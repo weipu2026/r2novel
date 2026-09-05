@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#20242c">
+<title>私人书屋</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- 登录 -->
+<section id="view-login" class="view view-center hidden">
+  <div class="login-box">
+    <div class="logo-block">书</div>
+    <h1>私人书屋</h1>
+    <form id="loginForm">
+      <input id="loginPwd" type="password" placeholder="输入口令" autocomplete="current-password" required>
+      <button id="loginBtn" type="submit">进入书屋</button>
+      <p id="loginErr" class="err"></p>
+    </form>
+  </div>
+</section>
+
+<!-- 书架 -->
+<section id="view-shelf" class="view hidden">
+  <header class="top">
+    <button class="brand" type="button" data-go="shelf" title="回到书架">
+      <span class="brand-logo">书</span>
+      <span class="brand-name">私人书屋</span>
+    </button>
+    <div class="top-actions">
+      <button id="trashBtn" class="ghost" type="button">回收站</button>
+      <button id="uploadBtn" class="primary" type="button">＋ 上传 txt</button>
+      <button id="logoutBtn" class="ghost slim" type="button">退出</button>
+    </div>
+  </header>
+  <main class="shelf-body">
+    <div id="continueWrap" class="hidden">
+      <p class="section-label">继续阅读</p>
+      <div id="continueCard"></div>
+    </div>
+    <div class="shelf-tools">
+      <input id="searchInput" class="search" type="search" placeholder="搜书名 / 标签…" autocomplete="off">
+      <select id="sortSel" class="sort" title="排序">
+        <option value="recent">最近阅读</option>
+        <option value="updated">最近更新</option>
+        <option value="created">创建时间</option>
+        <option value="title">书名</option>
+        <option value="words">字数</option>
+      </select>
+    </div>
+    <div id="tagCloud" class="tagcloud"></div>
+    <p class="section-label">全部书籍 <span id="filterNote" class="muted"></span> <span id="shelfCount" class="count muted"></span></p>
+    <div id="bookGrid" class="grid"></div>
+    <button id="loadMoreBtn" class="ghost loadmore hidden" type="button">加载更多 ↓</button>
+  </main>
+</section>
+
+<!-- 回收站 -->
+<section id="view-trash" class="view hidden">
+  <header class="top">
+    <button class="brand" type="button" data-go="shelf" title="回到书架">
+      <span class="brand-logo">书</span>
+      <span class="brand-name">私人书屋</span>
+    </button>
+    <div class="top-actions">
+      <button id="trashClear" class="ghost" type="button">清空回收站</button>
+      <button id="trashBack" class="primary" type="button">返回书架</button>
+    </div>
+  </header>
+  <main class="shelf-body">
+    <p class="section-label">软删书籍保留 15 天，过期自动清除；彻底删除不可恢复 <span id="trashCount" class="count muted"></span></p>
+    <div id="trashList"></div>
+  </main>
+</section>
+
+<!-- 上传 -->
+<section id="view-upload" class="view hidden">
+  <header class="top">
+    <button class="brand" type="button" data-go="shelf" title="回到书架">
+      <span class="brand-logo">书</span>
+      <span class="brand-name">私人书屋</span>
+    </button>
+    <button id="upCancel" class="ghost" type="button">返回书架</button>
+  </header>
+  <main class="upload-body">
+    <h2 class="page-title" id="upTitleHead">上传小说</h2>
+    <form id="upForm">
+      <label class="drop-zone" id="upDrop">
+        <input id="upFile" type="file" accept=".txt,.text,text/plain">
+        <strong>选择 .txt 文件</strong>
+        <span class="muted">也可直接拖到此处，或粘贴整段文本（一次一本）</span>
+      </label>
+
+      <div id="upUpdateHint" class="update-hint hidden"></div>
+
+      <div class="field-row">
+        <div class="field grow"><label>书名</label><input id="upTitle" placeholder="书名（自动取文件名）"></div>
+        <div class="field"><label>作者（可选）</label><input id="upAuthor" placeholder="作者"></div>
+      </div>
+      <div class="field-row">
+        <div class="field grow"><label>标签（可选，逗号分隔）</label><input id="upTags" placeholder="玄幻, 完结"></div>
+        <div class="field"><label>备注（可选）</label><input id="upNote" placeholder="给这本书留个备注"></div>
+      </div>
+
+      <fieldset>
+        <legend><label><input type="checkbox" id="upClean" checked> 自动清洗排版</label></legend>
+        <div id="upCleanOpts" class="chips">
+          <label><input type="checkbox" name="cleanitem" value="ref" checked> 去 [1] 脚注</label>
+          <label><input type="checkbox" name="cleanitem" value="garbled" checked> 清乱码</label>
+          <label><input type="checkbox" name="cleanitem" value="blank" checked> 合空行</label>
+          <label><input type="checkbox" name="cleanitem" value="indent"> 段首缩进</label>
+          <label><input type="checkbox" name="cleanitem" value="join"> 合并断行</label>
+          <label><input type="checkbox" name="cleanitem" value="quote"> 引号统一</label>
+          <label><input type="checkbox" name="cleanitem" value="site" checked> 去站点残留</label>
+          <label><input type="checkbox" name="cleanitem" value="md" checked> 去 Markdown 符号</label>
+        </div>
+      </fieldset>
+
+      <div id="upPrev" class="preview hidden">
+        <div class="detect-row">
+          <p id="upDetected" class="detect muted"></p>
+          <button id="encManual" class="ghost enc-manual hidden" type="button">手动指定编码</button>
+          <div id="encWrap" class="enc-wrap hidden">
+            <span class="enc-label">编码</span>
+            <select id="upEncoding"><option value="auto">自动检测</option></select>
+          </div>
+        </div>
+        <p class="section-label">分章预览 <span id="upStats" class="muted"></span></p>
+        <ul id="upList" class="chapter-preview"></ul>
+        <div class="actions">
+          <label class="switch" id="upKeepRawWrap" title="保留上传的原始 txt，以后可一键重新清洗"><input type="checkbox" id="upKeepRaw" checked><span>原件留档</span></label>
+          <button id="upConfirm" class="primary" type="button">确认入库</button>
+        </div>
+        <div id="upProgWrap" class="prog hidden">
+          <div class="prog-bar"><div id="upProgBar" class="prog-fill"></div></div>
+          <span id="upProgText" class="muted">上传中…</span>
+        </div>
+      </div>
+    </form>
+  </main>
+</section>
+
+<!-- 阅读 -->
+<section id="view-read" class="view hidden">
+  <!-- 桌面常驻目录侧栏（≥900px；可折叠成窄书脊） -->
+  <aside id="readSide" class="read-side hidden" aria-label="章节目录">
+    <div class="side-head">
+      <strong id="sideTitle"></strong>
+      <button id="sideClose" type="button" title="收起目录（快捷键 T）">« 收起</button>
+    </div>
+    <ul id="sideTocList" class="side-toc"></ul>
+    <button id="sideTocMore" class="ghost toc-more hidden" type="button">加载更多章节</button>
+    <button id="sideOpen" class="side-open hidden" type="button" title="展开目录"><span id="sideOpenTitle">目</span></button>
+  </aside>
+  <div id="readTop" class="read-top">
+    <button data-act="back" type="button">‹ 书架</button>
+    <span id="readTopTitle"></span>
+    <div class="read-top-actions">
+      <button data-act="download" type="button" title="下载整本离线">⤓ 离线</button>
+      <button data-act="export" type="button" title="导出清洗后 txt">⇩ txt</button>
+      <button data-act="toc" type="button" title="目录">目录 ☰</button>
+    </div>
+  </div>
+  <div id="readScroll">
+    <article id="readArt"></article>
+  </div>
+  <div class="read-bar">
+    <button data-act="prev" type="button">‹ 上章</button>
+    <button data-act="toc" type="button">目录</button>
+    <button data-act="fontDown" type="button" title="减小字号">A−</button>
+    <button data-act="fontUp" type="button" title="增大字号">A＋</button>
+    <button data-act="pref" type="button" title="字号/行距/背景">Aa</button>
+    <button data-act="next" type="button">下章 ›</button>
+  </div>
+  <!-- 阅读设置面板（字号 / 行距 / 背景） -->
+  <div id="prefPanel" class="pref-panel hidden">
+    <div class="pp-head">
+      <strong>阅读设置</strong>
+      <button data-act="prefClose" type="button">✕</button>
+    </div>
+    <div class="pp-row">
+      <span class="pp-k">字号</span>
+      <div class="pp-ctl">
+        <button data-act="fontDown" type="button" title="减小字号">A−</button>
+        <b id="ppFs">18</b>
+        <button data-act="fontUp" type="button" title="增大字号">A＋</button>
+      </div>
+    </div>
+    <div class="pp-row">
+      <span class="pp-k">行距</span>
+      <div class="pp-ctl">
+        <button data-act="lineDown" type="button" title="缩小行距">−</button>
+        <b id="ppLh">1.95</b>
+        <button data-act="lineUp" type="button" title="放大行距">＋</button>
+      </div>
+    </div>
+    <div class="pp-row">
+      <span class="pp-k">背景</span>
+      <div id="ppThemes" class="pp-themes"></div>
+    </div>
+  </div>
+  <div id="readTip" class="tip"></div>
+  <div id="tocDrawer" class="drawer hidden">
+    <div class="drawer-head">
+      <strong id="tocTitle"></strong>
+      <button data-act="tocClose" type="button">关闭 ✕</button>
+    </div>
+    <ul id="tocList"></ul>
+    <button id="tocMore" class="ghost toc-more hidden" type="button">加载更多章节</button>
+  </div>
+</section>
+
+<!-- 底部操作单（长按/点 ⋯ 弹出） -->
+<div id="sheet" class="sheet hidden"></div>
+<!-- 模态框（编辑信息 / 确认 / 选择） -->
+<div id="modalMask" class="modal-mask hidden">
+  <div id="modalBox" class="modal-box"></div>
+</div>
+<!-- 忙碌层（导出/下载离线/清空回收站等长任务） -->
+<div id="busyMask" class="modal-mask hidden">
+  <div class="modal-box busy-box">
+    <div class="prog-bar"><div id="busyBar" class="prog-fill"></div></div>
+    <p id="busyText" class="muted">处理中…</p>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+# 一键部署：把 Secrets 填进 GitHub → push main 即发布。仓库零敏感信息（域名也是 Secret）。
+#
+# Secrets 一览（逐步获取教程见 README「GitHub Actions 部署」一节）：
+#   CLOUDFLARE_API_TOKEN   API Token（Account·Workers Scripts:Edit + Account·R2:Edit；绑域名再加 Zone·Workers Routes:Edit）
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare 账户 ID（dashboard 首页右侧）
+#   ADMIN_PASSWORD         网站登录口令
+#   SESSION_SECRET         Cookie 的 HMAC 密钥（node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"）
+#   CUSTOM_DOMAIN          自定义域名（可选；留空用 workers.dev 地址）
+#
+# 流程：单测+语法 → 建桶(幂等) → 注入域名 → wrangler deploy → 同步 secrets → 对生产跑端到端冒烟（自动清走测试书）。
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-r2novel
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 单测 + 语法检查
+        run: npm test && npm run check
+
+      # 幂等：桶已存在时报错没关系，继续往下走（需 CLOUDFLARE_API_TOKEN 含 R2:Edit）
+      - name: 确保 R2 桶存在
+        run: npx wrangler r2 bucket create r2novel-7d1a || echo "· bucket 已存在，跳过"
+
+      # 域名不进仓库：CUSTOM_DOMAIN 非空时注入 wrangler.toml 副本末尾；
+      # 为空则用默认 workers.dev 地址（域名值不打印到日志）
+      - name: 注入自定义域名
+        run: |
+          if [ -z "${{ secrets.CUSTOM_DOMAIN }}" ]; then
+            echo "· 跳过域名绑定（CUSTOM_DOMAIN 未设置），使用 workers.dev 地址"
+            exit 0
+          fi
+          printf '\n[[routes]]\npattern = "%s"\ncustom_domain = true\n' \
+            "${{ secrets.CUSTOM_DOMAIN }}" >> wrangler.toml
+          echo "· 已绑定域名（值不打印到日志）"
+
+      # pipefail 保证 wrangler 失败时步骤失败（tee 会吞退出码）；输出存档用于提取访问地址
+      - name: 部署 Worker
+        shell: bash
+        run: |
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tee deploy.log
+
+      # 先部署代码（保证 Worker 存在，secret put 才有目标），再同步密钥；改 Secret 后跑一次部署即生效
+      - name: 同步密钥到 Worker
+        run: |
+          set -e
+          put() {
+            local name="$1" val="$2"
+            if [ -z "$val" ]; then
+              echo "· 跳过 $name（GitHub Secrets 未设置）"
+              return 0
+            fi
+            printf '%s' "$val" | npx wrangler secret put "$name"
+            echo "· $name 已同步"
+          }
+          put ADMIN_PASSWORD "${{ secrets.ADMIN_PASSWORD }}"
+          put SESSION_SECRET "${{ secrets.SESSION_SECRET }}"
+
+      # 部署后对生产环境跑端到端冒烟（登录→建书→传章→发布→读章→进度→管理→清理）
+      # SMOKE_CLEANUP=1：自动彻底删除测试书，不留垃圾；同名遗留会先清再建，可重复执行
+      - name: 生产冒烟
+        run: |
+          set -e
+          if [ -n "${{ secrets.CUSTOM_DOMAIN }}" ]; then
+            SMOKE_BASE="https://${{ secrets.CUSTOM_DOMAIN }}"
+          else
+            SMOKE_BASE=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1 || true)
+            if [ -z "$SMOKE_BASE" ]; then
+              echo "· 未能从部署输出解析 workers.dev 地址，跳过冒烟"
+              exit 0
+            fi
+          fi
+          echo "· 冒烟目标 $SMOKE_BASE"
+          SMOKE_BASE="$SMOKE_BASE" \
+            SMOKE_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \
+            SMOKE_CLEANUP=1 \
+            node scripts/smoke.mjs
+
+      - name: 部署完成
+        run: echo "✅ r2novel 已部署并通过生产冒烟"

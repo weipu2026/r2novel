@@ -1,0 +1,18 @@
+{
+  "name": "r2novel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "个人私有在线小说仓库：自上传 txt → 浏览器端清洗分章 → Cloudflare Worker + R2 存储 → 手机优先网页阅读 + 进度云端同步",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "test": "node --test test/cleaner.test.mjs test/api.test.mjs test/api-m2.test.mjs test/audit.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "node scripts/check.mjs",
+    "icons": "node scripts/gen-icon.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}

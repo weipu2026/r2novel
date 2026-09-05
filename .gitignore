@@ -1,0 +1,7 @@
+node_modules/
+.dev.vars
+data-dev/
+wrangler.local.toml
+*.log
+.ui-tests/
+shots/

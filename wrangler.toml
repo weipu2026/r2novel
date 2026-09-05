@@ -1,0 +1,38 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "r2novel"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# 静态资源（前端 SPA 外壳）：由 Cloudflare 边缘直出，不消耗 Workers 请求数。
+# run_worker_first 挂所有走 Worker 鉴权门的路径：/api/*（数据）、/opds 与 /export/*（OPDS 阅读器通道）。
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*", "/opds", "/export/*"]
+
+# 自定义域（可选）：GitHub Actions 部署时从 Secret CUSTOM_DOMAIN 注入；
+# 本地命令行部署则取消下面注释并填域名（需托管在同一 Cloudflare 账号下）。
+# [[routes]]
+# pattern = "novel.example.com"
+# custom_domain = true
+
+# R2：正文 + 元数据。bucket_name 用随机串避免被枚举（非凭据）。
+[[r2_buckets]]
+binding = "NOVELS"
+bucket_name = "r2novel-7d1a"
+
+[vars]
+SESSION_DAYS = "30"
+# raw 原件单次上传上限（字节）。Workers 请求体上限 100MB，txt 一般 1-10MB。
+MAX_UPLOAD = "52428800"
+# 单章上限：清洗后的一章正文 2MB 绰绰有余
+MAX_CHAPTER = "2097152"
+# 暴力破解防护：连错 BRUTE_LIMIT 次即锁定（按 IP 持久计数，跨重启有效）；
+# 锁定时长从 BRUTE_LOCK_MS 起指数翻倍，封顶 BRUTE_LOCK_MAX_MS；成功登录即清零
+BRUTE_LIMIT = "5"
+BRUTE_LOCK_MS = "600000"
+BRUTE_LOCK_MAX_MS = "3600000"
+
+# 敏感值用 wrangler secret put，本地开发放 .dev.vars（复制 .dev.vars.example）：
+#   ADMIN_PASSWORD   登录口令
+#   SESSION_SECRET   Cookie 的 HMAC 签名密钥（openssl rand -hex 32 生成）

@@ -1,0 +1,16 @@
+{
+  "name": "私人书屋",
+  "short_name": "书屋",
+  "description": "个人私有在线小说仓库：上传 txt · 自动分章 · 手机阅读 · 进度云端同步 · 离线阅读",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f4f1",
+  "theme_color": "#20242c",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

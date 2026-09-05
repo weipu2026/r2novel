@@ -81,6 +81,8 @@ jobs:
 
       # 部署后对生产环境跑端到端冒烟（登录→建书→传章→发布→读章→进度→管理→清理）
       # SMOKE_CLEANUP=1：自动彻底删除测试书，不留垃圾；同名遗留会先清再建，可重复执行
+      # 加固：custom domain 刚建时 DNS 需数十秒才在 runner 解析器生效 → 先轮询解析成功再跑冒烟；
+      #       冒烟本身遇瞬时网络/DNS 抖动最多自动重试 3 次
       - name: 生产冒烟
         run: |
           set -e
@@ -94,10 +96,28 @@ jobs:
             fi
           fi
           echo "· 冒烟目标 $SMOKE_BASE"
-          SMOKE_BASE="$SMOKE_BASE" \
-            SMOKE_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \
-            SMOKE_CLEANUP=1 \
-            node scripts/smoke.mjs
+          HOST=$(echo "$SMOKE_BASE" | sed -E 's#https?://##; s#/.*##')
+          echo "· 等待域名解析 $HOST ..."
+          for i in $(seq 1 20); do
+            if getent ahostsv4 "$HOST" >/dev/null 2>&1 || getent ahosts "$HOST" >/dev/null 2>&1; then
+              echo "  解析成功（第 $i 次探测）"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then echo "  ⚠ 轮询 100s 仍未解析，继续尝试冒烟"; fi
+            sleep 5
+          done
+          for attempt in 1 2 3; do
+            if SMOKE_BASE="$SMOKE_BASE" \
+               SMOKE_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \
+               SMOKE_CLEANUP=1 \
+               node scripts/smoke.mjs; then
+              echo "· 冒烟通过（第 $attempt 次尝试）"
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then echo "· 冒烟连续 3 次失败"; exit 1; fi
+            echo "· 冒烟异常，30s 后自动重试..."
+            sleep 30
+          done
 
       - name: 部署完成
         run: echo "✅ r2novel 已部署并通过生产冒烟"

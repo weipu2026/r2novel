@@ -209,9 +209,12 @@ function filteredBooks() {
   return list;
 }
 
+/** 默认「最近」排序键：最后阅读时间 ∨ 创建时间 —— 没读过的书退回按新书排，避免全 0 退化成上传顺序 */
+const recentKey = (x) => Math.max((x.prog && x.prog.updatedAt) || 0, x.createdAt || 0);
+
 function sortedBooks(list) {
   const sorters = {
-    recent: (a, b) => (b.prog && b.prog.updatedAt || 0) - (a.prog && a.prog.updatedAt || 0),
+    recent: (a, b) => recentKey(b) - recentKey(a),
     updated: (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
     created: (a, b) => (b.createdAt || 0) - (a.createdAt || 0),
     words: (a, b) => (b.wordCount || 0) - (a.wordCount || 0),
@@ -541,6 +544,7 @@ function renderDiag() {
   const rs = d.residue || [];
   const obs = d.orphanBooks || [];
   const cos = d.chapterOrphans || [];
+  const unregCos = cos.filter((o) => !o.known); // 未登记的孤儿才一键清；已登记的交给惰性清理
   const total = rs.length + obs.length + cos.length;
   const badge = total ? `<span class="diag-badge diag-badge-warn">发现 ${total} 项残留</span>` : `<span class="diag-badge diag-badge-ok">一切干净</span>`;
 
@@ -579,12 +583,12 @@ function renderDiag() {
           : '<p class="diag-none">无</p>')
       + sec('diag-dot-gray', '章节孤儿', cos.length,
         cos.length ? `<div class="diag-rows">${cos.map((o) => objRow(o, ` · ${esc(o.bookTitle || o.bookId)}${chTag(o)}`)).join('')}</div>
-          <p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="chapters">删除全部 ${cos.length} 项</button></p>`
+          ${unregCos.length ? `<p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="chapters">删除未登记孤儿 ${unregCos.length} 项</button></p>` : '<p class="diag-group-acts muted">已登记孤儿由惰性清理自动删除</p>'}`
           : '<p class="diag-none">无（自动惰性清理工作正常）</p>');
   }
 
   openModal(`<h3>残留检查</h3>
-    <p class="modal-sub">扫描于 ${new Date(d.scannedAt).toLocaleString()} · 在架 ${d.liveBooks} 本 ${badge}</p>
+    <p class="modal-sub">扫描于 ${new Date(d.scannedAt).toLocaleString()} · 在架 ${d.liveBooks} 本 ${badge}${d.incomplete ? '<span class="diag-tag diag-tag-orphan"> · 对象过多，扫描按预算截断、部分结果不完整</span>' : ''}</p>
     <div class="diag-body">${body}</div>
     <div class="m-acts">
       <button class="ghost" id="diagRefreshBtn" type="button">重新扫描</button>
@@ -604,19 +608,22 @@ async function onDiagBoxClick(e) {
     const key = btn.dataset.key;
     if (!(await confirmModal(`永久删除无主对象「${diagShort(key)}」？此操作不可恢复。`, '删除'))) return;
     try {
-      await api.purgeOrphans([key]);
-      toast('已删除 1 个对象', 1400);
+      const r1 = await api.purgeOrphans([key]);
+      toast(r1 && r1.deleted ? '已删除 1 个对象' : '对象已在引用中，未删除', 1400);
       await diagRefresh();
     } catch (err) {
       toast('删除失败：' + (err.message || err), 2400);
     }
   } else if (act === 'del-all') {
-    const keys = (btn.dataset.what === 'residue' ? diagData.residue : diagData.chapterOrphans).map((o) => o.key);
+    const src = btn.dataset.what === 'residue' ? diagData.residue : (diagData.chapterOrphans || []).filter((o) => !o.known);
+    const keys = src.map((o) => o.key);
     if (!keys.length) return;
     if (!(await confirmModal(`永久删除 ${keys.length} 个无主对象？此操作不可恢复。`, '全部删除'))) return;
     try {
-      await api.purgeOrphans(keys);
-      toast(`已删除 ${keys.length} 个对象`, 1600);
+      const r = await api.purgeOrphans(keys);
+      const done = (r && r.deleted) || 0;
+      const skipped = (r && r.skipped) || 0;
+      toast((done ? `已删除 ${done} 个对象` : '没有可删除的对象') + (skipped ? `（${skipped} 个被跳过）` : ''), 1600);
       await diagRefresh();
     } catch (err) {
       toast('删除失败：' + (err.message || err), 2400);

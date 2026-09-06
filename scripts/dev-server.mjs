@@ -103,7 +103,8 @@ const fsStore = {
       for (const e of entries) {
         const relKey = rel ? `${rel}/${e.name}` : e.name;
         if (e.isDirectory()) walk(path.join(dir, e.name), relKey);
-        else if (relKey.startsWith(prefix)) {
+        else if (relKey.startsWith(prefix) && !relKey.endsWith('.tmp')) {
+          // 跳过写入中断残留的 .tmp（putText 先写 tmp 再 rename，崩溃会留下）
           const st = fs.statSync(path.join(dir, e.name));
           out.push({ key: relKey, size: st.size });
         }

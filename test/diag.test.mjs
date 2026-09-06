@@ -208,3 +208,38 @@ test('diag：DELETE 空列表 / 非法 body 校验', async () => {
   r = await call(store, req('/api/diag/orphans', { method: 'DELETE', cookie, body: { objects: ['../meta/x.json'] } }));
   assert.equal(r.status, 400);
 });
+
+test('diag：活书当前章节正文 / raw / progress 经 DELETE 一律拒删', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '拒删书', 2);
+
+  // 当前章节正文 + 活书原件 + 进度 → 全部拒删（防扫描后竞态误删活书数据）
+  const del = await call(
+    store,
+    req('/api/diag/orphans', { method: 'DELETE', cookie, body: { objects: [`text/${id}/1.txt`, `raw/${id}.txt`, `progress/${id}.json`] } })
+  );
+  assert.equal(del.status, 200);
+  assert.equal(del.data.deleted, 0, '活书当前章节/raw/progress 一律拒删');
+  assert.equal(del.data.skipped, 3);
+
+  // 正文未被删，仍能读到
+  const t1 = await call(store, req(`/api/books/${id}/chapters/1`, { cookie }));
+  assert.equal(t1.text, '正文1');
+  // 扫描依旧干净（无残留可清理）
+  const d = await diag(store, cookie);
+  assert.equal(d.summary.residue, 0);
+});
+
+test('diag：书多导致预算耗尽时返回 incomplete 而非报错', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  // 造 45 本未入架半成品：无主 meta 逐本 readBook → 顶到 DIAG_SUB_BUDGET
+  for (let i = 0; i < 45; i++) {
+    const r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '孤儿' + i, chapters: ['第1章'], wordCount: 10 } }));
+    assert.equal(r.status, 200);
+  }
+  const d = await diag(store, cookie);
+  assert.equal(d.incomplete, true, '预算耗尽应标记 incomplete 而非抛错');
+  assert.equal(d.summary.orphanBooks, 45, '无主书条目仍全部列出（未读取的标 unknown）');
+});

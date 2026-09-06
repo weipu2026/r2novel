@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-server.mjs",
-    "test": "node --test test/cleaner.test.mjs test/api.test.mjs test/api-m2.test.mjs test/audit.test.mjs",
+    "test": "node --test test/cleaner.test.mjs test/api.test.mjs test/api-m2.test.mjs test/audit.test.mjs test/diag.test.mjs",
     "smoke": "node scripts/smoke.mjs",
     "check": "node scripts/check.mjs",
     "icons": "node scripts/gen-icon.mjs",

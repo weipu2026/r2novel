@@ -1023,10 +1023,22 @@ async function apiTrashClear(store) {
  *   orphanBooks    无主书：meta 在但 id 不在 index/trash（上传中断 / index 写失败）→ 不直接删，走「移入回收站」
  *   chapterOrphans 活书章表外正文：key 不在 chapters/orphans 之外（replace 等遗留）→ 可直接删对象
  * 删除接口只收 text|raw|progress 前缀，绝不接受 meta/*（系统文件与书元数据不可经此删除）。
+ * 子请求预算：Free 单请求 ≤50。逐书 readBook 与 list 分页都计入，预算将尽即标记 incomplete
+ *   截断（宁漏勿错），避免大书库把「检查残留」点成 500。
  */
 const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
+const DIAG_SUB_BUDGET = 40; // 扫描/删除单请求子请求软预算（留余量给响应与其他读取）
 
 async function apiDiagOrphans(store) {
+  const budget = { used: 2, incomplete: false }; // 2 = readIndex + readTrash
+  const bump = () => {
+    if (budget.used >= DIAG_SUB_BUDGET) {
+      budget.incomplete = true;
+      return false;
+    }
+    budget.used++;
+    return true;
+  };
   const index = await readIndex(store);
   const trash = await readTrash(store);
   const live = new Set();
@@ -1040,15 +1052,17 @@ async function apiDiagOrphans(store) {
   const chapterOrphans = [];
   const orphanBooks = [];
 
-  // 全库一次遍历（对象量小，R2 list 自动翻页拉全）
+  // 全库一次遍历（R2 list 每页 ≤1000，页数近似计入预算）
   const all = await store.list();
+  budget.used += Math.ceil(all.length / 1000);
 
   // meta/{id}.json → 无主书（系统 meta 文件排除）
   for (const o of all) {
     if (!o.key.startsWith('meta/') || DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
     const id = o.key.slice(5, -5); // 去 'meta/' 前缀与 '.json' 后缀
     if (live.has(id)) continue;
-    const m = await readBook(store, id);
+    let m = null;
+    if (bump()) m = await readBook(store, id); // 预算尽则跳过读取，仅记 unknown
     orphanBooks.push({
       id,
       key: o.key,
@@ -1084,6 +1098,7 @@ async function apiDiagOrphans(store) {
       }
       continue;
     }
+    if (!bump()) continue; // 预算尽：本活书正文不再分类（宁漏勿错）
     const m = await readBook(store, id);
     if (!m) continue; // 活书但 meta 读不到：宁漏勿错，留待下次扫描
     const have = new Set((m.chapters || []).map((c) => c.key));
@@ -1110,22 +1125,65 @@ async function apiDiagOrphans(store) {
   }
 
   const summary = { residue: residue.length, orphanBooks: orphanBooks.length, chapterOrphans: chapterOrphans.length };
-  return json({ scannedAt: Date.now(), liveBooks: live.size, summary, residue, orphanBooks, chapterOrphans });
+  return json({
+    scannedAt: Date.now(),
+    liveBooks: live.size,
+    summary,
+    residue,
+    orphanBooks,
+    chapterOrphans,
+    incomplete: budget.incomplete,
+  });
 }
 
-/** 批量删除已确认无引用的对象（text/raw/progress 前缀）。只删对象，不经书 meta。 */
+/** 批量删除已确认无引用的对象（text/raw/progress 前缀）。只删对象，不经书 meta。
+ * 删除前回验：在架/回收站活书的当前章节正文、raw、progress 一律拒删——阻止「扫描后 append
+ * 复用孤儿 key」的竞态把活书正文误删。非活书对象直接放行；预算将尽时剩余 key 不回验也不删。 */
 async function apiPurgeOrphans(req, store) {
   const body = await req.json().catch(() => ({}));
   const keys = Array.isArray(body.objects) ? body.objects.map(String) : [];
   if (!keys.length) return json({ error: '没有要删除的对象' }, 400);
   const ok = keys.filter((k) => /^(?:text|raw|progress)\/[^/]/.test(k) && !/\.\./.test(k));
   if (!ok.length) return json({ error: '没有可删除的合法对象' }, 400);
-  let deleted = 0;
+
+  const index = await readIndex(store);
+  const trash = await readTrash(store);
+  const live = new Set([...(index.books || []), ...(trash.books || [])].map((b) => b.id));
+  let used = 2; // 已读 index + trash
+  const metaCache = new Map(); // 同一本书多个删除 key 只回验一次
+  const toDelete = [];
   for (const k of ok) {
+    const parts = k.split('/');
+    // id 解析：text/<id>/<key>.txt 的 id 是 parts[1]；raw/<id>.txt、progress/<id>.json 只有一个斜杠，
+    // parts[1] 带扩展名，须剥掉才能对上 live 集合（否则活书的 raw/progress 会被误判为非活书而放行）
+    const id = parts[0] === 'text' ? parts[1] || '' : String(parts[1] || '').replace(/\.(txt|json)$/, '');
+    if (!live.has(id)) {
+      toDelete.push(k); // 非活书伴生残留，无需回验
+      continue;
+    }
+    if (parts[0] !== 'text') continue; // 活书的 raw/progress 拒删（原件/进度属该书）
+    let meta = metaCache.get(id);
+    if (metaCache.has(id)) {
+      // 命中缓存
+    } else {
+      if (used >= DIAG_SUB_BUDGET) break; // 预算尽：不回验也不删（宁漏勿错）
+      used++;
+      meta = await readBook(store, id);
+      metaCache.set(id, meta === null ? null : meta);
+    }
+    if (!meta) continue; // 活书 meta 读不到：宁漏勿错，留待下次扫描
+    const have = new Set((meta.chapters || []).map((c) => c.key));
+    const chKey = parts.slice(2).join('/').replace(/\.txt$/, '');
+    if (!have.has(chKey)) toDelete.push(k); // 章表外正文（含已登记孤儿）→ 可删（当前章节正文则拒删）
+  }
+  let deleted = 0;
+  for (const k of toDelete) {
+    if (used >= DIAG_SUB_BUDGET) break; // 预算含删除本身，防超 50
+    used++;
     await store.delete(k);
     deleted++;
   }
-  return json({ ok: true, deleted });
+  return json({ ok: true, deleted, skipped: ok.length - deleted });
 }
 
 /* ---------------- OPDS 目录 / 整本导出（第三方阅读器通道） ----------------

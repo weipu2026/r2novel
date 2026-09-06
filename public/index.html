@@ -34,11 +34,11 @@
       <span class="brand-name">私人书屋</span>
     </button>
     <div class="top-actions">
+      <button id="uploadBtn" class="primary" type="button">＋ 上传 txt</button>
       <button id="trashBtn" class="ghost" type="button">回收站</button>
       <button id="tagsBtn" class="ghost slim" type="button" title="查看全部标签，合并/改名/删除">标签</button>
       <button id="diagBtn" class="ghost slim" type="button" title="扫描库中无引用的残留文件">检查残留</button>
       <button id="batchBtn" class="ghost slim" type="button" title="多选书籍批量打标签/改状态/删除">批量</button>
-      <button id="uploadBtn" class="primary" type="button">＋ 上传 txt</button>
       <button id="logoutBtn" class="ghost slim" type="button">退出</button>
     </div>
   </header>
@@ -105,7 +105,7 @@
     <h2 class="page-title" id="upTitleHead">上传小说</h2>
     <form id="upForm">
       <label class="drop-zone" id="upDrop">
-        <input id="upFile" type="file" accept=".txt,.text,text/plain">
+        <input id="upFile" type="file" accept=".txt,.text,text/plain" multiple>
         <strong>选择 .txt 文件</strong>
         <span class="muted">也可直接拖到此处，或粘贴整段文本（一次一本）</span>
       </label>

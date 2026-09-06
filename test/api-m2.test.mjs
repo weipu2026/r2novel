@@ -284,6 +284,39 @@ test('M2：PATCH finished —— meta 与书架条目同步，完结状态可持
   assert.equal(meta.data.finished, true, 'meta 应持久化 finished');
 });
 
+test('M2：bulk 单批上限 —— 超过 DELETE_BATCH(30) 拒收 413，恰好 30 章放行', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const r = await call(store, req('/api/books', {
+    method: 'POST',
+    cookie,
+    body: { title: '批量上限书', chapters: Array.from({ length: 31 }, (_, i) => '第' + (i + 1) + '章'), wordCount: 31 },
+  }));
+  assert.equal(r.status, 200);
+  const id = r.data.id;
+
+  const many = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, {
+      method: 'POST',
+      cookie,
+      body: { chapters: Array.from({ length: 31 }, (_, i) => ({ key: String(i + 1), text: 'x' })) },
+    })
+  );
+  assert.equal(many.status, 413, '超过单批上限应拒收');
+
+  const ok = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, {
+      method: 'POST',
+      cookie,
+      body: { chapters: Array.from({ length: 30 }, (_, i) => ({ key: String(i + 1), text: 'y' })) },
+    })
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.count, 30, '恰好 30 章应放行');
+});
+
 test('M2：对已软删书 PATCH/update 拒绝', async () => {
   const store = memStore();
   const cookie = await login(store);

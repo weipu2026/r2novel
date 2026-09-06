@@ -964,10 +964,10 @@ async function apiProgressPut(req, store, id) {
 
 /* ---------------- 批量操作 / 标签治理（书架百本量级的治理工具） ---------------- */
 
-/** 批量操作单请求上限：每本 1 读(meta)+1 写(meta) ≈ 2N，加 index 读/bak/写 ≈ 5 → 20 本 ≈ 45 子请求，守住 Free 50 红线 */
-const BATCH_BOOKS_MAX = 20;
+/** 批量操作单请求上限：每本 1 读(meta)+1 写(meta) ≈ 2N，加 index 读/bak/写 ≈ 5 → 18 本 ≈ 41 子请求，留足余量 */
+const BATCH_BOOKS_MAX = 18;
 /** 标签合并单请求上限（同样受 2N 约束；未完成的部分返回 remaining 让前端续调） */
-const TAG_MERGE_MAX = 20;
+const TAG_MERGE_MAX = 18;
 
 /**
  * 批量操作：一次请求改多本书（标签增删/整设、完结状态、软删）。

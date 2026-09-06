@@ -635,7 +635,7 @@ const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</
 /* ---------- 书架批量操作（多选治理：加/去标签、完结状态、软删） ---------- */
 let batchMode = false;
 const selected = new Set();
-const BATCH_PAGE = 20; // 与后端 BATCH_BOOKS_MAX 对齐，分批调用避免子请求预算爆
+const BATCH_PAGE = 18; // 与后端 BATCH_BOOKS_MAX 对齐，分批调用避免子请求预算爆
 
 function enterBatchMode() {
   batchMode = true;
@@ -1164,11 +1164,84 @@ function hint(text) {
 
 async function handleFiles(files) {
   if (!files.length) return;
+  if (files.length > 1) {
+    await importBatch(files);
+    return;
+  }
   const f = files[0];
-  if (files.length > 1) toast('一次处理一本，已选用第一个文件：' + f.name, 2800);
   pending = null;
   els.upPrev.classList.add('hidden');
   await prepareFile(f);
+}
+
+/** 多文件批量导入（P1）：串行逐本 cleaner → 自动入库，一次一本避免浏览器内存峰值叠加。
+ * 作者/标签/备注取上传表单当前值，作为这一批的统一默认值；书名取文件名；
+ * 与书架同名的自动跳过（批量不逐本弹窗）。上传复用 bulk 通道。 */
+async function importBatch(files) {
+  const n = files.length;
+  const author = els.upAuthor.value.trim();
+  const tags = els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const note = els.upNote.value.trim();
+  const keepRaw = els.upKeepRaw.checked;
+  const summary = `作者「${author || '空'}」· 标签「${tags.join('、') || '空'}」· 备注「${note || '空'}」`;
+  if (!(await confirmModal(`将对 ${n} 本书批量导入。书名取文件名，以下信息统一应用到这批：${summary}。与书架同名的自动跳过。继续？`, `导入 ${n} 本`))) return;
+
+  let ok = 0;
+  let skip = 0;
+  let fail = 0;
+  els.upProgWrap.classList.remove('hidden');
+  els.upConfirm.disabled = true;
+  try {
+    for (let i = 0; i < n; i++) {
+      const file = files[i];
+      const title = file.name.replace(/\.(txt|text)$/i, '').trim() || ('未命名_' + (i + 1));
+      setProg(i / n, `处理 ${i + 1}/${n}：《${title}》`);
+      try {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        pending = { title, bytes: buf, updating: null, keepRaw };
+        runPreview();
+        const preview = pending.preview;
+        if (!preview || !preview.chapters.length) {
+          fail++;
+          continue;
+        }
+        const payload = {
+          title,
+          author,
+          tags,
+          note,
+          chapters: preview.chapters.map((c) => c.title),
+          wordCount: preview.words || 0,
+          cleanVer: 1,
+        };
+        const created = await api.createBook(payload);
+        if (created.duplicate && created.needCreate && created.book) {
+          skip++; // 同名 → 跳过（批量不弹窗确认）
+          continue;
+        }
+        createdId = created.id;
+        await uploadChapters(created.id, created.chapterKeys, payload, keepRaw);
+        createdId = null;
+        ok++;
+      } catch (e) {
+        fail++;
+        if (createdId) {
+          // 失败时把停在 creating 的半成品移入回收站，不留孤儿数据
+          await api.deleteBook(createdId).catch(() => {});
+          createdId = null;
+        }
+      }
+      setProg((i + 1) / n, `完成 ${ok + skip + fail}/${n}（成功 ${ok}）`);
+    }
+  } finally {
+    els.upProgWrap.classList.add('hidden');
+    els.upConfirm.disabled = false;
+  }
+  pending = null;
+  els.upFile.value = '';
+  toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : ''].filter(Boolean).join(' · '), 3200);
+  showView('shelf');
+  await loadShelf();
 }
 
 function onFileChosen() {
@@ -1530,7 +1603,7 @@ async function uploadChapters(id, keys, payload, keepRaw) {
 async function uploadMany(id, keys, chapters) {
   const n = keys.length;
   if (!n) return;
-  const BATCH = 40; // 与服务端单批上限一致
+  const BATCH = 30; // 必须与后端 DELETE_BATCH 一致（router.js），否则 >30 章的书第二批会被 413 拒收
   let done = 0;
   for (let i = 0; i < n; i += BATCH) {
     const keySlice = keys.slice(i, i + BATCH);

@@ -91,7 +91,8 @@ export function detectEncoding(bytes) {
     const d = new TextDecoder(bom);
     const text = d.decode(bin);
     const replaced = (text.match(/\uFFFD/g) || []).length;
-    return { encoding: bom, text, replaced, score: readabilityScore(text), candidates: [{ encoding: bom, score: 0, replaced }] };
+    const score = readabilityScore(text);
+    return { encoding: bom, text, replaced, score, candidates: [{ encoding: bom, score, replaced }] };
   }
 
   const labels = ['utf-8', 'gb18030', 'big5'];

@@ -146,6 +146,7 @@ export async function fetchChaptersAll(id, onProg) {
   const CONC = 8;
   let cursor = 0;
   let done = 0;
+  let missing = 0;
   await Promise.all(
     Array.from({ length: Math.min(CONC, n) }, async () => {
       while (true) {
@@ -156,11 +157,12 @@ export async function fetchChaptersAll(id, onProg) {
         } catch (e) {
           if (e instanceof ApiError && e.status === 401) throw e;
           texts[idx] = ''; // 单章失败不阻断整本
+          missing++;
         }
         done++;
         if (onProg && (done % 12 === 0 || done === n)) onProg(done / n);
       }
     })
   );
-  return { meta, texts };
+  return { meta, texts, missing };
 }

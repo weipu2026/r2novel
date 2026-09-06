@@ -143,7 +143,7 @@ export async function openBook(id) {
     if (e instanceof ApiError && e.status === 401) throw e;
     // 网络失败 → 用本地整本缓存的书目打开（离线场景）
     const off = await offline.getBook(id).catch(() => null);
-    if (off) meta = off;
+    if (off) meta = { ...off, id }; // IndexedDB 记录只存 bookId，补齐 id 供后续取章
     else throw e;
   }
   if (!meta.chapters || !meta.chapters.length) throw new Error('这本书还没有可读章节');
@@ -194,7 +194,6 @@ async function renderChapter(idx, restoreRatio) {
   // 进入新章节（无论加载成败）：触屏窄屏下放回工具栏——用户跳章/重试时能看到下章/目录/退出
   if (mqTouch() && !mqDesktop()) els.root.classList.remove('bars-hid');
   els.art.innerHTML = '';
-  els.scroll.scrollTop = 0;
   const ch = state.chapters[idx];
   let text;
   try {
@@ -330,6 +329,7 @@ function fillToc(ul, until) {
   const start = children.length ? Number(children[children.length - 1].dataset.idx) + 1 : 0;
   for (let i = start; i < end; i++) {
     const li = document.createElement('li');
+    li.dataset.idx = String(i); // 增量续接时按 li 上的 idx 定位，避免读错层级
     li.appendChild(buildTocItem(i));
     ul.appendChild(li);
   }
@@ -572,8 +572,8 @@ function onKey(e) {
       }
       break;
     }
-    case 'ArrowRight': goto(state.cur + 1); break;
-    case 'ArrowLeft': goto(state.cur - 1); break;
+    case 'ArrowRight': if (!inBtn) goto(state.cur + 1); break;
+    case 'ArrowLeft': if (!inBtn) goto(state.cur - 1); break;
     case 't':
     case 'T': (mqDesktop() ? toggleSide : toggleDrawerKey)(); break;
   }
@@ -600,7 +600,7 @@ async function downloadCurrent() {
   }
   busy(0.02, `下载《${book.title}》整本…`);
   try {
-    const { meta, texts } = await fetchChaptersAll(book.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
+    const { meta, texts, missing = 0 } = await fetchChaptersAll(book.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
     // 若本地旧缓存章节数与新版不一致（重洗后），先整体清掉再写入，避免残留旧章
     const old = await offline.getBook(meta.id).catch(() => null);
     if (old && old.chapterCount !== meta.chapterCount) {
@@ -609,7 +609,7 @@ async function downloadCurrent() {
     await offline.saveBook(meta);
     await offline.putChapters(meta.id, meta.chapters.map((c, i) => ({ key: c.key, text: texts[i] })));
     state.cache.clear(); // 离线缓存已含全部章
-    showTip(`已离线《${meta.title}》共 ${meta.chapters.length} 章，断网也能读`, 2600);
+    showTip(missing ? `已离线《${meta.title}》，但有 ${missing} 章缺失，请重试` : `已离线《${meta.title}》共 ${meta.chapters.length} 章，断网也能读`, 2600);
   } catch (e) {
     showTip('下载失败：' + (e.message || e), 2800);
   } finally {

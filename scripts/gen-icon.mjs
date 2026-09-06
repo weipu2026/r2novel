@@ -121,8 +121,7 @@ function draw(size, maskable) {
       // 左页 / 右页
       const pw = (book.w - spine) / 2;
       if (inPage(pageLx, pw) || inPage(pageRx, pw)) {
-        // 书页白底，带浅灰叠层更像纸
-        const shade = 0.98;
+        // 书页白底
         R = 255; G = 255; B = 255;
         // 页内文字行：深棕横线，避开书脊侧 12%
         const lx0 = pageLx + pw * 0.16;
@@ -135,7 +134,6 @@ function draw(size, maskable) {
             R = rr; G = Math.round(lerp(120, 96, 0.3)); B = Math.round(lerp(66, 52, 0.3));
           }
         }
-        void shade;
       }
       buf[i] = R;
       buf[i + 1] = G;

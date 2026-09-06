@@ -90,6 +90,28 @@ const fsStore = {
       /* ignore */
     }
   },
+  /** 遍历对象清单（与生产 R2 list 同形）；walk 全树后按前缀过滤 */
+  async list(prefix = '') {
+    const out = [];
+    const walk = (dir, rel) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const relKey = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(path.join(dir, e.name), relKey);
+        else if (relKey.startsWith(prefix)) {
+          const st = fs.statSync(path.join(dir, e.name));
+          out.push({ key: relKey, size: st.size });
+        }
+      }
+    };
+    walk(DATA, '');
+    return out;
+  },
 };
 
 /* ---- 静态服务 ---- */

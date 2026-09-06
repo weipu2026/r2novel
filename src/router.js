@@ -1017,6 +1017,117 @@ async function apiTrashClear(store) {
   return json({ ok: true, deleted, remaining });
 }
 
+/* ---------------- 残留诊断 / 孤儿清理（书架「检查残留」） ----------------
+ * 只读扫描全库对象，与「应有对象」（index + trash + 各书章表/orphans）做差集，分三类：
+ *   residue        已删书伴生残留：对象在但既无清单记录也无 meta（删书漏删 / 中断残留）→ 可直接删对象
+ *   orphanBooks    无主书：meta 在但 id 不在 index/trash（上传中断 / index 写失败）→ 不直接删，走「移入回收站」
+ *   chapterOrphans 活书章表外正文：key 不在 chapters/orphans 之外（replace 等遗留）→ 可直接删对象
+ * 删除接口只收 text|raw|progress 前缀，绝不接受 meta/*（系统文件与书元数据不可经此删除）。
+ */
+const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
+
+async function apiDiagOrphans(store) {
+  const index = await readIndex(store);
+  const trash = await readTrash(store);
+  const live = new Set();
+  const titleOf = new Map();
+  for (const b of [...(index.books || []), ...(trash.books || [])]) {
+    live.add(b.id);
+    if (!titleOf.has(b.id)) titleOf.set(b.id, b.title || '');
+  }
+
+  const residue = [];
+  const chapterOrphans = [];
+  const orphanBooks = [];
+
+  // 全库一次遍历（对象量小，R2 list 自动翻页拉全）
+  const all = await store.list();
+
+  // meta/{id}.json → 无主书（系统 meta 文件排除）
+  for (const o of all) {
+    if (!o.key.startsWith('meta/') || DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
+    const id = o.key.slice(5, -5); // 去 'meta/' 前缀与 '.json' 后缀
+    if (live.has(id)) continue;
+    const m = await readBook(store, id);
+    orphanBooks.push({
+      id,
+      key: o.key,
+      size: o.size,
+      status: m && m.status ? m.status : 'unknown',
+      title: m && m.title ? m.title : '',
+      chapterCount: m && Array.isArray(m.chapters) ? m.chapters.length : 0,
+      wordCount: m && Number(m.wordCount) ? Number(m.wordCount) : 0,
+    });
+  }
+  const orphanSet = new Set(orphanBooks.map((b) => b.id));
+
+  // text/{id}/{key}.txt → 章表外正文 / 无主正文
+  const textById = new Map();
+  for (const o of all) {
+    if (!o.key.startsWith('text/')) continue;
+    const rest = o.key.slice(5);
+    const slash = rest.indexOf('/');
+    if (slash <= 0) continue; // 非预期 key 形状，忽略
+    const id = rest.slice(0, slash);
+    if (!textById.has(id)) textById.set(id, []);
+    textById.get(id).push({ key: o.key, size: o.size, chKey: rest.slice(slash + 1, -4) });
+  }
+  for (const [id, items] of textById) {
+    if (!live.has(id)) {
+      // 无主正文：书连 meta 都没有 → 列为残留可直接删；有 meta（无主书）→ 正文随书进回收站，不单列
+      if (orphanSet.has(id)) {
+        const ob = orphanBooks.find((b) => b.id === id);
+        ob.texts = (ob.texts || 0) + items.length;
+        ob.textBytes = (ob.textBytes || 0) + items.reduce((s, x) => s + x.size, 0);
+      } else {
+        for (const it of items) residue.push({ key: it.key, size: it.size });
+      }
+      continue;
+    }
+    const m = await readBook(store, id);
+    if (!m) continue; // 活书但 meta 读不到：宁漏勿错，留待下次扫描
+    const have = new Set((m.chapters || []).map((c) => c.key));
+    const known = new Set(Array.isArray(m.orphans) ? m.orphans : []);
+    for (const it of items) {
+      if (have.has(it.chKey)) continue;
+      chapterOrphans.push({
+        key: it.key,
+        size: it.size,
+        bookId: id,
+        bookTitle: titleOf.get(id) || '',
+        known: known.has(it.chKey), // 已在 meta.orphans 登记（惰性清理会兜底）→ known
+      });
+    }
+  }
+
+  // raw/{id}.txt、progress/{id}.json → 无主残留
+  for (const prefix of ['raw/', 'progress/']) {
+    for (const o of all) {
+      if (!o.key.startsWith(prefix)) continue;
+      const id = o.key.slice(prefix.length).replace(/\.(txt|json)$/, '');
+      if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
+    }
+  }
+
+  const summary = { residue: residue.length, orphanBooks: orphanBooks.length, chapterOrphans: chapterOrphans.length };
+  return json({ scannedAt: Date.now(), liveBooks: live.size, summary, residue, orphanBooks, chapterOrphans });
+}
+
+/** 批量删除已确认无引用的对象（text/raw/progress 前缀）。只删对象，不经书 meta。 */
+async function apiPurgeOrphans(req, store) {
+  const body = await req.json().catch(() => ({}));
+  const keys = Array.isArray(body.objects) ? body.objects.map(String) : [];
+  if (!keys.length) return json({ error: '没有要删除的对象' }, 400);
+  const ok = keys.filter((k) => /^(?:text|raw|progress)\/[^/]/.test(k) && !/\.\./.test(k));
+  if (!ok.length) return json({ error: '没有可删除的合法对象' }, 400);
+  let deleted = 0;
+  for (const k of ok) {
+    await store.delete(k);
+    deleted++;
+  }
+  return json({ ok: true, deleted });
+}
+
 /* ---------------- OPDS 目录 / 整本导出（第三方阅读器通道） ----------------
  * 场景：手机阅读器 App（ReadEra/Librera/静读天下等）订阅私人书库，整本下载 TXT 本地读。
  * 鉴权：浏览器会话 Cookie 或 HTTP Basic Auth（阅读器 App 只认 Basic）。
@@ -1206,6 +1317,14 @@ async function handleApi(req, env, store, url, p) {
   if (p === '/api/trash') {
     if (req.method === 'GET') return apiTrashList(store, env);
     if (req.method === 'POST' && url.searchParams.get('action') === 'clear') return apiTrashClear(store);
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
+
+  // 残留诊断：GET 全库扫描分类 / DELETE 批量删无主对象（书架「检查残留」）
+  if (p === '/api/diag/orphans') {
+    if (req.method === 'GET') return apiDiagOrphans(store);
+    if (req.method === 'DELETE') return apiPurgeOrphans(req, store);
     await dropBody(req);
     return json({ error: 'method' }, 405);
   }

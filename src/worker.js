@@ -29,6 +29,17 @@ function r2Store(bucket) {
     async delete(key) {
       await bucket.delete(key);
     },
+    /** 遍历对象清单（含子前缀递归）；返回 [{ key, size }]，自动翻页拉全 */
+    async list(prefix = '') {
+      const out = [];
+      let cursor;
+      do {
+        const page = await bucket.list(prefix ? { prefix } : {});
+        for (const o of page.objects) out.push({ key: o.key, size: o.size });
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return out;
+    },
   };
 }
 

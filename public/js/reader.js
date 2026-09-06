@@ -21,11 +21,14 @@ const state = {
   chapters: [],
   cur: 0,
   cache: new Map(),
+  inflight: new Map(), // 进行中的章节请求：同章并发合并，翻章可搭后台预取的顺风车
   toc: { draw: TOC_PAGE, side: TOC_PAGE }, // 两个目录容器各自的已渲染量
   dirty: false,
   lastSave: 0,
   pref: { ...defaultPref(), ...local.getPref() },
 };
+
+const CACHE_MAX = 40; // 内存章缓存上限（LRU，防千章书无限膨胀）
 
 function defaultPref() {
   return { fs: 18, lh: 1.95, theme: 'paper' };
@@ -143,6 +146,7 @@ export async function openBook(id) {
   state.book = meta;
   state.chapters = meta.chapters.map((c, i) => ({ ...c, i }));
   state.cache.clear();
+  state.inflight.clear();
   state.cur = 0;
   state.toc = { draw: TOC_PAGE, side: TOC_PAGE };
 
@@ -224,21 +228,43 @@ async function loadChapter(idx) {
   const ch = state.chapters[idx];
   const hit = state.cache.get(ch.key);
   if (hit !== undefined) return hit;
-  try {
-    const t = await api.chapter(state.book.id, ch.key, state.book.cleanVer || 1);
-    state.cache.set(ch.key, t);
-    // 若该书已整本离线，顺带更新缓存
-    offline.cacheChapterIfDownloaded(state.book.id, ch.key, t).catch(() => {});
-    return t;
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) throw e;
-    // 网络失败 → 离线缓存兜底
-    const off = await offline.getChapter(state.book.id, ch.key).catch(() => null);
-    if (off != null) {
-      state.cache.set(ch.key, off);
-      return off;
+  // 同一章的并发请求合并为一次（翻章/目录跳转撞上后台预取时，直接搭同一请求）
+  const pending = state.inflight.get(ch.key);
+  if (pending) return pending;
+  const task = (async () => {
+    try {
+      const t = await api.chapter(state.book.id, ch.key, state.book.cleanVer || 1);
+      cachePut(ch.key, t);
+      // 若该书已整本离线，顺带更新缓存
+      offline.cacheChapterIfDownloaded(state.book.id, ch.key, t).catch(() => {});
+      return t;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) throw e;
+      // 网络失败 → 离线缓存兜底
+      const off = await offline.getChapter(state.book.id, ch.key).catch(() => null);
+      if (off != null) {
+        cachePut(ch.key, off);
+        return off;
+      }
+      throw e;
     }
-    throw e;
+  })();
+  state.inflight.set(ch.key, task);
+  try {
+    return await task;
+  } finally {
+    state.inflight.delete(ch.key);
+  }
+}
+
+/** 写入章缓存（LRU：命中提升为最新，超上限淘汰最久未读的章） */
+function cachePut(key, text) {
+  state.cache.delete(key);
+  state.cache.set(key, text);
+  while (state.cache.size > CACHE_MAX) {
+    const oldest = state.cache.keys().next().value;
+    if (oldest === undefined) break;
+    state.cache.delete(oldest);
   }
 }
 

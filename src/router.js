@@ -450,8 +450,24 @@ async function createBookRecord(store, body) {
   return json({ ok: true, duplicate: false, id, chapterKeys: chTable.map((c) => c.key) });
 }
 
-/** 上传一章：body 为清洗后文本（utf-8） */
+/** 上传一章：body 为清洗后文本（utf-8）
+ * 只放行「建书/更新中」（creating）的书：已发布书若走这里直写正文，
+ * 会绕过就地编辑的字数修正 / cleanVer+1 / index 镜像同步，造成长期不一致。 */
 async function apiPutChapter(req, env, store, id, key) {
+  const meta = await readBook(store, id);
+  if (!meta) {
+    await dropBody(req);
+    return json({ error: '书不存在' }, 404);
+  }
+  if (meta.status === 'ready') {
+    await dropBody(req);
+    return json({ error: '书已发布，请改用章节编辑接口' }, 409);
+  }
+  // 只放行章表内 key：建书/更新期往表外 key 塞正文会生成「publish 后无人认领」的孤儿对象
+  if (!(Array.isArray(meta.chapters) ? meta.chapters : []).some((c) => c.key === key)) {
+    await dropBody(req);
+    return json({ error: '章节不在章表中' }, 404);
+  }
   const max = Number(env.MAX_CHAPTER || 2097152);
   const declared = Number(req.headers.get('content-length') || 0);
   if (declared > max) {
@@ -512,7 +528,14 @@ async function apiUpdateChapters(req, env, store, id) {
   const now = Date.now();
 
   if (op === 'append') {
-    const startKey = oldCh.length + 1;
+    // 起点取「现有数字 key 最大值 +1」与「章数+1」的较大者：
+    // 就地删除会让数字 key 变稀疏（如 [1,3]），只按章数推算会撞上已存在的 key → 新正文覆盖旧章
+    let maxNum = 0;
+    for (const c of oldCh) {
+      const n = Number(c.key);
+      if (Number.isInteger(n) && n > maxNum) maxNum = n;
+    }
+    const startKey = Math.max(oldCh.length + 1, maxNum + 1);
     const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
     meta.chapters = oldCh.concat(add);
   } else {
@@ -553,10 +576,11 @@ async function apiUpdateChapters(req, env, store, id) {
   }
   if (body.wordCount !== undefined) {
     // append 只传新增部分的字数 → 在旧字数上累加；replace 传的是整本字数 → 直接采用
+    // 负字数（异常客户端）在 replace 采用时即压回 0，不必等 publish 才修正
     meta.wordCount =
       op === 'append'
         ? (Number(meta.wordCount) || 0) + (Number(body.wordCount) || 0)
-        : Number(body.wordCount) || 0;
+        : Math.max(0, Number(body.wordCount) || 0);
   }
   meta.cleanVer = (Number(meta.cleanVer) || 0) + 1;
   meta.updatedAt = now;
@@ -677,6 +701,177 @@ async function apiChapter(store, id, key) {
   return new Response(t, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
+/* ---------------- v1.1：已发布书的章节就地编辑（改标题/改正文/插入/删除） ----------------
+ * 就地编辑 ≠ replace 整表重建：新章用 newId 生成独立 key，既有章节 key 永不重排，
+ * 只写 meta 章表数组 + 受影响的正文对象 → 单次操作子请求 ≤10，远在 50 预算内。
+ * 仅放行 status==='ready' 的已发布书（书全程保持可读）；半成品走 /chapters 整表通道。
+ * 一致性规则：
+ *   - 标题传空 → 自动兜底「第 N 章」（N=当前位置 1-based）
+ *   - 改正文/删章按旧正文实际字数修正 meta.wordCount（读一次旧章，预算内）
+ *   - cleanVer+1：失效阅读缓存与 PWA 离线整本（前端提示重新下载）
+ *   - 插入/删除改变后续章号 → 云端进度按规则迁移（index 进度镜像一并更新）
+ */
+function chIndex(meta, key) {
+  const arr = Array.isArray(meta.chapters) ? meta.chapters : [];
+  return arr.findIndex((c) => c.key === key);
+}
+const wordsOf = (text) => String(text == null ? '' : text).replace(/\s/g, '').length;
+
+/** 就地编辑前提：书在架 + 存在 + 已发布；返回 { meta } 或 { resp }（直接作为响应） */
+async function editableMeta(store, id) {
+  const index = await readIndex(store);
+  if (!(index.books || []).some((b) => b.id === id)) {
+    return { resp: json({ error: '书不在书架（可能已删除或未发布）' }, 404) };
+  }
+  const meta = await readBook(store, id);
+  if (!meta) return { resp: json({ error: '书不存在' }, 404) };
+  if (meta.status !== 'ready') return { resp: json({ error: '书正在更新中，请稍后重试' }, 409) };
+  return { meta };
+}
+
+/** 就地编辑后同步书架摘要：快照 → 重建该条目（章数/字数/更新时间 + 保留 pinned/进度镜像） */
+async function syncIndexAfterEdit(store, meta) {
+  const index = await readIndex(store);
+  await writeIndexBak(store);
+  let prog;
+  try {
+    const pt = await store.getText(KEY.progress(meta.id));
+    if (pt) {
+      const p = JSON.parse(pt);
+      if (p && Number.isFinite(p.ch)) prog = { ch: p.ch, ratio: p.ratio || 0, updatedAt: p.updatedAt || 0 };
+    }
+  } catch {
+    /* 无进度则沿用原镜像 */
+  }
+  const books = (index.books || []).map((b) =>
+    b.id === meta.id ? { ...indexEntryFromMeta(meta), pinned: !!b.pinned, prog: prog || b.prog } : b
+  );
+  await writeIndex(store, { books });
+}
+
+/** 插入章后迁移进度：原进度章在插入位之后 → 章号 +1（章正文未变） */
+async function shiftProgressOnInsert(store, id, at) {
+  const t = await store.getText(KEY.progress(id));
+  if (!t) return;
+  try {
+    const p = JSON.parse(t);
+    if (p && Number.isFinite(p.ch) && p.ch >= 1 && p.ch - 1 >= at) {
+      await store.putText(KEY.progress(id), JSON.stringify({ ch: p.ch + 1, ratio: p.ratio || 0, updatedAt: Date.now() }));
+    }
+  } catch {
+    /* 损坏进度忽略 */
+  }
+}
+
+/** 删除章后迁移进度：进度在被删章之后 → 章号 -1；删的恰是进度章 → 原地顶替；
+ *  新章数 newLen 用于把越界进度（删末章后 ch > 章数）压回新末章——书架角标直接读
+ *  progress 镜像，不 clamp 就会显示「读到 5/4 章」这类越界数字。 */
+async function shiftProgressOnDelete(store, id, di, newLen) {
+  const t = await store.getText(KEY.progress(id));
+  if (!t) return;
+  try {
+    const p = JSON.parse(t);
+    if (p && Number.isFinite(p.ch) && p.ch >= 1) {
+      let ch = p.ch;
+      if (ch - 1 > di) ch -= 1; // 被删章之后 → 前移
+      if (ch > newLen) ch = newLen; // 删的是末章/进度章且越界 → 压回新末章
+      await store.putText(KEY.progress(id), JSON.stringify({ ch, ratio: p.ratio || 0, updatedAt: Date.now() }));
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** PATCH /api/books/:id/chapters/:key — 就地改标题 / 改正文（body: { title?, content? }） */
+async function apiPatchChapter(req, env, store, id, key) {
+  const g = await editableMeta(store, id);
+  if (!g.meta) return g.resp;
+  const meta = g.meta;
+  const i = chIndex(meta, key);
+  if (i < 0) return json({ error: '章节不存在' }, 404);
+  const body = await req.json().catch(() => ({}));
+  const hasTitle = typeof body.title === 'string';
+  const hasContent = typeof body.content === 'string';
+  if (!hasTitle && !hasContent) return json({ error: '没有要修改的内容' }, 400);
+
+  const ch = meta.chapters[i];
+  if (hasTitle) {
+    const t = body.title.trim();
+    ch.title = t ? safeStr(t, 120) : '第' + (i + 1) + '章';
+  }
+  if (hasContent) {
+    const max = Number(env.MAX_CHAPTER || 2097152);
+    if (enc.encode(body.content).byteLength > max) return json({ error: '章节超过上限' }, 413);
+    const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
+    const newWords = wordsOf(body.content);
+    await store.putText(KEY.text(id, key), body.content);
+    meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) + newWords - oldWords);
+  }
+  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+  meta.updatedAt = Date.now();
+  await store.putText(KEY.book(id), JSON.stringify(meta));
+  await syncIndexAfterEdit(store, meta);
+  return json({ ok: true, title: ch.title, cleanVer: meta.cleanVer, wordCount: meta.wordCount });
+}
+
+/** POST /api/books/:id/chapters/insert — 插入一章（body: { after?: key|null, title?, content? }）
+ * 新章获得独立 key（不与数字 key 冲突），老章 key 与正文全部保持不动。 */
+async function apiInsertChapter(req, env, store, id) {
+  const g = await editableMeta(store, id);
+  if (!g.meta) return g.resp;
+  const meta = g.meta;
+  const body = await req.json().catch(() => ({}));
+  const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
+  const content = typeof body.content === 'string' ? body.content : '';
+  if (!titleRaw && !content) return json({ error: '章节标题和正文不能都为空' }, 400);
+  const max = Number(env.MAX_CHAPTER || 2097152);
+  if (enc.encode(content).byteLength > max) return json({ error: '章节超过上限' }, 413);
+
+  if (!Array.isArray(meta.chapters)) meta.chapters = [];
+  const arr = meta.chapters; // 必须挂在 meta 上：否则非数组边界下插入结果会丢失
+  let at = arr.length; // 默认追加到末尾
+  if (body.after !== undefined && body.after !== null && body.after !== '') {
+    const j = arr.findIndex((c) => c.key === body.after);
+    if (j < 0) return json({ error: '参照章节不存在' }, 404);
+    at = j + 1;
+  }
+  const key = newId();
+  const title = titleRaw || '第' + (at + 1) + '章';
+  await shiftProgressOnInsert(store, id, at); // 先迁移进度，再改章表
+  arr.splice(at, 0, { key, title: safeStr(title, 120) });
+  meta.chapterCount = arr.length;
+  meta.wordCount = (Number(meta.wordCount) || 0) + wordsOf(content);
+  await store.putText(KEY.text(id, key), content); // 空正文也落盘（阅读时提示无内容，不 404）
+  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+  meta.updatedAt = Date.now();
+  await store.putText(KEY.book(id), JSON.stringify(meta));
+  await syncIndexAfterEdit(store, meta);
+  return json({ ok: true, key, title: meta.chapters[at].title, chapterCount: meta.chapters.length, cleanVer: meta.cleanVer });
+}
+
+/** DELETE /api/books/:id/chapters/:key — 删除一章（正文一并清除） */
+async function apiDeleteChapter(store, id, key) {
+  const g = await editableMeta(store, id);
+  if (!g.meta) return g.resp;
+  const meta = g.meta;
+  if (!Array.isArray(meta.chapters)) meta.chapters = [];
+  const arr = meta.chapters;
+  const i = arr.findIndex((c) => c.key === key);
+  if (i < 0) return json({ error: '章节不存在' }, 404);
+  if (arr.length <= 1) return json({ error: '至少保留一章' }, 400);
+  const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
+  await shiftProgressOnDelete(store, id, i, arr.length - 1); // 先迁移进度（用删除前的下标与新章数），再改章表
+  meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) - oldWords);
+  await store.delete(KEY.text(id, key));
+  arr.splice(i, 1);
+  meta.chapterCount = arr.length;
+  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+  meta.updatedAt = Date.now();
+  await store.putText(KEY.book(id), JSON.stringify(meta));
+  await syncIndexAfterEdit(store, meta);
+  return json({ ok: true, chapterCount: arr.length, cleanVer: meta.cleanVer, wordCount: meta.wordCount });
+}
+
 /* ---------------- 进度（DR-02：R2 小对象 + index 镜像供书架角标） ---------------- */
 
 const EMPTY_PROG = { ch: 0, ratio: 0, updatedAt: 0 };
@@ -720,18 +915,21 @@ async function apiProgressPut(req, store, id) {
 
 /* ---------------- 回收站 API ---------------- */
 
-/** 软删：index 摘除 → trash（正文/meta/raw 全保留，可恢复） */
+/** 软删：index 摘除 → trash（正文/meta/raw 全保留，可恢复）
+ * 也接纳「未上架的半成品书」（上传中途失败停在 creating、不在 index）：
+ * 这类书若不能进回收站就永远删不掉、也看不见，只能留成孤儿数据。 */
 async function apiSoftDelete(store, id) {
   const index = await readIndex(store);
   const b = (index.books || []).find((x) => x.id === id);
-  if (!b) return json({ error: '书不存在或已删除' }, 404);
+  const meta = b ? null : await readBook(store, id);
+  if (!b && !meta) return json({ error: '书不存在或已删除' }, 404);
   await writeIndexBak(store);
   const books = (index.books || []).filter((x) => x.id !== id);
   await writeIndex(store, { books });
 
   const trash = await readTrash(store);
   if (!trash.books.some((x) => x.id === id)) {
-    trash.books.push({ ...b, deletedAt: Date.now() });
+    trash.books.push({ ...(b || indexEntryFromMeta(meta)), deletedAt: Date.now() });
     await writeTrash(store, trash);
   }
   return json({ ok: true });
@@ -756,13 +954,22 @@ async function apiTrashList(store, env) {
   return json({ books: view });
 }
 
-/** 恢复：trash → index（正文未删时） */
+/** 恢复：trash → index（正文未删时）
+ * 只放行已发布（status='ready'）的书：半成品/更新中的书恢复回书架后既读不了（bookMeta 409）
+ * 也没有继续上传的入口，只会变成书架上一本点不开的孤儿。 */
 async function apiRestore(store, id) {
   const trash = await readTrash(store);
   const idx = trash.books.findIndex((b) => b.id === id);
   if (idx < 0) return json({ error: '回收站里没有这本书' }, 404);
   const entry = trash.books[idx];
   if (entry.purge) return json({ error: '该书的正文已部分清除，无法完整恢复' }, 409);
+  // 软删自半成品（第三轮起可软删 creating 书）：trash 条目来自 indexEntryFromMeta，无 status 字段。
+  // 一律以 meta 本体为准：只有已发布书恢复才有阅读/继续编辑入口，其余只会变书架孤儿。
+  const meta = await readBook(store, id);
+  if (!meta) return json({ error: '书本体数据缺失，无法恢复' }, 404);
+  if (meta.status !== 'ready') {
+    return json({ error: '该书尚未发布，无法恢复；如不再需要请在回收站中彻底删除' }, 409);
+  }
   trash.books.splice(idx, 1);
   await writeTrash(store, trash);
 
@@ -1015,6 +1222,11 @@ async function handleApi(req, env, store, url, p) {
   if (mChapters && !isSafeId(mChapters[1])) return notFound();
   if (mChapters && req.method === 'POST') return apiUpdateChapters(req, env, store, mChapters[1]);
 
+  // 章节就地编辑：插入（v1.1）。注意必须在单章 /chapters/:key 之前匹配，否则 'insert' 会被当成 key
+  const mIns = /^\/api\/books\/([^/]+)\/chapters\/insert$/.exec(p);
+  if (mIns && !isSafeId(mIns[1])) return notFound();
+  if (mIns && req.method === 'POST') return apiInsertChapter(req, env, store, mIns[1]);
+
   const mCh = /^\/api\/books\/([^/]+)\/chapters\/([^/]+)$/.exec(p);
   if (mCh && (!isSafeId(mCh[1]) || !isSafeId(mCh[2]))) {
     await dropBody(req);
@@ -1022,6 +1234,8 @@ async function handleApi(req, env, store, url, p) {
   }
   if (mCh && req.method === 'PUT') return apiPutChapter(req, env, store, mCh[1], mCh[2]);
   if (mCh && req.method === 'GET') return apiChapter(store, mCh[1], mCh[2]);
+  if (mCh && req.method === 'PATCH') return apiPatchChapter(req, env, store, mCh[1], mCh[2]);
+  if (mCh && req.method === 'DELETE') return apiDeleteChapter(store, mCh[1], mCh[2]);
 
   const mBook = /^\/api\/books\/([^/]+)$/.exec(p);
   if (mBook && !isSafeId(mBook[1])) {

@@ -19,9 +19,8 @@ export function busyDone() {
   if (ui.mask) ui.mask.classList.add('hidden');
 }
 
-/** 触发浏览器下载一段文本 */
-export function downloadText(text, filename) {
-  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+/** 触发浏览器下载一个 Blob（整本导出走它，避免把大文本整份读进 JS 字符串） */
+export function downloadBlob(blob, filename) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = filename;
@@ -31,4 +30,9 @@ export function downloadText(text, filename) {
     URL.revokeObjectURL(a.href);
     a.remove();
   }, 800);
+}
+
+/** 触发浏览器下载一段文本 */
+export function downloadText(text, filename) {
+  downloadBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), filename);
 }

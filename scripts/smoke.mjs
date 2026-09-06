@@ -215,6 +215,32 @@ async function main() {
   r = await api(`/api/books/${idReplace}`);
   check('M2 append 后共 5 章', r.data.chapterCount === 5);
 
+  /* ============== v1.1 已发布书章节就地编辑 ============== */
+  console.log('\n[ v1.1 章节编辑 ]');
+  // 改标题 + 改正文
+  r = await api(`/api/books/${idReplace}/chapters/3`, { method: 'PATCH', body: { title: '新章 终（改名）' } });
+  check('v1.1 PATCH 改标题', r.status === 200 && r.data.title === '新章 终（改名）' && r.data.cleanVer >= 3);
+  const editBody = '这是就地编辑后的第2章正文内容。';
+  r = await api(`/api/books/${idReplace}/chapters/2`, { method: 'PATCH', body: { content: editBody } });
+  check('v1.1 PATCH 改正文', r.status === 200 && r.data.wordCount > 0);
+  r = await api(`/api/books/${idReplace}/chapters/2`);
+  check('v1.1 新正文可取', r.status === 200 && r.text === editBody);
+  // 中间插入 + 末尾追加 + 删除
+  r = await api(`/api/books/${idReplace}/chapters/insert`, { method: 'POST', body: { after: '3', title: '插入章', content: '插进来的正文。' } });
+  check('v1.1 中部插入（独立 key）', r.status === 200 && r.data.chapterCount === 6 && /^n_/.test(r.data.key || ''));
+  const insKey = r.data.key;
+  r = await api(`/api/books/${idReplace}/chapters/${insKey}`);
+  check('v1.1 插入章正文可取', r.status === 200 && r.text.includes('插进来的正文'));
+  r = await api(`/api/books/${idReplace}/chapters/insert`, { method: 'POST', body: { title: '尾章', content: 'end' } });
+  check('v1.1 末尾追加', r.status === 200 && r.data.chapterCount === 7);
+  r = await api(`/api/books/${idReplace}/chapters/${insKey}`, { method: 'DELETE' });
+  check('v1.1 删除插入章', r.status === 200 && r.data.chapterCount === 6);
+  r = await api(`/api/books/${idReplace}`);
+  check('v1.1 章表顺序正确且书可读', r.status === 200 && r.data.chapters.length === 6 && r.data.chapters[2].title === '新章 终（改名）');
+  r = await api('/api/books');
+  const bEdit = (r.data.books || []).find((x) => x.id === idReplace);
+  check('v1.1 书架字数/章数镜像同步', bEdit && bEdit.chapterCount === 6 && bEdit.wordCount > 0);
+
   // 软删 + 回收站
   await api(`/api/books/${idTrash}`, { method: 'DELETE' });
   r = await api('/api/books');

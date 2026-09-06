@@ -50,6 +50,16 @@ export const api = {
   updateChapters(id, payload) {
     return request(`/api/books/${encodeURIComponent(id)}/chapters`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
   },
+  // v1.1：已发布书章节就地编辑
+  patchChapter(id, key, patch) {
+    return request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) });
+  },
+  insertChapter(id, payload) {
+    return request(`/api/books/${encodeURIComponent(id)}/chapters/insert`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+  },
+  deleteChapter(id, key) {
+    return request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'DELETE' });
+  },
   deleteBook: (id) => request(`/api/books/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   trash: () => request('/api/trash'),
   restore: (id) => request(`/api/books/${encodeURIComponent(id)}/restore`, { method: 'POST' }),

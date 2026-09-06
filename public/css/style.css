@@ -194,6 +194,57 @@ legend label { display: flex; align-items: center; gap: 6px; }
 .prog-fill { height: 100%; background: var(--accent); width: 0; transition: width .15s; }
 #upProgText { display: block; margin-top: 6px; }
 
+/* ============ v1.1：章节编辑（上传预览行 + 书架「编辑章节」弹层共用） ============ */
+.pv-btn {
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+  border-radius: 7px; font-size: 12.5px; line-height: 1; padding: 5px 8px; cursor: pointer; flex: none;
+}
+.pv-btn:hover { color: var(--accent); border-color: var(--accent); }
+.pv-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+/* 上传分章预览：每行改为可编辑（序号 + 标题输入 + 字数 + 操作钮 / 可展开正文） */
+.chapter-preview li.pv-row { flex-direction: column; align-items: stretch; gap: 6px; padding: 8px 10px; }
+.pv-line { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; }
+.pv-line .ch-t,
+.ce-line .ce-title {
+  flex: 1; min-width: 0; font: inherit; font-size: 13.5px; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 7px; background: #fbfaf6;
+  padding: 4px 8px; outline: none;
+}
+.pv-line .ch-t:focus,
+.ce-line .ce-title:focus { border-color: var(--accent); background: var(--panel); }
+.pv-body { width: 100%; }
+.pv-body textarea, .ce-body textarea {
+  width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 8px;
+  background: #fbfaf6; color: var(--fg);
+  font: 12.5px/1.6 ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei", monospace;
+  padding: 8px 10px; outline: none; resize: vertical;
+}
+.pv-body textarea:focus, .ce-body textarea:focus { border-color: var(--accent); background: var(--panel); }
+li.pv-add { border-top: 1px dashed var(--line); }
+li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); border-style: dashed; }
+.chapter-preview li.muted { justify-content: center; padding: 8px; }
+
+/* 书架「编辑章节」弹层（宽模态：章节列表 + 行内操作） */
+.modal-box.ce { max-width: 760px; width: min(96vw, 760px); }
+.modal-box.ce h3 { margin-bottom: 2px; }
+.ce-stat { margin: 0 0 4px; }
+.ce-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 52vh; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.ce-row { border-bottom: 1px solid #f0efe9; }
+.ce-row:last-child { border-bottom: 0; }
+.ce-line { display: flex; align-items: center; gap: 7px; padding: 8px 12px; }
+.ce-body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+.ce-body-acts { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.ce-body-acts .pv-save {
+  border: 0; background: var(--accent); color: #fff; border-radius: 999px;
+  padding: 6px 14px; font-size: 13px; cursor: pointer;
+}
+.ce-body-acts .pv-save:disabled { opacity: .5; }
+.ce-body-acts .pv-tip { font-size: 11.5px; color: var(--muted); margin-right: auto; }
+.ce-empty { text-align: center; padding: 26px 10px; }
+.ce-foot { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+.ce-foot .grow { flex: 1; }
+.ce-busy { font-size: 11.5px; color: var(--muted); }
+
 /* 阅读器 */
 #view-read { position: relative; }
 .read-top {
@@ -399,6 +450,8 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
 }
 .modal-box h3 { margin: 0 0 6px; font-size: 16px; }
 .modal-box .modal-sub { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; }
+/* 确认弹层的说明文案较长（原本靠内联 style 放大）→ 收敛为类 */
+.modal-box .confirm-text { font-size: 14px; line-height: 1.55; }
 .modal-box .m-field { margin-bottom: 10px; }
 .modal-box .m-field label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
 .modal-box .m-field input {

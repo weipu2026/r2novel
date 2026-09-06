@@ -96,11 +96,21 @@ export const offline = {
     await this.putChapter(bookId, chKey, text);
     return true;
   },
+  /** 入队一条离线进度（同一本书只保留最新一条，last-write-wins）
+   * 拆成「只读取旧 → 只写新」两个事务：IDB 事务在 await 让出后会被浏览器自动提交，
+   * 在同一事务内跨 await 再 put/delete 会抛 TransactionInactiveError（离线进度丢失）。 */
   async queueProgress(bookId, p) {
-    await inTx('progQueue', 'readwrite', async (os, p2) => {
-      const all = (await p2(os.getAll())) || [];
-      for (const r of all) if (r.bookId === bookId) os.delete(r.at);
-      os.put({ bookId, ch: p.ch, ratio: p.ratio, updatedAt: p.updatedAt, at: Date.now() });
+    const rows = (await inTx('progQueue', 'readonly', (os, rp) => rp(os.getAll()))) || [];
+    const drop = [];
+    let at = Date.now();
+    for (const r of rows) {
+      if (r.bookId === bookId) drop.push(r.at);
+      if (r.at >= at) at = r.at + 1; // keyPath=at 必须唯一：同毫秒入队会互相覆盖
+    }
+    const rec = { bookId, ch: p.ch, ratio: p.ratio, updatedAt: p.updatedAt, at };
+    await inTx('progQueue', 'readwrite', (os) => {
+      for (const k of drop) os.delete(k);
+      os.put(rec);
     });
   },
   /** 回网上送离线进度；send(bookId,{ch,ratio}) 抛错则保留 */

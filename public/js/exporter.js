@@ -2,16 +2,18 @@
  * 优先走服务端流式端点 GET /export/<id>.txt（1 个请求，逐章流式拼好）；
  * 服务端不可用时（离线 / 书未发布 404）回退浏览器逐章拉取拼接（IndexedDB 缓存离线可用）。 */
 import { fetchChaptersAll } from './store.js';
-import { downloadText } from './ui.js';
+import { downloadText, downloadBlob } from './ui.js';
 
 /** 拉全章 → 拼 txt → 触发浏览器下载。返回书名。 */
 export async function exportBookTxt(id, onProg) {
   try {
-    const r = await fetch(`/export/${id}.txt`);
+    const r = await fetch(`/export/${encodeURIComponent(id)}.txt`);
     if (r.ok) {
-      const text = await r.text();
-      const title = (text.split('\n', 1)[0] || '').trim() || 'book';
-      downloadText(text, title + '.txt');
+      // 流式端点的成果直接以 Blob 落盘：整本最大 50MB，读成字符串会再占一份内存
+      const blob = await r.blob();
+      const head = await blob.slice(0, 4096).text(); // 书名只从头 4KB 的第一行取
+      const title = (head.split('\n', 1)[0] || '').trim() || 'book';
+      downloadBlob(blob, title + '.txt');
       return title;
     }
     // 404（未发布/半成品）等情况 → 落到客户端兜底

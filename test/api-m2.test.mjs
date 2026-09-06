@@ -321,3 +321,282 @@ test('M2：F16 备注 —— replace 重洗带 note / append 保留旧 note', as
   r = await call(store, req(`/api/books/${id}`, { cookie }));
   assert.equal(r.data.note, '重洗备注', 'replace 携带 note 时覆盖');
 });
+
+/* ================= v1.1：已发布书章节就地编辑 ================= */
+
+const wc = (s) => String(s || '').replace(/\s/g, '').length;
+
+test('v1.1：PATCH 章节标题+正文 → 同步 meta/字数/cleanVer/书架摘要，书保持可读', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '就地编辑书', 3);
+  const oldMeta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+
+  const newContent = '这是改过的第二章正文，字数会变。abc123';
+  let r = await call(store, req(`/api/books/${id}/chapters/2`, { method: 'PATCH', cookie, body: { title: '第二章 新题名', content: newContent } }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.title, '第二章 新题名');
+  assert.equal(r.data.cleanVer, oldMeta.cleanVer + 1, 'cleanVer +1');
+
+  const meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.equal(meta.status, 'ready', '就地编辑后书保持已发布可读');
+  assert.equal(meta.chapters.length, 3, '章节数不变');
+  assert.equal(meta.chapters[1].title, '第二章 新题名');
+  const oldW = wc('第2章正文内容，用于测试。');
+  assert.equal(meta.wordCount, oldMeta.wordCount - oldW + wc(newContent), '字数按新旧差修正');
+
+  r = await call(store, req(`/api/books/${id}/chapters/2`, { cookie }));
+  assert.equal(r.status, 200);
+  assert.equal(r.text, newContent, '正文已覆盖');
+
+  // 书架摘要镜像字数
+  const books = (await call(store, req('/api/books', { cookie }))).data.books;
+  const b = books.find((x) => x.id === id);
+  assert.equal(b.wordCount, meta.wordCount, 'index 字数镜像同步');
+});
+
+test('v1.1：PATCH 仅标题 / 空标题兜底第N章 / 无修改内容 400', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '改题书', 2);
+  const before = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+
+  let r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PATCH', cookie, body: { title: '   ' } }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.title, '第1章', '空标题兜底为第 N 章');
+
+  r = await call(store, req(`/api/books/${id}`, { cookie }));
+  assert.equal(r.data.wordCount, before.wordCount, '仅改标题不动字数');
+
+  r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PATCH', cookie, body: {} }));
+  assert.equal(r.status, 400, '无修改内容拒绝');
+
+  r = await call(store, req(`/api/books/${id}/chapters/99`, { method: 'PATCH', cookie, body: { title: 'x' } }));
+  assert.equal(r.status, 404, '不存在的章 404');
+
+  // 半成品状态不可就地编辑：
+  //   a) 未发布书不在书架 → 404
+  const fresh = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '半成品书', chapters: ['第一章'], wordCount: 1 } }))).data;
+  r = await call(store, req(`/api/books/${fresh.id}/chapters/1`, { method: 'PATCH', cookie, body: { title: 'x' } }));
+  assert.equal(r.status, 404, '未发布书不在书架 → 404');
+  //   b) replace 重建后（在架但 creating）→ 409
+  await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'replace', chapters: ['新章'], wordCount: 1 } }));
+  r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PATCH', cookie, body: { title: 'x' } }));
+  assert.equal(r.status, 409, '在架但 creating（替换中）→ 409');
+
+  await call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie }));
+  r = await call(store, req(`/api/books/${id}/chapters/2`, { method: 'PATCH', cookie, body: { title: 'x' } }));
+  assert.equal(r.status, 404, '软删后 404');
+});
+
+test('v1.1：INSERT 中部/末尾插入（独立 key），章序/字数/书架同步，进度顺移', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '插章书', 3);
+  const oldMeta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 3, ratio: 0.5 } }));
+
+  const body = '插入的正文。';
+  let r = await call(store, req(`/api/books/${id}/chapters/insert`, { method: 'POST', cookie, body: { after: '1', title: '第一章 补', content: body } }));
+  assert.equal(r.status, 200);
+  assert.ok(r.data.key.startsWith('n_'), '新章用独立 n_ key，不与数字 key 冲突');
+  assert.equal(r.data.chapterCount, 4);
+
+  let meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.deepEqual(meta.chapters.map((c) => c.key), ['1', r.data.key, '2', '3'], '插入后老章 key 稳定不动');
+  assert.equal(meta.chapters[1].title, '第一章 补');
+  assert.equal(meta.wordCount, oldMeta.wordCount + wc(body), '字数累加');
+
+  r = await call(store, req(`/api/books/${id}/chapters/${r.data.key}`, { cookie }));
+  assert.equal(r.text, body, '新章正文可取');
+
+  // 进度迁移：插在第 3 章之前 → ch 3 → 4
+  const prog = (await call(store, req(`/api/progress/${id}`, { cookie }))).data;
+  assert.equal(prog.ch, 4, '插入后进度章号顺移 +1');
+
+  // 末尾追加（不传 after）
+  r = await call(store, req(`/api/books/${id}/chapters/insert`, { method: 'POST', cookie, body: { title: '尾章', content: '尾。' } }));
+  assert.equal(r.status, 200);
+  meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.equal(meta.chapters.length, 5);
+  assert.equal(meta.chapters[4].title, '尾章');
+
+  // 校验边界
+  r = await call(store, req(`/api/books/${id}/chapters/insert`, { method: 'POST', cookie, body: {} }));
+  assert.equal(r.status, 400, '标题与正文都为空拒绝');
+  r = await call(store, req(`/api/books/${id}/chapters/insert`, { method: 'POST', cookie, body: { after: 'nope', title: 'x', content: 'y' } }));
+  assert.equal(r.status, 404, '参照章节不存在 404');
+});
+
+test('v1.1：DELETE 章节 → 字数/书架同步、正文清除、进度回退；末章不可删', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '删章书', 3);
+  const oldMeta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 3, ratio: 0.4 } }));
+
+  let r = await call(store, req(`/api/books/${id}/chapters/2`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.chapterCount, 2);
+  assert.ok(!store._map.has(`text/${id}/2.txt`), '被删章正文对象已清除');
+
+  let meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.deepEqual(meta.chapters.map((c) => c.key), ['1', '3'], '数组移除且老章 key 不动');
+  assert.equal(meta.wordCount, oldMeta.wordCount - wc('第2章正文内容，用于测试。'), '字数扣减');
+
+  const books = (await call(store, req('/api/books', { cookie }))).data.books;
+  const b = books.find((x) => x.id === id);
+  assert.equal(b.chapterCount, 2, '书架章数镜像同步');
+
+  // 进度迁移：ch3 在被删章(idx1)之后 → 2
+  const prog = (await call(store, req(`/api/progress/${id}`, { cookie }))).data;
+  assert.equal(prog.ch, 2, '删除后进度章号回退 -1');
+
+  // 末章不可删 / 不存在章 404
+  const only = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '单章书', chapters: ['仅一章'], wordCount: 3 } }))).data;
+  await call(store, req(`/api/books/${only.id}/chapters/1`, { method: 'PUT', cookie, body: '单章正文' }));
+  await call(store, req(`/api/books/${only.id}/publish`, { method: 'POST', cookie }));
+  r = await call(store, req(`/api/books/${only.id}/chapters/1`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 400, '至少保留一章');
+
+  r = await call(store, req(`/api/books/${id}/chapters/9`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 404);
+});
+
+test('M2：F17 append 起点避让稀疏 key —— 删章后再追加不覆盖旧章正文', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const bk = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '稀疏key书', chapters: ['第1章', '第2章', '第3章'], wordCount: 30 } }))).data;
+  const id = bk.id;
+  const bodies = ['一一', '二二二', '三三三三'];
+  for (let i = 1; i <= 3; i++) await call(store, req(`/api/books/${id}/chapters/${i}`, { method: 'PUT', cookie, body: bodies[i - 1] }));
+  await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+
+  // 就地删除第 2 章 → 章表 key 变稀疏 [1,3]
+  await call(store, req(`/api/books/${id}/chapters/2`, { method: 'DELETE', cookie }));
+  let meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.deepEqual(meta.chapters.map((c) => c.key), ['1', '3'], '删除后 key 稀疏');
+
+  // append 2 章：按「章数+1」会算出 startKey=3 → 撞已有 key 3（旧实现会覆盖第 3 章正文）
+  const r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'append', chapters: ['第4章', '第5章'], wordCount: 10 } }));
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.data.chapterKeys, ['1', '3', '4', '5'], 'append 起点取最大数字 key+1');
+
+  await call(store, req(`/api/books/${id}/chapters/4`, { method: 'PUT', cookie, body: '四四四四四' }));
+  await call(store, req(`/api/books/${id}/chapters/5`, { method: 'PUT', cookie, body: '五五五五五五' }));
+  await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.deepEqual(meta.chapters.map((c) => c.key), ['1', '3', '4', '5']);
+  assert.equal(store._map.get(`text/${id}/3.txt`), '三三三三', '旧第 3 章正文未被 append 的新 key 覆盖');
+});
+
+test('M2：F18 已发布书禁止走建书通道直写正文（PUT /chapters/:key → 409）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const bk = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '发布态保护', chapters: ['第一章'], wordCount: 2 } }))).data;
+  const id = bk.id;
+  await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '原正文' }));
+  await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+
+  // 发布后直写正文必须被拒（否则绕过字数/cleanVer/index 同步）
+  let r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '直写覆盖' }));
+  assert.equal(r.status, 409, 'ready 书拒绝 PUT 正文');
+  assert.equal(store._map.get(`text/${id}/1.txt`), '原正文', '正文未被直写覆盖');
+
+  // 就地编辑通道照常可用
+  r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PATCH', cookie, body: { content: '改后正文' } }));
+  assert.equal(r.status, 200);
+  assert.equal(store._map.get(`text/${id}/1.txt`), '改后正文');
+
+  // 不存在的书 → 404（不是 409）
+  r = await call(store, req('/api/books/n_notexist/chapters/1', { method: 'PUT', cookie, body: 'x' }));
+  assert.equal(r.status, 404);
+});
+
+test('M2：F19 未上架的半成品书也能软删+彻底清除（上传中途失败不留孤儿）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  // 建书 → 只传部分正文 → 不 publish：停在 creating 且不在 index
+  const bk = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '半成品书', chapters: ['第一章', '第二章'], wordCount: 5 } }))).data;
+  const id = bk.id;
+  await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '半成品正文' }));
+  let r = await call(store, req('/api/books', { cookie }));
+  assert.ok(!(r.data.books || []).some((b) => b.id === id), '半成品不在书架');
+
+  // 软删必须接纳它（旧实现因不在 index 直接 404 → 数据永远删不掉）
+  r = await call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200, '未上架半成品也能软删');
+  r = await call(store, req('/api/trash', { cookie }));
+  const entry = (r.data.books || []).find((b) => b.id === id);
+  assert.ok(entry && entry.restorable, '进入回收站且可恢复');
+
+  // 彻底删除 → meta 与已传正文一并清除（purge 按批续调，书小则一次 done）
+  let remaining = 1;
+  let guard = 0;
+  while (remaining > 0 && guard++ < 10) {
+    const rr = await call(store, req(`/api/trash/${id}`, { method: 'DELETE', cookie }));
+    remaining = rr.data.remaining || 0;
+  }
+  assert.equal(store._map.has(`meta/${id}.json`), false, 'meta 已清除');
+  assert.equal(store._map.has(`text/${id}/1.txt`), false, '已传正文已清除');
+});
+
+test('M2：F20 未发布书（半成品）进回收站后不可恢复（避免书架孤儿）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  // 建书不发布 → creating，软删入回收站
+  const bk = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '半成品B', chapters: ['第一章'], wordCount: 2 } }))).data;
+  const id = bk.id;
+  await call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie }));
+  let r = await call(store, req(`/api/books/${id}/restore`, { method: 'POST', cookie }));
+  assert.equal(r.status, 409, 'creating 书不可恢复');
+  assert.equal(r.data.error.includes('尚未发布'), true, '提示未发布');
+  // 书仍留在回收站，可彻底删除
+  r = await call(store, req('/api/trash', { cookie }));
+  assert.ok((r.data.books || []).some((b) => b.id === id), '仍在回收站');
+  // 对照：已发布书软删后照常可恢复
+  const ok = await makeReadyBook(store, cookie, '可恢复书', 2);
+  await call(store, req(`/api/books/${ok.id}`, { method: 'DELETE', cookie }));
+  r = await call(store, req(`/api/books/${ok.id}/restore`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, 'ready 书可恢复');
+});
+
+test('M2：F21 建书/更新期 PUT 章表外 key → 404（堵孤儿正文来源）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const bk = (await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '表外书', chapters: ['第一章', '第二章'], wordCount: 2 } }))).data;
+  const id = bk.id;
+  // key=99 不在章表（表内只有 1、2）→ 拒绝落盘
+  let r = await call(store, req(`/api/books/${id}/chapters/99`, { method: 'PUT', cookie, body: '孤儿正文' }));
+  assert.equal(r.status, 404, '章表外 key 拒绝');
+  assert.equal(store._map.has(`text/${id}/99.txt`), false, '未产生孤儿对象');
+  // 表内 key 照常可传
+  r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '正常正文' }));
+  assert.equal(r.status, 200);
+  await call(store, req(`/api/books/${id}/chapters/2`, { method: 'PUT', cookie, body: '正文二' }));
+  r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, '正常流程 publish 不受影响');
+});
+
+test('M2：F22 就地删除末章后云端进度压回章数内（书架角标不越界）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '进度越界书', 3);
+  // 读到第 3 章（末章）并把进度上报云端
+  await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 3, ratio: 0.5 } }));
+  // 就地删除末章（key=3）→ 剩 2 章，进度应被压回 2 而不是留在 3
+  let r = await call(store, req(`/api/books/${id}/chapters/3`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.chapterCount, 2);
+  r = await call(store, req(`/api/progress/${id}`, { cookie }));
+  assert.equal(r.data.ch, 2, '末章删除后进度压回新末章');
+  // 书在书架镜像也同步为 2 章（索引已更新）
+  r = await call(store, req('/api/books', { cookie }));
+  const entry = (r.data.books || []).find((b) => b.id === id);
+  assert.equal(entry.chapterCount, 2);
+  // 删除中间章（key=1，进度 2 在其后）→ 进度前移为 1
+  r = await call(store, req(`/api/books/${id}/chapters/1`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200);
+  r = await call(store, req(`/api/progress/${id}`, { cookie }));
+  assert.equal(r.data.ch, 1, '删前章进度前移');
+});

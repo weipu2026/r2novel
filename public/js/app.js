@@ -4,6 +4,7 @@ import * as cleaner from './cleaner.js';
 import * as reader from './reader.js';
 import { bindBusy, busy, busyDone } from './ui.js';
 import { exportBookTxt } from './exporter.js';
+import { offline } from './offline.js';
 
 const $ = (sel, scope) => (scope || document).querySelector(sel);
 const $$ = (sel, scope) => Array.from((scope || document).querySelectorAll(sel));
@@ -303,11 +304,14 @@ function progBadgeText(b) {
   const p = b.prog;
   if (!p || !p.updatedAt) return '';
   const cc = b.chapterCount || 0;
-  const done = p.ch >= cc && cc > 0 && p.ratio > 0.96;
+  if (p.ch <= 0 || cc <= 0) return '';
+  // 就地删章后 progress 章号可能略超当前章数（服务端会压回，历史脏数据/竞态窗口仍可能越界）：
+  // 展示层 clamp，避免角标出现「读到 5/4 章」这类自相矛盾的数字
+  const ch = Math.min(p.ch, cc);
+  const done = ch >= cc && p.ratio > 0.96;
   if (done) return '已读完';
-  if (p.ch <= 0) return '';
-  const pct = p.ch >= cc ? Math.round((p.ratio || 0) * 100) : Math.round(((p.ch - 1 + (p.ratio || 0)) / cc) * 100);
-  return `读到 ${p.ch}/${cc} 章 · ${Math.max(1, Math.min(99, pct))}%`;
+  const pct = ch >= cc ? Math.round((p.ratio || 0) * 100) : Math.round(((ch - 1 + (p.ratio || 0)) / cc) * 100);
+  return `读到 ${ch}/${cc} 章 · ${Math.max(1, Math.min(99, pct))}%`;
 }
 
 function makeCard(b, big) {
@@ -378,8 +382,9 @@ function openSheet(b) {
     { text: '阅读', act: () => { closeSheet(); openRead(b.id); } },
     { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { closeSheet(); await safePatch(b.id, { pinned: !isPin }); } },
     { text: '编辑信息（书名/作者/标签/备注）', act: () => { closeSheet(); openEditModal(b); } },
+    { text: '编辑章节（标题/正文/增删章）', act: () => { closeSheet(); openChapterEditor(b); } },
     { text: '导出清洗后的 txt', act: () => { closeSheet(); exportBook(b); } },
-    { text: '重新清洗（用原件重排）', act: () => { closeSheet(); rewash(b); } },
+    { text: '重新清洗（用原件重排）', act: () => { closeSheet(); rewashConfirm(b); } },
   ];
   for (const it of items) {
     const btn = document.createElement('button');
@@ -468,13 +473,14 @@ function openModal(html) {
   els.modalMask.classList.remove('hidden');
 }
 function closeModal() {
+  els.modalBox.classList.remove('ce');
   els.modalMask.classList.add('hidden');
 }
 function confirmModal(text, okText = '确定') {
   return new Promise((resolve) => {
     openModal(`
       <h3>确认</h3>
-      <p class="modal-sub" style="font-size:14px">${esc(text)}</p>
+      <p class="modal-sub confirm-text">${esc(text)}</p>
       <div class="m-acts">
         <button class="ghost" id="cfNo" type="button">取消</button>
         <button class="primary" id="cfYes" type="button">${esc(okText)}</button>
@@ -606,6 +612,8 @@ async function clearTrashFlow() {
 
 // 上传会话：{ title, bytes, preview, updating:null|{id,op,book}, keepRaw }
 let pending = null;
+// 本次「新建」出来的书 id：入库中途失败时用它把半成品移入回收站（否则它不在书架、也清不掉）
+let createdId = null;
 
 function openUpload(opts = {}) {
   showView('upload');
@@ -637,12 +645,17 @@ function openUpload(opts = {}) {
     els.upNote.value = opts.book.note || '';
     hint(`正在用原件重新清洗《${opts.book.title}》，确认后整本替换`);
     busy(0.05, '下载原件…');
-    api.rawBytes(opts.book.id)
+    const bookId = opts.book.id;
+    const sameSession = () => !!(pending && pending.updating && pending.updating.id === bookId);
+    api.rawBytes(bookId)
       .then((bytes) => {
+        // 下载期间用户可能又选了别的文件（pending 已被替换）→ 丢弃这次回调，避免数据串台
+        if (!sameSession()) return;
         pending.bytes = bytes;
         runPreview();
       })
       .catch((e) => {
+        if (!sameSession()) return; // 同理：会话已切换就别把用户踢回书架
         toast('原件下载失败（可能未留档）：' + (e.message || e), 3000);
         showView('shelf');
       })
@@ -768,40 +781,125 @@ function runPreview() {
         ? `已按 ${cur} 编码解析${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''}`
         : `按 ${cur} 编码解析失败，请换一种或改回自动检测`)
     : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected || '未识别（整本一章）'} · 处理 ${ms}ms`;
-  els.upStats.textContent = `${r.chapters.length} 章 · ${fmtWords(r.words)}${r.fitNote ? ' · ' + r.fitNote : ''}`;
-
-  const ul = els.upList;
-  ul.innerHTML = '';
-  const MAX_PREVIEW = 500;
-  r.chapters.slice(0, MAX_PREVIEW).forEach((c, i) => {
-    const li = document.createElement('li');
-    const n = document.createElement('span');
-    n.className = 'ch-no';
-    n.textContent = String(i + 1);
-    const t = document.createElement('span');
-    t.className = 'ch-t';
-    t.textContent = c.title || '(无题)';
-    const w = document.createElement('span');
-    w.className = 'ch-w';
-    w.textContent = fmtWords(cleaner.countWords(c.content));
-    li.appendChild(n);
-    li.appendChild(t);
-    li.appendChild(w);
-    ul.appendChild(li);
-  });
-  if (r.chapters.length > MAX_PREVIEW) {
-    const li = document.createElement('li');
-    li.className = 'muted';
-    li.textContent = `…共 ${r.chapters.length} 章，确认后全部上传`;
-    ul.appendChild(li);
-  }
 
   els.upPrev.classList.remove('hidden');
-  els.upConfirm.disabled = !r.chapters.length;
-  const isUpd = !!(pending.updating && pending.updating.id);
+  // 统计与列表交给 renderPreviewChapters 实时维护（预览可编辑后章数/字数会变）
+  renderPreviewChapters();
+}
+
+/* ---------- v1.1：分章预览可编辑（改标题 / 改正文 / 增删章） ----------
+ * 预览只是本地数组，直接改 pending.preview.chapters，确认后走原入库通道。 */
+const MAX_PREVIEW = 500;
+
+function refreshPreviewStats() {
+  const chs = pending.preview.chapters;
+  const words = chs.reduce((s, c) => s + cleaner.countWords(c.content || ''), 0);
+  pending.preview.words = words; // 入库 payload 从此处读取
+  els.upStats.textContent = `${chs.length} 章 · ${fmtWords(words)}${pending.preview.fitNote ? ' · ' + pending.preview.fitNote : ''}`;
+}
+
+function updateConfirmBtn() {
+  const chs = pending && pending.preview ? pending.preview.chapters : [];
+  els.upConfirm.disabled = !chs.length;
+  const isUpd = !!(pending && pending.updating && pending.updating.id);
   els.upConfirm.textContent = isUpd
     ? (pending.updating.op === 'append' ? `追加到《${pending.updating.book.title}》` : `整本替换《${pending.updating.book.title}》`)
     : '确认入库';
+}
+
+function pvIconBtn(text, title, onClick, danger) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'pv-btn' + (danger ? ' danger' : '');
+  b.textContent = text;
+  b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function buildPreviewRow(ch, i) {
+  const li = document.createElement('li');
+  li.className = 'pv-row';
+  const line = document.createElement('div');
+  line.className = 'pv-line';
+  const n = document.createElement('span');
+  n.className = 'ch-no';
+  n.textContent = String(i + 1);
+  const input = document.createElement('input');
+  input.className = 'ch-t';
+  input.placeholder = '第' + (i + 1) + '章';
+  input.value = ch.title || '';
+  input.addEventListener('input', () => { ch.title = input.value; });
+  const w = document.createElement('span');
+  w.className = 'ch-w';
+  const wcText = () => { w.textContent = fmtWords(cleaner.countWords(ch.content || '')); };
+  wcText();
+  const bodyBox = document.createElement('div');
+  bodyBox.className = 'pv-body hidden';
+  const ta = document.createElement('textarea');
+  ta.rows = 8;
+  ta.placeholder = '本章正文（清洗后的内容，将原样入库；标题留空则按位置自动命名）';
+  ta.value = ch.content || '';
+  ta.addEventListener('input', () => { ch.content = ta.value; wcText(); });
+  bodyBox.appendChild(ta);
+  line.append(
+    n,
+    input,
+    w,
+    pvIconBtn('✎', '编辑正文', () => {
+      bodyBox.classList.toggle('hidden');
+      if (!bodyBox.classList.contains('hidden')) ta.focus();
+    }),
+    pvIconBtn('＋', '在本章后插入一章', () => insertPreviewAfter(i)),
+    pvIconBtn('✕', '删除本章', () => {
+      pending.preview.chapters.splice(i, 1);
+      renderPreviewChapters();
+    }, true)
+  );
+  li.append(line, bodyBox);
+  return li;
+}
+
+/** 在第 i 章（0-based）之后插一个空章；-1/空列表时插在最前 */
+function insertPreviewAfter(i) {
+  pending.preview.chapters.splice(i + 1, 0, { title: '', content: '' });
+  renderPreviewChapters();
+  const rows = $$('#upList .pv-row');
+  const t = rows[i + 1] && rows[i + 1].querySelector('.ch-t');
+  if (t) {
+    t.focus();
+    t.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function appendPreview() {
+  pending.preview.chapters.push({ title: '', content: '' });
+  renderPreviewChapters();
+  const rows = $$('#upList .pv-row');
+  const t = rows[rows.length - 1] && rows[rows.length - 1].querySelector('.ch-t');
+  if (t) {
+    t.focus();
+    t.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function renderPreviewChapters() {
+  const ul = els.upList;
+  ul.innerHTML = '';
+  const chs = pending.preview.chapters;
+  chs.slice(0, MAX_PREVIEW).forEach((c, i) => ul.appendChild(buildPreviewRow(c, i)));
+  if (chs.length > MAX_PREVIEW) {
+    const li = document.createElement('li');
+    li.className = 'muted';
+    li.textContent = `…共 ${chs.length} 章，确认后全部上传`;
+    ul.appendChild(li);
+  }
+  const addLi = document.createElement('li');
+  addLi.className = 'pv-add';
+  addLi.appendChild(pvIconBtn('＋ 在末尾追加一章', '追加到末尾', appendPreview));
+  ul.appendChild(addLi);
+  refreshPreviewStats();
+  updateConfirmBtn();
 }
 
 function collectPayload() {
@@ -812,7 +910,8 @@ function collectPayload() {
     tags: els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     note: els.upNote.value.trim(),
     chapters: preview.chapters.map((c) => c.title),
-    wordCount: preview.words,
+    // 字数由 refreshPreviewStats 在每次编辑后实时维护（预览可编辑后它是唯一事实源）
+    wordCount: preview.words || 0,
     cleanVer: 1,
   };
 }
@@ -826,6 +925,7 @@ async function onConfirm() {
   if (!pending || !pending.preview || !pending.preview.chapters.length) return;
   const payload = collectPayload();
   const keepRaw = els.upKeepRaw.checked;
+  createdId = null;
   els.upConfirm.disabled = true;
   els.upProgWrap.classList.remove('hidden');
 
@@ -853,6 +953,12 @@ async function onConfirm() {
     showView('shelf');
     await loadShelf();
   } catch (e) {
+    // 新建流程中途失败 → 书停在 creating 且从未进书架：看不见、回收站也清不掉。
+    // 移入回收站，让用户能看见并彻底删除（或重试），不留孤儿数据。
+    if (createdId) {
+      await api.deleteBook(createdId).catch(() => {});
+      createdId = null;
+    }
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
     toast('上传失败：' + (e.message || e), 3200);
@@ -886,15 +992,18 @@ async function createAndUpload(payload, keepRaw) {
       // 服务端同名拦截 → 自动加「（副本）」编号直至接受（防御旧书单竞态下的同名）
       let k = 1;
       let created2 = { duplicate: true };
-      while (created2.duplicate) {
+      while (created2.duplicate && k <= 50) { // 上限防御：极端情况下不至于打空转请求
         const t = payload.title + '（副本' + (k === 1 ? '' : k) + '）';
         created2 = await api.createBook({ ...payload, title: t });
         k++;
       }
+      if (created2.duplicate) throw new Error('无法创建副本（同名冲突过多）');
+      createdId = created2.id;
       return uploadChapters(created2.id, created2.chapterKeys, payload, keepRaw);
     }
     return uploadToExisting(created.book.id, mode, payload, keepRaw);
   }
+  createdId = created.id;
   return uploadChapters(created.id, created.chapterKeys, payload, keepRaw);
 }
 
@@ -947,6 +1056,12 @@ async function uploadMany(id, keys, chapters) {
 }
 
 /* ---------- 重洗（raw → 前端重新清洗 → 整本替换） ---------- */
+async function rewashConfirm(b) {
+  // v1.1：手动章节编辑后重洗会整体重建 → 先确认，避免静默覆盖人工改动
+  const ok = await confirmModal('重新清洗会用原件重建整本书的分章与正文，此前手动修改的章节标题/正文会被覆盖。继续？');
+  if (ok) rewash(b);
+}
+
 async function rewash(b) {
   let full = b;
   try {
@@ -960,9 +1075,245 @@ async function rewash(b) {
   openUpload({ book: full });
 }
 
+/* ---------- v1.1：书架「编辑章节」（已发布书就地编辑：改标题/改正文/插章/删章） ---------- */
+const ceState = { id: null, bookTitle: '', chapters: [], count: 0, words: 0, dirty: false };
+const ceBodies = new Map(); // 已拉取的章节正文缓存 key -> text
+
+function ceStatText() {
+  return `《${ceState.bookTitle}》 · ${ceState.count} 章 · ${fmtWords(ceState.words)} · 改动即时保存`;
+}
+
+async function openChapterEditor(b) {
+  let meta;
+  try {
+    meta = await api.bookMeta(b.id);
+  } catch (e) {
+    toast('打开失败：' + (e.message || e), 2600);
+    return;
+  }
+  ceState.id = b.id;
+  ceState.bookTitle = b.title;
+  ceState.chapters = (meta.chapters || []).map((c) => ({ key: c.key, title: c.title }));
+  ceState.count = meta.chapterCount || ceState.chapters.length;
+  ceState.words = meta.wordCount || 0;
+  ceState.dirty = false;
+  ceBodies.clear();
+  openModal(`
+    <div class="ce-head">
+      <h3>编辑章节</h3>
+      <p id="ceStat" class="ce-stat modal-sub"></p>
+    </div>
+    <ul id="ceList" class="ce-list"></ul>
+    <div class="ce-foot">
+      <button class="pv-btn" id="ceAppend" type="button">＋ 在末尾追加一章</button>
+      <span class="ce-busy" id="ceBusy"></span>
+      <button class="ghost" id="ceDone" type="button">完成</button>
+    </div>`);
+  els.modalBox.classList.add('ce');
+  $('#ceStat', els.modalBox).textContent = ceStatText();
+  $('#ceAppend', els.modalBox).addEventListener('click', () => ceInsert(null));
+  $('#ceDone', els.modalBox).addEventListener('click', finishChapterEditor);
+  renderCeList();
+}
+
+function ceBusy(text) {
+  const el = $('#ceBusy', els.modalBox);
+  if (el) el.textContent = text || '';
+}
+
+function renderCeList() {
+  const ul = $('#ceList', els.modalBox);
+  if (!ul) return;
+  ul.innerHTML = '';
+  if (!ceState.chapters.length) {
+    const li = document.createElement('li');
+    li.className = 'ce-empty muted';
+    li.textContent = '（暂无章节）';
+    ul.appendChild(li);
+    return;
+  }
+  ceState.chapters.forEach((ch, i) => ul.appendChild(ceBuildRow(ch, i)));
+}
+
+/** 构造一行章节：序号 + 标题输入 + 正文/插章/删章按钮 +（可展开的正文编辑区） */
+function ceBuildRow(ch, i) {
+  const li = document.createElement('li');
+  li.className = 'ce-row';
+  const line = document.createElement('div');
+  line.className = 'ce-line';
+  const idx = document.createElement('span');
+  idx.className = 'ch-no';
+  idx.textContent = String(i + 1);
+  const input = document.createElement('input');
+  input.className = 'ce-title';
+  input.placeholder = '第' + (i + 1) + '章';
+  input.value = ch.title;
+  input.addEventListener('change', async () => {
+    const v = input.value.trim();
+    if (v === ch.title) return;
+    const old = ch.title;
+    input.value = ch.title; // 未成功前先回显旧值
+    ceBusy('保存标题…');
+    try {
+      const r = await api.patchChapter(ceState.id, ch.key, { title: v });
+      ch.title = r.title; // 服务端兜底（空标题 → 第 N 章）后的规范值
+      ceState.words = r.wordCount;
+      ceState.dirty = true;
+      input.value = ch.title;
+      $('#ceStat', els.modalBox).textContent = ceStatText();
+      toast('标题已保存', 1200);
+    } catch (e) {
+      input.value = old;
+      toast('保存失败：' + (e.message || e), 2600);
+    } finally {
+      ceBusy('');
+    }
+  });
+
+  // 正文编辑区（懒加载：首次展开才拉正文）
+  const bodyBox = document.createElement('div');
+  bodyBox.className = 'ce-body hidden';
+  const ta = document.createElement('textarea');
+  ta.rows = 8;
+  bodyBox.appendChild(ta);
+  const acts = document.createElement('div');
+  acts.className = 'ce-body-acts';
+  const tip = document.createElement('span');
+  tip.className = 'pv-tip';
+  tip.textContent = '替换本章正文（UTF-8 文本）';
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'pv-save';
+  save.textContent = '保存本章';
+  save.disabled = true;
+  let bodyOpen = false;
+  ta.addEventListener('input', () => { save.disabled = false; });
+  save.addEventListener('click', async () => {
+    ceBusy('保存正文…');
+    save.disabled = true;
+    try {
+      const r = await api.patchChapter(ceState.id, ch.key, { content: ta.value });
+      ceBodies.set(ch.key, ta.value);
+      ceState.words = r.wordCount;
+      ceState.dirty = true;
+      $('#ceStat', els.modalBox).textContent = ceStatText();
+      toast('本章正文已保存', 1400);
+    } catch (e) {
+      save.disabled = false;
+      toast('保存失败：' + (e.message || e), 2600);
+    } finally {
+      ceBusy('');
+    }
+  });
+  acts.append(tip, save);
+  bodyBox.append(ta, acts);
+
+  const toggleBody = async () => {
+    if (bodyOpen) {
+      bodyBox.classList.add('hidden');
+      bodyOpen = false;
+      return;
+    }
+    if (!ceBodies.has(ch.key)) {
+      ta.value = '';
+      try {
+        const meta0 = await api.bookMeta(ceState.id); // 拉最新 cleanVer 防缓存击穿失效
+        const txt = await api.chapter(ceState.id, ch.key, meta0.cleanVer || 1);
+        ceBodies.set(ch.key, txt);
+        ta.value = txt;
+      } catch (e) {
+        toast('正文加载失败：' + (e.message || e), 2600);
+        return;
+      }
+    }
+    // 重开时若还保留着未保存的修改 → 不动内容也不启用保存钮之外的干扰
+    if (ta.value === (ceBodies.get(ch.key) || '')) save.disabled = true;
+    bodyBox.classList.remove('hidden');
+    bodyOpen = true;
+    ta.focus();
+  };
+
+  // 删除：双段确认（3s 内再点一次才执行）
+  const delBtn = pvIconBtn('✕', '删除本章（连点两次确认）', () => {}, true);
+  let armed = false;
+  let armTimer = null;
+  delBtn.addEventListener('click', () => {
+    if (!armed) {
+      armed = true;
+      delBtn.textContent = '确认删除';
+      armTimer = setTimeout(() => {
+        armed = false;
+        delBtn.textContent = '✕';
+      }, 3200);
+      return;
+    }
+    clearTimeout(armTimer);
+    ceDelete(ch);
+  });
+
+  const editBtn = pvIconBtn('正文', '查看 / 替换本章正文', () => toggleBody().catch(() => {}));
+  const insBtn = pvIconBtn('＋', '在本章后插入一章', () => ceInsert(ch.key));
+  line.append(idx, input, editBtn, insBtn, delBtn);
+  li.append(line, bodyBox);
+  return li;
+}
+
+async function ceDelete(ch) {
+  ceBusy('删除中…');
+  try {
+    const r = await api.deleteChapter(ceState.id, ch.key);
+    ceState.chapters = ceState.chapters.filter((c) => c.key !== ch.key);
+    ceState.count = r.chapterCount;
+    ceState.words = r.wordCount;
+    ceState.dirty = true;
+    ceBodies.delete(ch.key);
+    $('#ceStat', els.modalBox).textContent = ceStatText();
+    renderCeList();
+    toast('已删除本章', 1400);
+  } catch (e) {
+    toast('删除失败：' + (e.message || e), 2600);
+  } finally {
+    ceBusy('');
+  }
+}
+
+async function ceInsert(afterKey) {
+  ceBusy('插入中…');
+  try {
+    const body = afterKey ? { after: afterKey, title: '新章', content: '' } : { title: '新章', content: '' };
+    const r = await api.insertChapter(ceState.id, body);
+    ceState.dirty = true;
+    await refreshCeFromServer(); // 以服务端为唯一事实源刷新顺序/编号/字数
+    toast('已插入「' + r.title + '」，可改标题/正文', 1600);
+  } catch (e) {
+    toast('插入失败：' + (e.message || e), 2600);
+  } finally {
+    ceBusy('');
+  }
+}
+
+/** 结构变化后以服务端为准刷新章表（顺序/编号/字数） */
+async function refreshCeFromServer() {
+  const meta = await api.bookMeta(ceState.id);
+  ceState.chapters = (meta.chapters || []).map((c) => ({ key: c.key, title: c.title }));
+  ceState.count = meta.chapterCount || ceState.chapters.length;
+  ceState.words = meta.wordCount || 0;
+  $('#ceStat', els.modalBox).textContent = ceStatText();
+  renderCeList();
+}
+
+async function finishChapterEditor() {
+  const { id, dirty } = ceState;
+  closeModal();
+  if (!dirty) return;
+  await loadShelf().catch(() => {});
+  const off = await offline.getBook(id).catch(() => null);
+  toast(off ? '已保存。若曾下载离线整本，请到阅读页重新 ⤓ 离线 同步' : '已保存', 2800);
+}
+
 /* ---------- toast ---------- */
 let toastTimer = null;
-export function toast(msg, ms = 2000) {
+function toast(msg, ms = 2000) {
   els.toast.textContent = msg;
   els.toast.classList.add('show');
   clearTimeout(toastTimer);

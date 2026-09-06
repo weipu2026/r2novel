@@ -35,7 +35,9 @@
     </button>
     <div class="top-actions">
       <button id="trashBtn" class="ghost" type="button">回收站</button>
+      <button id="tagsBtn" class="ghost slim" type="button" title="查看全部标签，合并/改名/删除">标签</button>
       <button id="diagBtn" class="ghost slim" type="button" title="扫描库中无引用的残留文件">检查残留</button>
+      <button id="batchBtn" class="ghost slim" type="button" title="多选书籍批量打标签/改状态/删除">批量</button>
       <button id="uploadBtn" class="primary" type="button">＋ 上传 txt</button>
       <button id="logoutBtn" class="ghost slim" type="button">退出</button>
     </div>
@@ -44,6 +46,16 @@
     <div id="continueWrap" class="hidden">
       <p class="section-label">继续阅读</p>
       <div id="continueCard"></div>
+    </div>
+    <div id="batchBar" class="batch-bar hidden">
+      <span class="bb-count"><strong id="bbCount">0</strong> 本已选</span>
+      <button id="bbAll" class="ghost slim" type="button">全选</button>
+      <button id="bbInvert" class="ghost slim" type="button">反选</button>
+      <button id="bbTags" class="ghost slim" type="button">改标签</button>
+      <button id="bbDone" class="ghost slim" type="button">标完结</button>
+      <button id="bbOngoing" class="ghost slim" type="button">标连载</button>
+      <button id="bbDelete" class="ghost slim danger" type="button">删除</button>
+      <button id="bbExit" class="ghost slim" type="button">退出批量</button>
     </div>
     <div class="shelf-tools">
       <input id="searchInput" class="search" type="search" placeholder="搜书名 / 标签…" autocomplete="off">

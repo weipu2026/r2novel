@@ -962,6 +962,150 @@ async function apiProgressPut(req, store, id) {
   return json({ ok: true });
 }
 
+/* ---------------- 批量操作 / 标签治理（书架百本量级的治理工具） ---------------- */
+
+/** 批量操作单请求上限：每本 1 读(meta)+1 写(meta) ≈ 2N，加 index 读/bak/写 ≈ 5 → 20 本 ≈ 45 子请求，守住 Free 50 红线 */
+const BATCH_BOOKS_MAX = 20;
+/** 标签合并单请求上限（同样受 2N 约束；未完成的部分返回 remaining 让前端续调） */
+const TAG_MERGE_MAX = 20;
+
+/**
+ * 批量操作：一次请求改多本书（标签增删/整设、完结状态、软删）。
+ * 只写一次 index（含快照），避免 N 次请求产生 N 次 index 写放大与丢失更新窗口。
+ * body: { ids: [...], action: 'addTags'|'removeTags'|'setTags'|'setFinished'|'delete', tags?, finished? }
+ */
+async function apiBatchBooks(req, store) {
+  const body = await req.json().catch(() => ({}));
+  const idsRaw = Array.isArray(body.ids) ? body.ids : null;
+  if (!idsRaw || !idsRaw.length) return json({ error: '请先选择要操作的书' }, 400);
+  const ids = Array.from(new Set(idsRaw.map((x) => String(x)).filter((x) => isSafeId(x))));
+  if (!ids.length) return json({ error: '没有合法的书 id' }, 400);
+
+  const action = String(body.action || '');
+  if (!['addTags', 'removeTags', 'setTags', 'setFinished', 'delete'].includes(action)) {
+    return json({ error: '未知操作' }, 400);
+  }
+  const tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, 10) : [];
+  // setTags 允许空数组（清空标签），其余两种必须给非空标签
+  if (action !== 'setTags' && action !== 'setFinished' && action !== 'delete' && !tags.length) {
+    return json({ error: '请填写标签' }, 400);
+  }
+  if (action === 'setFinished' && body.finished === undefined) return json({ error: '缺少 finished' }, 400);
+
+  const batch = ids.slice(0, BATCH_BOOKS_MAX);
+  const index = await readIndex(store);
+  const inShelf = new Set((index.books || []).map((b) => b.id));
+  const targets = batch.filter((id) => inShelf.has(id));
+
+  if (action === 'delete') return batchSoftDelete(store, index, targets);
+
+  const patches = new Map();
+  for (const id of targets) {
+    const meta = await readBook(store, id);
+    if (!meta) continue;
+    if (action === 'addTags') {
+      const set = new Set(meta.tags || []);
+      for (const t of tags) set.add(t);
+      meta.tags = Array.from(set).slice(0, 10);
+    } else if (action === 'removeTags') {
+      const rm = new Set(tags);
+      meta.tags = (meta.tags || []).filter((t) => !rm.has(t));
+    } else if (action === 'setTags') {
+      meta.tags = tags;
+    } else if (action === 'setFinished') {
+      meta.finished = !!body.finished;
+    }
+    meta.updatedAt = Date.now();
+    await store.putText(KEY.book(id), JSON.stringify(meta));
+    patches.set(id, { tags: meta.tags || [], finished: !!meta.finished, updatedAt: meta.updatedAt });
+  }
+
+  if (patches.size) {
+    await writeIndexBak(store);
+    const books = (index.books || []).map((b) => (patches.has(b.id) ? { ...b, ...patches.get(b.id) } : b));
+    await writeIndex(store, { books });
+  }
+  return json({ ok: true, updated: patches.size, skipped: batch.length - targets.length, rest: Math.max(0, ids.length - batch.length) });
+}
+
+/** 批量软删：index 一次摘除 + trash 一次写入（不读各书 meta，index 条目即摘要） */
+async function batchSoftDelete(store, index, targets) {
+  if (!targets.length) return json({ ok: true, updated: 0, skipped: 0, rest: 0 });
+  await writeIndexBak(store);
+  const gone = new Set(targets);
+  const books = (index.books || []).filter((b) => !gone.has(b.id));
+  await writeIndex(store, { books });
+
+  const trash = await readTrash(store);
+  let n = 0;
+  for (const id of targets) {
+    if (trash.books.some((x) => x.id === id)) continue;
+    const entry = (index.books || []).find((b) => b.id === id);
+    if (entry) {
+      trash.books.push({ ...entry, deletedAt: Date.now() });
+      n++;
+    }
+  }
+  if (n) await writeTrash(store, trash);
+  return json({ ok: true, updated: n, skipped: 0, rest: 0 });
+}
+
+/** 全量标签清单（不截断：前端导航栏只显示 top12，治理页需要看到全部） */
+async function apiTagsList(store) {
+  const index = await readIndex(store);
+  const m = new Map();
+  for (const b of index.books || []) {
+    for (const t of b.tags || []) m.set(t, (m.get(t) || 0) + 1);
+  }
+  const tags = Array.from(m.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh'))
+    .map(([tag, count]) => ({ tag, count }));
+  return json({ tags, total: tags.length });
+}
+
+/**
+ * 标签治理：合并 / 改名 / 删除（to 为空串即删除）。
+ * 只改受影响书，超出单请求预算时返回 remaining，前端续调即可。
+ */
+async function apiTagsMerge(req, store) {
+  const body = await req.json().catch(() => ({}));
+  const from = safeStr(body.from, 30);
+  const to = safeStr(body.to, 30);
+  if (!from) return json({ error: '请指定要处理的标签' }, 400);
+  if (to && to === from) return json({ error: '源标签与目标相同' }, 400);
+
+  const index = await readIndex(store);
+  const hit = (index.books || []).filter((b) => (b.tags || []).includes(from));
+  if (!hit.length) return json({ ok: true, updated: 0, remaining: 0 });
+
+  const targets = hit.slice(0, TAG_MERGE_MAX);
+  const patches = new Map();
+  for (const b of targets) {
+    const meta = await readBook(store, b.id);
+    if (!meta) continue;
+    const out = [];
+    for (const t of meta.tags || []) {
+      if (t === from) {
+        if (to && !out.includes(to)) out.push(to); // 改名/合并：落到目标标签（已存在则不重复）
+        continue;
+      }
+      if (to && t === to) continue; // 目标标签已出现过，去重
+      if (!out.includes(t)) out.push(t);
+    }
+    meta.tags = out.slice(0, 10);
+    meta.updatedAt = Date.now();
+    await store.putText(KEY.book(b.id), JSON.stringify(meta));
+    patches.set(b.id, { tags: meta.tags, updatedAt: meta.updatedAt });
+  }
+
+  if (patches.size) {
+    await writeIndexBak(store);
+    const books = (index.books || []).map((b) => (patches.has(b.id) ? { ...b, ...patches.get(b.id) } : b));
+    await writeIndex(store, { books });
+  }
+  return json({ ok: true, updated: patches.size, remaining: Math.max(0, hit.length - targets.length) });
+}
+
 /* ---------------- 回收站 API ---------------- */
 
 /** 软删：index 摘除 → trash（正文/meta/raw 全保留，可恢复）
@@ -1429,6 +1573,21 @@ async function handleApi(req, env, store, url, p) {
   if (p === '/api/trash') {
     if (req.method === 'GET') return apiTrashList(store, env);
     if (req.method === 'POST' && url.searchParams.get('action') === 'clear') return apiTrashClear(store);
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
+
+  // 批量操作（书架多选）：必须在 /api/books/:id 之前匹配，否则 'batch' 会被当成书 id
+  if (p === '/api/books/batch') {
+    if (req.method === 'POST') return apiBatchBooks(req, store);
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
+
+  // 标签治理：GET 全量清单（不截断）/ POST 合并·改名·删除（to 为空即删除）
+  if (p === '/api/tags') {
+    if (req.method === 'GET') return apiTagsList(store);
+    if (req.method === 'POST') return apiTagsMerge(req, store);
     await dropBody(req);
     return json({ error: 'method' }, 405);
   }

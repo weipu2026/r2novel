@@ -31,6 +31,17 @@ export function init() {
   els.uploadBtn = $('#uploadBtn');
   els.trashBtn = $('#trashBtn');
   els.diagBtn = $('#diagBtn');
+  els.tagsBtn = $('#tagsBtn');
+  els.batchBtn = $('#batchBtn');
+  els.batchBar = $('#batchBar');
+  els.bbCount = $('#bbCount');
+  els.bbAll = $('#bbAll');
+  els.bbInvert = $('#bbInvert');
+  els.bbTags = $('#bbTags');
+  els.bbDone = $('#bbDone');
+  els.bbOngoing = $('#bbOngoing');
+  els.bbDelete = $('#bbDelete');
+  els.bbExit = $('#bbExit');
   els.continueCard = $('#continueCard');
   els.continueWrap = $('#continueWrap');
   els.grid = $('#bookGrid');
@@ -92,6 +103,26 @@ export function init() {
   els.trashBtn.addEventListener('click', openTrash);
   els.diagBtn.addEventListener('click', openDiag);
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
+  els.tagsBtn.addEventListener('click', openTagMgr);
+  els.batchBtn.addEventListener('click', enterBatchMode);
+  els.bbExit.addEventListener('click', exitBatchMode);
+  els.bbAll.addEventListener('click', () => {
+    for (const b of filteredBooks()) selected.add(b.id);
+    syncBatchBar();
+    renderGrid(sortedBooks(filteredBooks()));
+  });
+  els.bbInvert.addEventListener('click', () => {
+    for (const b of filteredBooks()) {
+      if (selected.has(b.id)) selected.delete(b.id);
+      else selected.add(b.id);
+    }
+    syncBatchBar();
+    renderGrid(sortedBooks(filteredBooks()));
+  });
+  els.bbTags.addEventListener('click', batchEditTags);
+  els.bbDone.addEventListener('click', () => batchRun('setFinished', { finished: true }, `把 ${selected.size} 本书标记为「已完结」？`));
+  els.bbOngoing.addEventListener('click', () => batchRun('setFinished', { finished: false }, `把 ${selected.size} 本书标记为「连载中」？`));
+  els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？15 天内可恢复`));
   els.trashBack.addEventListener('click', () => { showView('shelf'); loadShelf().catch(() => {}); });
   els.trashClear.addEventListener('click', clearTrashFlow);
   els.searchInput.addEventListener('input', () => { ui.q = els.searchInput.value.trim(); ui.page = 1; renderShelf(); });
@@ -397,7 +428,7 @@ function progBadgeText(b) {
 function makeCard(b, big) {
   const c = document.createElement('button');
   c.type = 'button';
-  c.className = 'card' + (big ? ' big' : '') + (b.pinned ? ' pinned' : '');
+  c.className = 'card' + (big ? ' big' : '') + (b.pinned ? ' pinned' : '') + (batchMode ? ' picking' : '') + (selected.has(b.id) ? ' picked' : '');
   const block = document.createElement('span');
   block.className = 'card-block';
   block.style.background = colorOf(b.title);
@@ -419,25 +450,40 @@ function makeCard(b, big) {
   }
   c.appendChild(block);
   c.appendChild(info);
-  const badge = progBadgeText(b);
-  if (badge) {
-    const p = document.createElement('span');
-    p.className = 'prog-badge' + (badge === '已读完' ? ' done' : '');
-    p.textContent = badge;
-    c.appendChild(p);
-  }
-  if (!big) {
-    const more = document.createElement('button');
-    more.type = 'button';
-    more.className = 'card-more';
-    more.textContent = '⋯';
-    more.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openSheet(b);
+  if (batchMode) {
+    const tick = document.createElement('span');
+    tick.className = 'pick-tick';
+    tick.textContent = selected.has(b.id) ? '✓' : '';
+    c.appendChild(tick);
+    // 批量模式下点卡片 = 勾选/取消（不进阅读）
+    c.addEventListener('click', () => {
+      if (selected.has(b.id)) selected.delete(b.id);
+      else selected.add(b.id);
+      c.classList.toggle('picked', selected.has(b.id));
+      tick.textContent = selected.has(b.id) ? '✓' : '';
+      syncBatchBar();
     });
-    c.appendChild(more);
+  } else {
+    const badge = progBadgeText(b);
+    if (badge) {
+      const p = document.createElement('span');
+      p.className = 'prog-badge' + (badge === '已读完' ? ' done' : '');
+      p.textContent = badge;
+      c.appendChild(p);
+    }
+    if (!big) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'card-more';
+      more.textContent = '⋯';
+      more.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openSheet(b);
+      });
+      c.appendChild(more);
+    }
+    c.addEventListener('click', () => openRead(b.id));
   }
-  c.addEventListener('click', () => openRead(b.id));
   return c;
 }
 
@@ -585,6 +631,212 @@ function confirmModal(text, okText = '确定') {
 }
 
 const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/* ---------- 书架批量操作（多选治理：加/去标签、完结状态、软删） ---------- */
+let batchMode = false;
+const selected = new Set();
+const BATCH_PAGE = 20; // 与后端 BATCH_BOOKS_MAX 对齐，分批调用避免子请求预算爆
+
+function enterBatchMode() {
+  batchMode = true;
+  selected.clear();
+  els.batchBtn.classList.add('hidden');
+  els.batchBar.classList.remove('hidden');
+  syncBatchBar();
+  renderShelf();
+  toast('批量模式：点书勾选，再点取消', 2000);
+}
+
+function exitBatchMode() {
+  batchMode = false;
+  selected.clear();
+  els.batchBtn.classList.remove('hidden');
+  els.batchBar.classList.add('hidden');
+  renderShelf();
+}
+
+function syncBatchBar() {
+  els.bbCount.textContent = String(selected.size);
+  // 未选书时禁用全部动作按钮（视觉+语义同步）
+  const dis = selected.size === 0;
+  for (const b of [els.bbTags, els.bbDone, els.bbOngoing, els.bbDelete]) b.disabled = dis;
+}
+
+/** 批量执行：分批调用批量 API（每批 20），busy 进度反馈；完成后刷新书架 */
+async function batchRun(action, payload, confirmText) {
+  if (!selected.size) return;
+  const ids = Array.from(selected);
+  if (!(await confirmModal(confirmText, '执行'))) return;
+  busy(`批量操作中… 0/${ids.length}`);
+  let ok = 0;
+  let fail = 0;
+  try {
+    for (let i = 0; i < ids.length; i += BATCH_PAGE) {
+      const batch = ids.slice(i, i + BATCH_PAGE);
+      try {
+        const r = await api.batchBooks(batch, action, payload);
+        ok += r.updated || 0;
+        fail += batch.length - (r.updated || 0);
+      } catch {
+        fail += batch.length;
+      }
+      busy(`批量操作中… ${Math.min(i + BATCH_PAGE, ids.length)}/${ids.length}`);
+    }
+  } finally {
+    busyDone();
+  }
+  exitBatchMode();
+  await loadShelf();
+  toast(fail ? `完成 ${ok} 本，${fail} 本失败（可能是半成品书）` : `已更新 ${ok} 本`, 2600);
+}
+
+/** 批量改标签：输入标签（逗号分隔）→ 添加到所选书 / 从所选书移除 */
+function batchEditTags() {
+  if (!selected.size) return;
+  openModal(`
+    <h3>批量改标签 <span class="muted">(${selected.size} 本)</span></h3>
+    <div class="m-field">
+      <input id="btInput" class="input" type="text" placeholder="多个标签用逗号分隔，如：玄幻, 完结自用" autocomplete="off">
+      <div id="btChips" class="tag-chips"></div>
+      <p class="modal-sub">「添加」把标签加到所选书；「移除」从所选书去掉这些标签</p>
+    </div>
+    <div class="m-acts">
+      <button class="ghost" id="btCancel" type="button">取消</button>
+      <button class="ghost" id="btRemove" type="button" disabled>移除</button>
+      <button class="primary" id="btAdd" type="button" disabled>添加</button>
+    </div>`);
+  const input = $('#btInput', els.modalBox);
+  const chips = $('#btChips', els.modalBox);
+  const btnAdd = $('#btAdd', els.modalBox);
+  const btnRemove = $('#btRemove', els.modalBox);
+  const parse = () => input.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const sync = () => {
+    const has = parse().length > 0;
+    btnAdd.disabled = !has;
+    btnRemove.disabled = !has;
+  };
+  // 预设 chips 点选写入输入框（与上传表单同款交互）
+  for (const t of PRESET_TAGS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = t;
+    b.addEventListener('click', () => {
+      const have = new Set(parse());
+      if (have.has(t)) have.delete(t);
+      else have.add(t);
+      input.value = Array.from(have).join(', ');
+      syncChipsOn();
+      sync();
+    });
+    chips.appendChild(b);
+  }
+  const syncChipsOn = () => {
+    const have = new Set(parse());
+    for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
+  };
+  input.addEventListener('input', sync);
+  $('#btCancel', els.modalBox).addEventListener('click', closeModal);
+  const go = async (action) => {
+    const tags = parse();
+    if (!tags.length) return;
+    closeModal();
+    const verb = action === 'addTags' ? '添加' : '移除';
+    await batchRun(action, { tags }, `给 ${selected.size} 本书${verb}标签：${tags.join('、')}？`);
+  };
+  btnAdd.addEventListener('click', () => go('addTags'));
+  btnRemove.addEventListener('click', () => go('removeTags'));
+}
+
+/* ---------- 标签管理（全量清单 + 改名/合并/删除，治理碎片标签） ---------- */
+async function openTagMgr() {
+  openModal('<h3>标签管理</h3><p class="modal-sub">加载中…</p>');
+  let data;
+  try {
+    data = await api.tags();
+  } catch (e) {
+    openModal(`<h3>标签管理</h3><p class="modal-sub">加载失败：${esc(e.message || e)}</p>
+      <div class="m-acts"><button class="ghost" id="tmErrClose" type="button">关闭</button></div>`);
+    $('#tmErrClose', els.modalBox).addEventListener('click', closeModal);
+    return;
+  }
+  renderTagMgr(data);
+}
+
+function renderTagMgr(data) {
+  const rows = (data.tags || [])
+    .map(
+      (t) => `
+      <div class="tm-row" data-tag="${esc(t.tag)}">
+        <span class="tm-name" title="${esc(t.tag)}">${esc(t.tag)}</span>
+        <span class="tm-count">${t.count} 本</span>
+        <input class="input tm-input" type="text" placeholder="改名 / 合并到…" autocomplete="off">
+        <button class="ghost slim tm-go" type="button" title="把「${esc(t.tag)}」改成或合并到左侧输入的标签">→</button>
+        <button class="ghost slim tm-del danger" type="button" title="从所有书上移除该标签">×</button>
+      </div>`
+    )
+    .join('');
+  openModal(`
+    <h3>标签管理 <span class="muted">(${data.total || 0} 个标签)</span></h3>
+    <p class="modal-sub">输入新名字点 → 即改名；输入已有标签名点 → 即合并；点 × 从全部书上移除。所有改动会同步到每一本书。</p>
+    <div class="tm-list">${rows || '<p class="empty muted">还没有任何标签</p>'}</div>
+    <div class="m-acts">
+      <button class="ghost" id="tmReload" type="button">刷新</button>
+      <button class="primary" id="tmClose" type="button">完成</button>
+    </div>`);
+  $('#tmClose', els.modalBox).addEventListener('click', closeModal);
+  $('#tmReload', els.modalBox).addEventListener('click', openTagMgr);
+  for (const row of $$('.tm-row', els.modalBox)) {
+    const tag = row.dataset.tag;
+    const input = $('.tm-input', row);
+    const go = async () => {
+      const to = input.value.trim();
+      if (!to) {
+        toast('先输入新标签名', 1600);
+        return;
+      }
+      if (to === tag) {
+        toast('名字没变', 1600);
+        return;
+      }
+      const same = to === tag;
+      const existing = (data.tags || []).some((x) => x.tag === to);
+      const verb = existing ? `合并进「${to}」` : `改名为「${to}」`;
+      if (!(await confirmModal(`把「${tag}」${verb}？改动会应用到所有打了这个标签的书`, '执行'))) return;
+      await tagMergeRun(tag, to);
+    };
+    $('.tm-go', row).addEventListener('click', go);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') go();
+    });
+    $('.tm-del', row).addEventListener('click', async () => {
+      if (!(await confirmModal(`从所有书上移除标签「${tag}」？`, '移除'))) return;
+      await tagMergeRun(tag, '');
+    });
+  }
+}
+
+/** 标签合并执行：remaining>0 时自动续调直到清完（每批 20 本受子请求预算约束） */
+async function tagMergeRun(from, to) {
+  busy('更新书籍标签…');
+  let updated = 0;
+  try {
+    for (let guard = 0; guard < 60; guard++) {
+      const r = await api.tagsMerge(from, to);
+      updated += r.updated || 0;
+      if (!r.remaining) break;
+    }
+  } catch (e) {
+    busyDone();
+    toast('失败：' + (e.message || e), 2600);
+    return;
+  }
+  busyDone();
+  await loadShelf();
+  toast(to ? `已更新 ${updated} 本` : `已从 ${updated} 本书上移除`, 2400);
+  // 确认弹层（confirmModal 共用 modalBox）已把标签管理弹层顶掉并关闭：
+  // 无条件重新拉取渲染，既"操作后刷新结果"，也保证改名/合并后的后续操作基于最新行名
+  await openTagMgr();
+}
 
 /* ---------- 残留诊断（书架「检查残留」：只读扫描 + 删无主对象 / 无主书移入回收站） ---------- */
 let diagData = null; // 最近一次扫描结果（删除 / 移入回收站动作读取）

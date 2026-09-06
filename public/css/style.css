@@ -701,3 +701,46 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
   .modal-box.diag { padding: 14px; }
   .diag-row-sub { font-size: 11.5px; }
 }
+
+/* ============ 书架批量操作（多选治理） ============ */
+.batch-bar {
+  position: sticky; top: 8px; z-index: 5;
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
+  padding: 8px 10px; margin: 10px 0 2px;
+  box-shadow: 0 4px 16px rgba(60, 42, 20, 0.1);
+}
+.batch-bar .bb-count { font-size: 13px; margin-right: 2px; white-space: nowrap; }
+.batch-bar .bb-count strong { color: var(--accent); font-size: 15px; }
+.batch-bar button:disabled { opacity: .4; cursor: not-allowed; }
+.card.picking { cursor: pointer; }
+.card.picked { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
+.card .pick-tick {
+  position: absolute; top: 8px; left: 8px; width: 22px; height: 22px;
+  border-radius: 50%; border: 1.5px solid var(--line); background: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: #fff;
+}
+.card.picked .pick-tick { background: var(--accent); border-color: var(--accent); }
+
+/* ============ 标签管理（全量 + 改名/合并/删除） ============ */
+.modal-box .tm-list { max-height: 46vh; overflow-y: auto; margin-top: 4px; }
+.tm-row {
+  display: flex; gap: 6px; align-items: center;
+  padding: 7px 0; border-bottom: 1px solid #f2f1ec;
+}
+.tm-row:last-of-type { border-bottom: 0; }
+.tm-name {
+  flex: 0 0 auto; max-width: 32%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 600; font-size: 13.5px;
+}
+.tm-count { flex: none; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.tm-row .tm-input { flex: 1 1 90px; min-width: 0; padding: 6px 9px; font-size: 13px; border-radius: 8px; }
+.tm-row .tm-go, .tm-row .tm-del { flex: none; padding: 5px 10px; font-size: 13px; }
+button.danger { color: var(--danger); border-color: #ecc9c4; }
+button.danger:hover { background: #fbeeec; }
+@media (max-width: 480px) {
+  .batch-bar { top: 4px; padding: 7px 8px; }
+  .batch-bar button { padding: 4px 9px; font-size: 12px; }
+  .tm-name { max-width: 38%; }
+}

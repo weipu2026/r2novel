@@ -88,6 +88,19 @@ export const api = {
   purgeOrphans(keys) {
     return request('/api/diag/orphans', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ objects: keys }) });
   },
+  // 书架批量操作（多选治理）：addTags / removeTags / setTags / setFinished / delete
+  batchBooks(ids, action, payload = {}) {
+    return request('/api/books/batch', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids, action, ...payload }),
+    });
+  },
+  // 标签治理：全量清单（不截断）+ 合并/改名/删除（to 为空即删除）
+  tags: () => request('/api/tags'),
+  tagsMerge(from, to) {
+    return request('/api/tags', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ from, to }) });
+  },
 };
 
 /* 本地镜像：进度 / 最近打开 / 阅读偏好（离线与杀后台兜底） */

@@ -327,7 +327,8 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
       : [];
   }
   const batch = keys.slice(0, maxDel);
-  for (const k of batch) await store.delete(KEY.text(id, k));
+  // 并发删除：子请求数不变，耗时从串行 N 次往返降为一批并发
+  await Promise.all(batch.map((k) => store.delete(KEY.text(id, k))));
   const left = keys.slice(batch.length);
   let deleted = batch.length;
   let done = false;
@@ -337,9 +338,7 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
     await writeTrash(store, trash);
   } else {
     done = true;
-    await store.delete(KEY.raw(id));
-    await store.delete(KEY.book(id));
-    await store.delete(KEY.progress(id));
+    await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id))]);
     trash.books.splice(idx, 1);
     await writeTrash(store, trash);
   }
@@ -367,7 +366,7 @@ async function sweepOrphans(store, meta, max = ORPHAN_BATCH) {
   const keys = Array.isArray(meta.orphans) ? meta.orphans : [];
   if (!keys.length) return 0;
   const batch = keys.slice(0, max);
-  for (const k of batch) await store.delete(KEY.text(meta.id, k));
+  await Promise.all(batch.map((k) => store.delete(KEY.text(meta.id, k))));
   const left = keys.slice(batch.length);
   if (left.length) meta.orphans = left;
   else delete meta.orphans;
@@ -492,9 +491,9 @@ async function apiPutChapter(req, env, store, id, key) {
 }
 
 /** 批量上传正文（连续上传优化）：一次读 meta + 批量写。
- * 请求数从「每章 1 个」降到「每 40 章 1 个」（Free 计划硬配额是请求数/天），
+ * 请求数从「每章 1 个」降到「每 BULK_CHAPTER_BATCH 章 1 个」（Free 计划硬配额是请求数/天），
  * 单章 PUT 保留兼容。规则与单章一致：只放行 creating、只收章表内 key、每章 ≤ MAX_CHAPTER。
- * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + ≤30 写。 */
+ * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + BULK_CHAPTER_BATCH 并发写。 */
 async function apiPutChapters(req, env, store, id) {
   const body = await req.json().catch(() => ({}));
   const list = Array.isArray(body.chapters) ? body.chapters : [];
@@ -517,7 +516,8 @@ async function apiPutChapters(req, env, store, id) {
     if (size > max || total > maxTotal) return json({ error: '章节超过上限' }, 413);
     items.push({ key, text });
   }
-  for (const it of items) await store.putText(KEY.text(id, it.key), it.text);
+  // 批内并发写：子请求数不变（仍 ≤BULK_CHAPTER_BATCH），耗时从串行 N×RTT 降为一次并发
+  await Promise.all(items.map((it) => store.putText(KEY.text(id, it.key), it.text)));
   return json({ ok: true, count: items.length, words: items.map((it) => wordsOf(it.text)) });
 }
 
@@ -638,9 +638,9 @@ async function apiPublish(req, env, store, id) {
   if (!meta.chapters || !meta.chapters.length) return json({ error: '书还没有章节' }, 400);
   const keys = meta.chapters.map((c) => c.key);
   const samples = [keys[0], keys[Math.floor(keys.length / 2)], keys[keys.length - 1]].filter((k, i, arr) => arr.indexOf(k) === i);
-  for (const k of samples) {
-    const t = await store.getText(KEY.text(id, k));
-    if (t == null) return json({ error: `章节 ${k} 未上传，发布中止` }, 409);
+  const sampled = await Promise.all(samples.map((k) => store.getText(KEY.text(id, k))));
+  for (let i = 0; i < samples.length; i++) {
+    if (sampled[i] == null) return json({ error: `章节 ${samples[i]} 未上传，发布中止` }, 409);
   }
   meta.chapterCount = keys.length;
   meta.wordCount = Math.max(Number(meta.wordCount) || 0, 0);

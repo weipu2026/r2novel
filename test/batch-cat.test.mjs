@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
+import { BULK_CHAPTER_BATCH } from '../public/js/shared-const.js';
 
 const BASE = 'http://r2novel.test';
 const ENV = {
@@ -114,11 +115,11 @@ test('bulk：空批次与缺失 chapters 均 400', async () => {
   assert.equal(missing.status, 400, '缺 chapters 字段应 400');
 });
 
-test('bulk：超过单批上限（BULK_CHAPTER_BATCH=30，用 40 章样本）拒收 413', async () => {
+test('bulk：超过单批上限（BULK_CHAPTER_BATCH+1）拒收 413', async () => {
   const store = memStore();
   const cookie = await login(store);
-  // 造 41 章的大纲，只测「条数超限」这一层（key 合法性在条数校验之后）
-  const chapters = Array.from({ length: 41 }, (_, i) => '第' + (i + 1) + '章');
+  // 造 BULK_CHAPTER_BATCH+1 章的大纲，只测「条数超限」这一层（key 合法性在条数校验之后）
+  const chapters = Array.from({ length: BULK_CHAPTER_BATCH + 1 }, (_, i) => '第' + (i + 1) + '章');
   const r = await call(
     store,
     req('/api/books', { method: 'POST', cookie, body: { title: '超限书', chapters, wordCount: 100, cleanVer: 1 } })
@@ -131,10 +132,10 @@ test('bulk：超过单批上限（BULK_CHAPTER_BATCH=30，用 40 章样本）拒
     req(`/api/books/${id}/chapters/bulk`, {
       method: 'POST',
       cookie,
-      body: { chapters: Array.from({ length: 41 }, (_, i) => ({ key: String(i + 1), text: 'x' })) },
+      body: { chapters: Array.from({ length: BULK_CHAPTER_BATCH + 1 }, (_, i) => ({ key: String(i + 1), text: 'x' })) },
     })
   );
-  assert.equal(big.status, 413, '单批 >40 章应 413');
+  assert.equal(big.status, 413, '单批超限应 413');
 });
 
 test('bulk：已发布（ready）的书 409，必须走章节编辑接口', async () => {

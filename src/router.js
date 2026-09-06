@@ -20,7 +20,9 @@
  *
  * 子请求预算纪律（Workers Free 单请求 ≤50 个子请求）：
  *   - publish 只抽样 3 章校验，字数信任客户端 cleaner 统计，绝不逐章回读统计；
- *   - 彻底删除单批 ≤40 章，剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
+ *   - 彻底删除单批 ≤30 章、惰性清扫每请求 ≤1 本、孤儿批次 ≤24，逐书固定开销
+ *     （readBook + raw/meta/progress 删除 + 写 trash）叠加核账过，单路径最坏仍远低于 50；
+ *     剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
  */
 
 const SESSION_COOKIE = 'rn_session';
@@ -302,9 +304,9 @@ const apiLogout = (req) =>
 
 /* ---------------- 回收站惰性清理 / 彻底删除（分批，尊重 50 子请求预算） ---------------- */
 
-const DELETE_BATCH = 40; // 单请求/单次惰性清理最多删除的对象数（分批评删与孤儿清理共用同一上限）
+const DELETE_BATCH = 30; // 单请求/单次惰性清理最多删除的正文对象数（加固定开销后仍远低于 Free 50 子请求红线）
 const PURGE_BATCH = DELETE_BATCH; // 彻底删除单批上限（留余量给 raw/meta/progress/trash 写入）
-const ORPHAN_BATCH = DELETE_BATCH; // replace 遗留孤儿惰性清理单批上限
+const ORPHAN_BATCH = 24; // replace 遗留孤儿惰性清理单批（publish/更新/目录读取顺带清，分批清完）
 
 /**
  * 对 trash 里一本书执行一批彻底删除。返回 { entry(更新后), deleted, done, remaining }。
@@ -343,7 +345,8 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
 }
 
 /** 惰性清理：把超过 TRASH_DAYS 的书清掉一批（无 cron，靠业务请求时机触发）
- * 注意：进行中（purge 字段非空）的书也要继续清，否则 >40 章的书会中途卡死在回收站。 */
+ * 注意：进行中（purge 字段非空）的书也要继续清，否则 >30 章的书会中途卡死在回收站。
+ * 预算由调用方控制（sweepTrashSafe 限定 maxBooks=1）：本函数本身按默认 batch 推进。 */
 async function sweepTrash(store, env, maxBooks = 1) {
   const trash = await readTrash(store);
   if (!trash.books.length) return;
@@ -387,8 +390,10 @@ function indexEntryFromMeta(meta, extra = {}) {
   };
 }
 
-/** 惰性清理是"顺手"动作：删除失败不应阻断书架/回收站读取，包一层降级 */
-const sweepTrashSafe = (store, env) => sweepTrash(store, env, 2).catch(() => {});
+/** 惰性清理是"顺手"动作：删除失败不应阻断书架/回收站读取，包一层降级。
+ * 每请求最多推进 1 本（batch ≤30）：逐本书的固定开销（readBook+写trash 等）叠上去
+ * 多本必爆 50，1 本最坏 ~33 才稳。剩余靠下一请求继续（purge 字段续清）。 */
+const sweepTrashSafe = (store, env) => sweepTrash(store, env, 1).catch(() => {});
 
 /** 书架摘要（含置顶与进度镜像；排序由前端负责） */
 async function apiBooks(store, env) {
@@ -1001,20 +1006,14 @@ async function apiTrashPurge(store, id) {
   return json({ ok: true, done: r.done, remaining: r.remaining, deleted: r.deleted });
 }
 
-/** 清空回收站（每请求尽力清，客户端按 remaining 续调直至 0） */
+/** 清空回收站（每请求推进 1 本，客户端按 remaining 续调直至 0）
+ * 只处理 1 本：彻底删除的固定开销（readBook + raw/meta/progress 删除 + writeTrash）会叠在
+ * 章删除之上，逐本累积轻松超 Free 50 子请求红线；一本一本清最稳。 */
 async function apiTrashClear(store) {
   const trash = await readTrash(store);
-  let budget = PURGE_BATCH;
-  let deleted = 0;
-  for (let i = 0; i < (trash.books || []).length && budget > 0; ) {
-    const b = trash.books[i];
-    const r = await purgeOnce(store, trash, b.id, budget);
-    deleted += r.deleted;
-    budget -= Math.max(r.deleted, 1);
-    if (!r.done) break; // 这一本就吃满预算，下一请求再来
-  }
-  const remaining = trash.books.length; // purgeOnce 就地维护并已持久化 trash，内存即真值
-  return json({ ok: true, deleted, remaining });
+  if (!trash.books.length) return json({ ok: true, deleted: 0, remaining: 0 });
+  const r = await purgeOnce(store, trash, trash.books[0].id, PURGE_BATCH);
+  return json({ ok: true, deleted: r.deleted, remaining: trash.books.length });
 }
 
 /* ---------------- 残留诊断 / 孤儿清理（书架「检查残留」） ----------------
@@ -1310,6 +1309,13 @@ async function opdsExport(req, env, store, id) {
   const meta = await readBook(store, id);
   if (!meta || meta.status !== 'ready' || !Array.isArray(meta.chapters) || !meta.chapters.length) {
     return json({ error: '书不存在或不可下载' }, 404);
+  }
+  // Free 计划单请求 ≤50 子请求：整本流式导出逐章开 R2 流（1 章 = 1 子请求），
+  // 超出剩余预算会让流在中段报错 → 客户端拿到截断/失败文件。明确拒绝并指引网页端
+  // 导出（exportBookTxt 收到非 200 会自动回退到逐章拉取，网页端不受影响）。
+  const EXPORT_MAX_CHAPTERS = 40;
+  if (meta.chapters.length > EXPORT_MAX_CHAPTERS) {
+    return json({ error: `本书 ${meta.chapters.length} 章超过整本流式导出上限（${EXPORT_MAX_CHAPTERS} 章），请在网页中使用「导出」功能` }, 409);
   }
   return new Response(pumpParts(exportParts(meta, store)), {
     status: 200,

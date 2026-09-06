@@ -121,10 +121,10 @@ test('审计：sweep —— 已进入 purge 分段的过期书会被继续清理
   const { id } = await makeBook(store, cookie, '多章书', 45);
   await call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie })); // 软删
 
-  // 手动删一批制造 purge 中段（45 章 > 40 上限）
+  // 手动删一批制造 purge 中段（45 章 > 30 上限）
   let r = await call(store, req(`/api/trash/${id}`, { method: 'DELETE', cookie }));
-  assert.equal(r.data.done, false, '首删 40 章未完');
-  assert.equal(r.data.remaining, 5);
+  assert.equal(r.data.done, false, '首删 30 章未完');
+  assert.equal(r.data.remaining, 15);
 
   // 把这本书的 deletedAt 改到 16 天前（过期）
   const trash = JSON.parse(store._map.get('meta/trash.json'));
@@ -200,9 +200,9 @@ test('审计：replace 章节数变少 —— 孤儿正文先清一批、publish
   const { id } = await makeBook(store, cookie, '缩水书', 45); // 原 45 章（key 1..45）
   let r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'replace', chapters: ['新的一章'] } }));
   assert.equal(r.status, 200);
-  // updateChapters 当场清一批（40 个）：key 2..41 应被删，42..45 留待惰性
-  for (const k of [2, 41]) assert.ok(!store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应在首批被删`);
-  for (const k of [42, 45]) assert.ok(store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应留待下一批`);
+  // updateChapters 当场清一批（24 个）：key 2..25 应被删，26..45 留待惰性
+  for (const k of [2, 25]) assert.ok(!store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应在首批被删`);
+  for (const k of [26, 45]) assert.ok(store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应留待下一批`);
   await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '新正文' }));
   r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
   assert.equal(r.status, 200);

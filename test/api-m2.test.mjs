@@ -209,8 +209,8 @@ test('M2：彻底删除分批 + 清空（purge 预算回归）', async () => {
 
   let r = await call(store, req(`/api/trash/${a.id}`, { method: 'DELETE', cookie }));
   assert.equal(r.status, 200);
-  assert.equal(r.data.done, false, '45 章 > 40 上限 → 首批未完成');
-  assert.equal(r.data.remaining, 5);
+  assert.equal(r.data.done, false, '45 章 > 30 上限 → 首批未完成');
+  assert.equal(r.data.remaining, 15);
   r = await call(store, req(`/api/trash/${a.id}`, { method: 'DELETE', cookie }));
   assert.equal(r.data.done, true, '续调后完成');
   assert.ok(!store._map.has(`text/${a.id}/1.txt`), '正文已清');

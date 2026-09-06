@@ -101,13 +101,17 @@ export function bindReader(root, navCb) {
     fillToc(els.drawerList, state.toc.draw);
     els.tocMore.classList.toggle('hidden', state.chapters.length <= state.toc.draw);
   });
-  // 点正文空白处关闭设置面板（别点中按钮）
+  // 点正文空白处：有浮层就关浮层；触屏窄屏下切换工具栏显隐（不再随滚动自动隐藏，避免翻页闪烁）
   els.scroll.addEventListener('click', (e) => {
-    if (e.target === els.art || e.target === els.scroll) closePref();
-  });
-  // 触屏窄屏：点屏幕唤出被自动隐藏的工具栏
-  els.scroll.addEventListener('pointerdown', () => {
-    if (els.root.classList.contains('bars-hid')) els.root.classList.remove('bars-hid');
+    const onBody = e.target === els.art || e.target === els.scroll;
+    if (!onBody) return;
+    if (!els.prefPanel.classList.contains('hidden') || !els.drawer.classList.contains('hidden')) {
+      closePref();
+      return;
+    }
+    if (mqTouch() && !mqDesktop()) {
+      els.root.classList.toggle('bars-hid');
+    }
   });
   els.scroll.addEventListener('scroll', onScroll);
   document.addEventListener('visibilitychange', onHidden);
@@ -187,6 +191,8 @@ export async function openBook(id) {
 async function renderChapter(idx, restoreRatio) {
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
+  // 进入新章节（无论加载成败）：触屏窄屏下放回工具栏——用户跳章/重试时能看到下章/目录/退出
+  if (mqTouch() && !mqDesktop()) els.root.classList.remove('bars-hid');
   els.art.innerHTML = '';
   els.scroll.scrollTop = 0;
   const ch = state.chapters[idx];
@@ -483,25 +489,11 @@ function curRatio() {
 
 function onScroll() {
   if (!state.book) return;
+  // 进度节流保存（触屏窄屏下滚动不再自动切工具栏——显隐改由正文 click 控制，避免翻页闪烁）
   const now = Date.now();
   if (now - state.lastSave > 8000) {
     state.lastSave = now;
     saveProgress();
-  }
-  // 触屏窄屏：向下滚动隐藏工具栏（上移 / 回顶 唤出）
-  if (mqTouch() && !mqDesktop()) {
-    const el = els.scroll;
-    const y = el.scrollTop;
-    const ly = onScroll.lastY == null ? y : onScroll.lastY; // 首次滚动无基准 → 直接建立基准
-    if (y > 40 && y > ly + 8) {
-      if (!els.root.classList.contains('bars-hid')) {
-        closePref();
-        els.root.classList.add('bars-hid');
-      }
-    } else if (y < ly - 8 || y <= 2) {
-      els.root.classList.remove('bars-hid');
-    }
-    onScroll.lastY = y;
   }
 }
 

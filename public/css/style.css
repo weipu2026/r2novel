@@ -1,4 +1,9 @@
 /* r2novel 前端样式 —— 手机优先阅读，桌面上传友好 */
+/* color-scheme: light —— 阻止 Android WebView / 部分浏览器在 OS 深色模式下
+   对本站 UI 区（chrome 栏/书架/登录/上传/弹层等）做强制反色。
+   阅读区有独立的「夜间」主题（paper/white/green/night），但 chrome 等
+   UI 区本就是固定的浅色系设计，强制反色会把深底反成浅底而字色不变 → 白字不可见。 */
+html { color-scheme: light; }
 :root {
   --bg: #f4f4f1;
   --panel: #ffffff;

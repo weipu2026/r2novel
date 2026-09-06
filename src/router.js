@@ -393,14 +393,15 @@ function indexEntryFromMeta(meta, extra = {}) {
   };
 }
 
-/** 惰性清理是"顺手"动作：删除失败不应阻断书架/回收站读取，包一层降级。
- * 每请求最多推进 1 本（batch ≤30）：逐本书的固定开销（readBook+写trash 等）叠上去
- * 多本必爆 50，1 本最坏 ~33 才稳。剩余靠下一请求继续（purge 字段续清）。 */
+/** 惰性清理是"顺手"动作：删除失败不应阻断读取，包一层降级。
+ * 只挂在回收站列表（apiTrashList）触发：书架 GET 不再等待清扫——超期大书的
+ * 多批 R2 删除（每请求 ≤1 本）不会拖慢首屏；超期书本已过期，晚几天清无妨。
+ * 每请求最多推进 1 本（batch ≤30）：逐本书的固定开销（readBook+写trash 等）
+ * 叠上去多本必爆 50，1 本最坏 ~33 才稳。剩余靠下一请求继续（purge 字段续清）。 */
 const sweepTrashSafe = (store, env) => sweepTrash(store, env, 1).catch(() => {});
 
 /** 书架摘要（含置顶与进度镜像；排序由前端负责） */
-async function apiBooks(store, env) {
-  await sweepTrashSafe(store, env);
+async function apiBooks(store) {
   const index = await readIndex(store);
   return json({ books: index.books || [] });
 }
@@ -1564,7 +1565,7 @@ async function handleApi(req, env, store, url, p) {
   if (p === '/api/logout' && req.method === 'POST') return apiLogout(req);
 
   if (p === '/api/books') {
-    if (req.method === 'GET') return apiBooks(store, env);
+    if (req.method === 'GET') return apiBooks(store);
     if (req.method === 'POST') return apiCreateBook(req, env, store);
     await dropBody(req);
     return json({ error: 'method' }, 405);

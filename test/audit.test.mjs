@@ -131,8 +131,8 @@ test('审计：sweep —— 已进入 purge 分段的过期书会被继续清理
   trash.books[0].deletedAt = Date.now() - 16 * 86400000;
   store._map.set('meta/trash.json', JSON.stringify(trash));
 
-  // 书架 GET 触发 sweep：purge 中的过期书也继续删
-  r = await call(store, req('/api/books', { cookie }));
+  // 回收站列表触发 sweep（清扫只挂回收站页，书架 GET 不再等待）：purge 中的过期书也继续删
+  r = await call(store, req('/api/trash', { cookie }));
   assert.equal(r.status, 200);
   assert.ok(!store._map.has(`text/${id}/41.txt`), 'sweep 应继续删除 purge 中剩余的章');
   assert.ok(!store._map.has(`meta/${id}.json`), '清完后 meta 应被删除');

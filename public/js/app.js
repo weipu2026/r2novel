@@ -725,6 +725,10 @@ function batchEditTags() {
     btnAdd.disabled = !has;
     btnRemove.disabled = !has;
   };
+  const syncChipsOn = () => {
+    const have = new Set(parse());
+    for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
+  };
   // 预设 chips 点选写入输入框（与上传表单同款交互）
   for (const t of PRESET_TAGS) {
     const b = document.createElement('button');
@@ -740,10 +744,6 @@ function batchEditTags() {
     });
     chips.appendChild(b);
   }
-  const syncChipsOn = () => {
-    const have = new Set(parse());
-    for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
-  };
   input.addEventListener('input', sync);
   $('#btCancel', els.modalBox).addEventListener('click', closeModal);
   const go = async (action) => {

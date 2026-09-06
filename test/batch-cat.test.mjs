@@ -114,7 +114,7 @@ test('bulk：空批次与缺失 chapters 均 400', async () => {
   assert.equal(missing.status, 400, '缺 chapters 字段应 400');
 });
 
-test('bulk：超过单批上限（40 章）拒收 413', async () => {
+test('bulk：超过单批上限（BULK_CHAPTER_BATCH=30，用 40 章样本）拒收 413', async () => {
   const store = memStore();
   const cookie = await login(store);
   // 造 41 章的大纲，只测「条数超限」这一层（key 合法性在条数校验之后）

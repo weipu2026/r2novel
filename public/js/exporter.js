@@ -20,7 +20,7 @@ export async function exportBookTxt(id, onProg) {
   } catch {
     /* 离线/网络失败 → 客户端兜底 */
   }
-  const { meta, texts } = await fetchChaptersAll(id, onProg);
+  const { meta, texts, missing = 0 } = await fetchChaptersAll(id, onProg);
   const parts = [];
   parts.push(meta.title + (meta.author ? '　作者：' + meta.author : ''));
   parts.push('');
@@ -31,5 +31,6 @@ export async function exportBookTxt(id, onProg) {
     parts.push('');
   });
   downloadText(parts.join('\n'), (meta.title || 'book') + '.txt');
+  if (missing) console.warn(`导出《${meta.title}》有 ${missing} 章拉取失败（对应章节为空），可稍后重试`);
   return meta.title;
 }

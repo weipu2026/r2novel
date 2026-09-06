@@ -1110,6 +1110,7 @@ async function clearTrashFlow() {
 
 // 上传会话：{ title, bytes, preview, updating:null|{id,op,book}, keepRaw }
 let pending = null;
+let importing = false; // 批量导入进行中：屏蔽「确认入库」，防止与批量循环并发操作 pending
 // 本次「新建」出来的书 id：入库中途失败时用它把半成品移入回收站（否则它不在书架、也清不掉）
 let createdId = null;
 
@@ -1199,6 +1200,7 @@ async function importBatch(files) {
   let ok = 0;
   let skip = 0;
   let fail = 0;
+  importing = true;
   els.upProgWrap.classList.remove('hidden');
   els.upConfirm.disabled = true;
   try {
@@ -1210,6 +1212,7 @@ async function importBatch(files) {
         const buf = new Uint8Array(await file.arrayBuffer());
         pending = { title, bytes: buf, updating: null, keepRaw };
         runPreview();
+        els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
         const preview = pending.preview;
         if (!preview || !preview.chapters.length) {
           fail++;
@@ -1230,7 +1233,7 @@ async function importBatch(files) {
           continue;
         }
         createdId = created.id;
-        await uploadChapters(created.id, created.chapterKeys, payload, keepRaw);
+        await uploadChapters(created.id, created.chapterKeys, keepRaw);
         createdId = null;
         ok++;
       } catch (e) {
@@ -1244,6 +1247,7 @@ async function importBatch(files) {
       setProg((i + 1) / n, `完成 ${ok + skip + fail}/${n}（成功 ${ok}）`);
     }
   } finally {
+    importing = false;
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
   }
@@ -1496,6 +1500,7 @@ function setProg(pct, text) {
 }
 
 async function onConfirm() {
+  if (importing) return; // 批量导入中：runPreview 会重启用确认按钮，这里兜底屏蔽
   if (!pending || !pending.preview || !pending.preview.chapters.length) return;
   const payload = collectPayload();
   const keepRaw = els.upKeepRaw.checked;
@@ -1573,12 +1578,12 @@ async function createAndUpload(payload, keepRaw) {
       }
       if (created2.duplicate) throw new Error('无法创建副本（同名冲突过多）');
       createdId = created2.id;
-      return uploadChapters(created2.id, created2.chapterKeys, payload, keepRaw);
+      return uploadChapters(created2.id, created2.chapterKeys, keepRaw);
     }
     return uploadToExisting(created.book.id, mode, payload, keepRaw);
   }
   createdId = created.id;
-  return uploadChapters(created.id, created.chapterKeys, payload, keepRaw);
+  return uploadChapters(created.id, created.chapterKeys, keepRaw);
 }
 
 async function uploadToExisting(id, op, payload, keepRaw) {
@@ -1590,6 +1595,11 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
   await uploadMany(id, keys.slice(startKeyIdx), pending.preview.chapters);
+  await finalizeUpload(id, keepRaw);
+}
+
+/** 收尾：原件留档（可选）+ 发布（创建/替换/追加/批量导入共用） */
+async function finalizeUpload(id, keepRaw) {
   if (keepRaw && pending.bytes) {
     setProg(1, '上传原件…');
     await api.putRaw(id, pending.bytes);
@@ -1598,14 +1608,9 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   await api.publish(id);
 }
 
-async function uploadChapters(id, keys, payload, keepRaw) {
+async function uploadChapters(id, keys, keepRaw) {
   await uploadMany(id, keys, pending.preview.chapters);
-  if (keepRaw && pending.bytes) {
-    setProg(1, '上传原件…');
-    await api.putRaw(id, pending.bytes);
-  }
-  setProg(1, '发布中…');
-  await api.publish(id);
+  await finalizeUpload(id, keepRaw);
 }
 
 /** 批量上传章节正文（bulk 接口，≤40 章一批串行）：

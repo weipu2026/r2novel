@@ -39,6 +39,14 @@ export const api = {
     const r = await request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PUT', body: text });
     return r;
   },
+  putChapters(id, chapters) {
+    // 批量上传（≤服务端单批上限）：连续上传时 meta 校验从每章一次收敛到每批一次
+    return request(`/api/books/${encodeURIComponent(id)}/chapters/bulk`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chapters }),
+    });
+  },
   async putRaw(id, bytes) {
     return request(`/api/books/${encodeURIComponent(id)}/raw`, { method: 'PUT', body: bytes });
   },

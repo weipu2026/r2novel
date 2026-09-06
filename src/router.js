@@ -487,6 +487,36 @@ async function apiPutChapter(req, env, store, id, key) {
   return json({ ok: true, words });
 }
 
+/** 批量上传正文（连续上传优化）：一次读 meta + 批量写。
+ * 请求数从「每章 1 个」降到「每 40 章 1 个」（Free 计划硬配额是请求数/天），
+ * 单章 PUT 保留兼容。规则与单章一致：只放行 creating、只收章表内 key、每章 ≤ MAX_CHAPTER。
+ * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + ≤30 写。 */
+async function apiPutChapters(req, env, store, id) {
+  const body = await req.json().catch(() => ({}));
+  const list = Array.isArray(body.chapters) ? body.chapters : [];
+  if (!list.length) return json({ error: '没有章节' }, 400);
+  if (list.length > DELETE_BATCH) return json({ error: `单批最多 ${DELETE_BATCH} 章` }, 413);
+  const meta = await readBook(store, id);
+  if (!meta) return json({ error: '书不存在' }, 404);
+  if (meta.status === 'ready') return json({ error: '书已发布，请改用章节编辑接口' }, 409);
+  const table = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
+  const max = Number(env.MAX_CHAPTER || 2097152);
+  const maxTotal = 16 * 1024 * 1024; // 单批总字节护栏（body/内存）
+  const items = [];
+  let total = 0;
+  for (const it of list) {
+    const key = String(it && it.key == null ? '' : it.key);
+    if (!table.has(key)) return json({ error: `章节 ${key} 不在章表中` }, 404);
+    const text = it && typeof it.text === 'string' ? it.text : '';
+    const size = enc.encode(text).byteLength;
+    total += size;
+    if (size > max || total > maxTotal) return json({ error: '章节超过上限' }, 413);
+    items.push({ key, text });
+  }
+  for (const it of items) await store.putText(KEY.text(id, it.key), it.text);
+  return json({ ok: true, count: items.length, words: items.map((it) => wordsOf(it.text)) });
+}
+
 /** 上传原件（原始字节留档，重洗/恢复依据） */
 async function apiPutRaw(req, env, store, id) {
   const max = Number(env.MAX_UPLOAD || 52428800);
@@ -1429,6 +1459,11 @@ async function handleApi(req, env, store, url, p) {
   const mIns = /^\/api\/books\/([^/]+)\/chapters\/insert$/.exec(p);
   if (mIns && !isSafeId(mIns[1])) return notFound();
   if (mIns && req.method === 'POST') return apiInsertChapter(req, env, store, mIns[1]);
+
+  // 批量上传正文（连续上传优化）：同样必须在单章 /chapters/:key 之前匹配，否则 'bulk' 会被当成 key
+  const mBulk = /^\/api\/books\/([^/]+)\/chapters\/bulk$/.exec(p);
+  if (mBulk && !isSafeId(mBulk[1])) return notFound();
+  if (mBulk && req.method === 'POST') return apiPutChapters(req, env, store, mBulk[1]);
 
   const mCh = /^\/api\/books\/([^/]+)\/chapters\/([^/]+)$/.exec(p);
   if (mCh && (!isSafeId(mCh[1]) || !isSafeId(mCh[2]))) {

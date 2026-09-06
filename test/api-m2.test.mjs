@@ -238,6 +238,35 @@ test('M2：>50 章大书 publish 通过（子请求预算修复回归）', async
   assert.equal(r.data.wordCount, 555, '字数用上报值，不回读全部章');
 });
 
+test('M2：批量上传章节（bulk）—— 一次校验一次写，正文可读，章表外 key 拒收', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '批量书', chapters: ['第1章', '第2章'], wordCount: 10, cleanVer: 1 } }));
+  assert.equal(r.status, 200);
+  const id = r.data.id;
+
+  const up = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, {
+      method: 'POST',
+      cookie,
+      body: { chapters: [{ key: '1', text: '批量正文一' }, { key: '2', text: '批量正文二' }] },
+    })
+  );
+  assert.equal(up.status, 200);
+  assert.equal(up.data.count, 2);
+
+  const bad = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body: { chapters: [{ key: '99', text: 'x' }] } })
+  );
+  assert.equal(bad.status, 404, '章表外 key 拒收');
+
+  await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  const t = await call(store, req(`/api/books/${id}/chapters/2`, { cookie }));
+  assert.equal(t.text, '批量正文二');
+});
+
 test('M2：对已软删书 PATCH/update 拒绝', async () => {
   const store = memStore();
   const cookie = await login(store);

@@ -1184,25 +1184,24 @@ async function uploadChapters(id, keys, payload, keepRaw) {
   await api.publish(id);
 }
 
-/** 并发窗口上传章节正文（默认 4 并发），按完成比例推进度 */
+/** 批量上传章节正文（bulk 接口，≤40 章一批串行）：
+ * 服务端 meta 校验从「每章一次」收敛到「每批一次」，请求数也从每章 1 个降到每批 1 个，
+ * 连续上传大幅减负（Free 计划请求数/天是硬配额）。 */
 async function uploadMany(id, keys, chapters) {
   const n = keys.length;
   if (!n) return;
-  const CONC = 4;
+  const BATCH = 40; // 与服务端单批上限一致
   let done = 0;
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < n) {
-      const i = cursor++;
-      try {
-        await api.putChapter(id, keys[i], chapters[i] && chapters[i].content != null ? chapters[i].content : '');
-      } finally {
-        done++;
-        setProg(done / n, `上传章节 ${done}/${n}`);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(CONC, n) }, worker));
+  for (let i = 0; i < n; i += BATCH) {
+    const keySlice = keys.slice(i, i + BATCH);
+    const items = keySlice.map((k, j) => {
+      const c = chapters[i + j];
+      return { key: k, text: c && c.content != null ? c.content : '' };
+    });
+    const r = await api.putChapters(id, items);
+    done += (r && r.count) || 0;
+    setProg(done / n, `上传章节 ${done}/${n}`);
+  }
 }
 
 /* ---------- 重洗（raw → 前端重新清洗 → 整本替换） ---------- */

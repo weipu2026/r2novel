@@ -1,0 +1,27 @@
+/* 前后端共用的数值协议 —— 数字只此一处定义。
+ * src/router.js（后端 Worker/dev-server）与 public/js/*.js（前端浏览器）共同 import：
+ *   router.js 经 '../public/js/shared-const.js'、前端经 './shared-const.js'。
+ * 目的：杜绝「后端 DELETE_BATCH=30 vs 前端 BATCH=40」这类前后端数字漂移 bug。
+ * 任何改动都会同时生效于两端；改前请确认后端预算（子请求 ≤50）仍然成立。
+ */
+
+/** 单本章表上限（章节数） */
+export const CHAPTER_MAX = 20000;
+
+/** 单章正文上限（字节，2MB）—— 后端 env.MAX_CHAPTER 的默认值 */
+export const MAX_CHAPTER_BYTES = 2097152;
+
+/** 前端超大章预切阈值（字节）：须 < MAX_CHAPTER_BYTES 留上传余量（fitChapters） */
+export const FIT_CHAPTER_BYTES = 1900000;
+
+/** 批量上传正文单批上限（章）：POST /chapters/bulk 与前端 uploadMany 共用 */
+export const BULK_CHAPTER_BATCH = 30;
+
+/** 书架批量操作单批上限（本）：POST /api/books/batch 与前端 BATCH_PAGE 共用 */
+export const BATCH_BOOKS_MAX = 18;
+
+/** 原件单次上传上限（字节，50MB）—— 后端 env.MAX_UPLOAD 的默认值 */
+export const MAX_UPLOAD_BYTES = 52428800;
+
+/** 整本流式导出章节上限（Free 计划子请求护栏） */
+export const EXPORT_MAX_CHAPTERS = 40;

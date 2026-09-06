@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleRequest } from '../src/router.js';
+import { MAX_CHAPTER_BYTES, MAX_UPLOAD_BYTES } from '../public/js/shared-const.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -159,8 +160,8 @@ const env = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
   SESSION_SECRET: process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD,
   SESSION_DAYS: '30',
-  MAX_UPLOAD: '52428800',
-  MAX_CHAPTER: '2097152',
+  MAX_UPLOAD: String(MAX_UPLOAD_BYTES),
+  MAX_CHAPTER: String(MAX_CHAPTER_BYTES),
   serveStatic,
 };
 

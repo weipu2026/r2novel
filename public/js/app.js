@@ -1,5 +1,6 @@
 /* app.js — 登录 / 书架（M2 管理）/ 上传 / 回收站 / 阅读入口（电脑上传为主，手机阅读为主） */
 import { api, local, fmtWords, ApiError } from './store.js';
+import { BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, CHAPTER_MAX } from './shared-const.js';
 import * as cleaner from './cleaner.js';
 import * as reader from './reader.js';
 import { bindBusy, busy, busyDone } from './ui.js';
@@ -220,15 +221,21 @@ async function logout() {
 
 /* ---------- 书架 ---------- */
 const PALETTE = ['#d97757', '#c2518c', '#7d66c9', '#4e8fd8', '#2f9e8f', '#4f9d4f', '#d0a43a', '#8a7a5c'];
+const colorCache = new Map(); // 按书名缓存封面色，避免上千本书重复哈希
 function colorOf(title) {
+  const hit = colorCache.get(title);
+  if (hit) return hit;
   let h = 0;
   for (let i = 0; i < title.length; i++) h = (h * 31 + title.charCodeAt(i)) >>> 0;
-  return PALETTE[h % PALETTE.length];
+  const c = PALETTE[h % PALETTE.length];
+  colorCache.set(title, c);
+  return c;
 }
 
 async function loadShelf(data) {
   if (!data) data = await api.books();
   books = data.books || [];
+  tagCache = null; // books 已更新 → 标签计数缓存失效，下次 renderShelf 重算
   // 校正可能失效的筛选项
   if (ui.tag && !books.some((b) => (b.tags || []).includes(ui.tag))) ui.tag = '';
   ui.page = 1;
@@ -317,12 +324,15 @@ function renderGrid(list) {
   }
 }
 
+let tagCache = null; // 标签计数缓存：books 变化（loadShelf）时才重算，筛选/翻页不重复 O(n) 扫描
 function tagCounts() {
+  if (tagCache) return tagCache;
   const m = new Map();
   for (const b of books) {
     for (const t of b.tags || []) m.set(t, (m.get(t) || 0) + 1);
   }
-  return Array.from(m.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh')).slice(0, 12);
+  tagCache = Array.from(m.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh')).slice(0, 12);
+  return tagCache;
 }
 
 /** 分类导航栏（方向1）：状态频道（全部/完结/连载中）+ 全部标签 chips */
@@ -635,7 +645,7 @@ const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</
 /* ---------- 书架批量操作（多选治理：加/去标签、完结状态、软删） ---------- */
 let batchMode = false;
 const selected = new Set();
-const BATCH_PAGE = 18; // 与后端 BATCH_BOOKS_MAX 对齐，分批调用避免子请求预算爆
+const BATCH_PAGE = BATCH_BOOKS_MAX; // 与后端共享常量对齐（shared-const.js），分批避免子请求预算爆
 
 function enterBatchMode() {
   batchMode = true;
@@ -1210,7 +1220,7 @@ async function importBatch(files) {
           author,
           tags,
           note,
-          chapters: preview.chapters.map((c) => c.title),
+          chapters: preview.chapters.slice(0, CHAPTER_MAX).map((c) => c.title),
           wordCount: preview.words || 0,
           cleanVer: 1,
         };
@@ -1467,12 +1477,13 @@ function renderPreviewChapters() {
 
 function collectPayload() {
   const preview = pending.preview;
+  if (preview.chapters.length > CHAPTER_MAX) toast(`章节数超过上限 ${CHAPTER_MAX}，多余章节将被截断`, 2600);
   return {
     title: els.upTitle.value.trim() || pending.title,
     author: els.upAuthor.value.trim(),
     tags: els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     note: els.upNote.value.trim(),
-    chapters: preview.chapters.map((c) => c.title),
+    chapters: preview.chapters.slice(0, CHAPTER_MAX).map((c) => c.title),
     // 字数由 refreshPreviewStats 在每次编辑后实时维护（预览可编辑后它是唯一事实源）
     wordCount: preview.words || 0,
     cleanVer: 1,
@@ -1603,7 +1614,7 @@ async function uploadChapters(id, keys, payload, keepRaw) {
 async function uploadMany(id, keys, chapters) {
   const n = keys.length;
   if (!n) return;
-  const BATCH = 30; // 必须与后端 DELETE_BATCH 一致（router.js），否则 >30 章的书第二批会被 413 拒收
+  const BATCH = BULK_CHAPTER_BATCH; // 与后端共享常量对齐（shared-const.js），防止 >单批上限被 413 拒收
   let done = 0;
   for (let i = 0; i < n; i += BATCH) {
     const keySlice = keys.slice(i, i + BATCH);

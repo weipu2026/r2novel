@@ -25,6 +25,8 @@
  *     剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
  */
 
+import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS } from '../public/js/shared-const.js';
+
 const SESSION_COOKIE = 'rn_session';
 const TRASH_DAYS = 15; // 回收站保留天数（惰性清理，无 cron）
 
@@ -413,7 +415,7 @@ async function apiCreateBook(req, env, store) {
   const body = await req.json().catch(() => ({}));
   const title = safeStr(body.title, 120);
   if (!title) return json({ error: '书名不能为空' }, 400);
-  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, 20000) : [];
+  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
 
   const index = await readIndex(store);
@@ -434,7 +436,7 @@ async function apiCreateBook(req, env, store) {
 
 async function createBookRecord(store, body) {
   const title = safeStr(body.title, 120);
-  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, 20000) : [];
+  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   const id = newId();
   const now = Date.now();
   const chTable = chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));
@@ -474,7 +476,7 @@ async function apiPutChapter(req, env, store, id, key) {
     await dropBody(req);
     return json({ error: '章节不在章表中' }, 404);
   }
-  const max = Number(env.MAX_CHAPTER || 2097152);
+  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
   const declared = Number(req.headers.get('content-length') || 0);
   if (declared > max) {
     await dropBody(req);
@@ -496,12 +498,12 @@ async function apiPutChapters(req, env, store, id) {
   const body = await req.json().catch(() => ({}));
   const list = Array.isArray(body.chapters) ? body.chapters : [];
   if (!list.length) return json({ error: '没有章节' }, 400);
-  if (list.length > DELETE_BATCH) return json({ error: `单批最多 ${DELETE_BATCH} 章` }, 413);
+  if (list.length > BULK_CHAPTER_BATCH) return json({ error: `单批最多 ${BULK_CHAPTER_BATCH} 章` }, 413);
   const meta = await readBook(store, id);
   if (!meta) return json({ error: '书不存在' }, 404);
   if (meta.status === 'ready') return json({ error: '书已发布，请改用章节编辑接口' }, 409);
   const table = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
-  const max = Number(env.MAX_CHAPTER || 2097152);
+  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
   const maxTotal = 16 * 1024 * 1024; // 单批总字节护栏（body/内存）
   const items = [];
   let total = 0;
@@ -520,7 +522,7 @@ async function apiPutChapters(req, env, store, id) {
 
 /** 上传原件（原始字节留档，重洗/恢复依据） */
 async function apiPutRaw(req, env, store, id) {
-  const max = Number(env.MAX_UPLOAD || 52428800);
+  const max = Number(env.MAX_UPLOAD || MAX_UPLOAD_BYTES);
   const declared = Number(req.headers.get('content-length') || 0);
   if (declared > max) {
     await dropBody(req);
@@ -550,7 +552,7 @@ async function apiRawGet(store, id) {
 async function apiUpdateChapters(req, env, store, id) {
   const body = await req.json().catch(() => ({}));
   const op = body.op === 'append' ? 'append' : 'replace';
-  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, 20000) : [];
+  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
 
   const index = await readIndex(store);
@@ -845,7 +847,7 @@ async function apiPatchChapter(req, env, store, id, key) {
     ch.title = t ? safeStr(t, 120) : '第' + (i + 1) + '章';
   }
   if (hasContent) {
-    const max = Number(env.MAX_CHAPTER || 2097152);
+    const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
     if (enc.encode(body.content).byteLength > max) return json({ error: '章节超过上限' }, 413);
     const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
     const newWords = wordsOf(body.content);
@@ -869,7 +871,7 @@ async function apiInsertChapter(req, env, store, id) {
   const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
   const content = typeof body.content === 'string' ? body.content : '';
   if (!titleRaw && !content) return json({ error: '章节标题和正文不能都为空' }, 400);
-  const max = Number(env.MAX_CHAPTER || 2097152);
+  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
   if (enc.encode(content).byteLength > max) return json({ error: '章节超过上限' }, 413);
 
   if (!Array.isArray(meta.chapters)) meta.chapters = [];
@@ -964,9 +966,8 @@ async function apiProgressPut(req, store, id) {
 
 /* ---------------- 批量操作 / 标签治理（书架百本量级的治理工具） ---------------- */
 
-/** 批量操作单请求上限：每本 1 读(meta)+1 写(meta) ≈ 2N，加 index 读/bak/写 ≈ 5 → 18 本 ≈ 41 子请求，留足余量 */
-const BATCH_BOOKS_MAX = 18;
-/** 标签合并单请求上限（同样受 2N 约束；未完成的部分返回 remaining 让前端续调） */
+/** 标签合并单请求上限（同样受 2N 约束；未完成的部分返回 remaining 让前端续调）。
+ * 书架批量操作上限 BATCH_BOOKS_MAX 见 shared-const.js（前后端共用，防漂移）。 */
 const TAG_MERGE_MAX = 18;
 
 /**
@@ -1493,7 +1494,6 @@ async function opdsExport(req, env, store, id) {
   // Free 计划单请求 ≤50 子请求：整本流式导出逐章开 R2 流（1 章 = 1 子请求），
   // 超出剩余预算会让流在中段报错 → 客户端拿到截断/失败文件。明确拒绝并指引网页端
   // 导出（exportBookTxt 收到非 200 会自动回退到逐章拉取，网页端不受影响）。
-  const EXPORT_MAX_CHAPTERS = 40;
   if (meta.chapters.length > EXPORT_MAX_CHAPTERS) {
     return json({ error: `本书 ${meta.chapters.length} 章超过整本流式导出上限（${EXPORT_MAX_CHAPTERS} 章），请在网页中使用「导出」功能` }, 409);
   }

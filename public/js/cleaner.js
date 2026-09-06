@@ -11,6 +11,8 @@
  *      引子归章、单章取书名、误抓修复、自定义正则）。
  */
 
+import { FIT_CHAPTER_BYTES } from './shared-const.js';
+
 export const DEFAULT_CLEAN_OPTS = {
   stripRefMarks: true, // 去 [12]【3】 脚注数字标注
   stripMarkdown: true, // 去 Markdown 语法
@@ -387,7 +389,7 @@ export function processBook(bytes, { fallbackTitle, cleanOpts = {}, forceEncodin
  * 按 UTF-8 字节边界切成连续段——切点回退到字符边界，绝不劈裂多字节字符。
  * 超大章（分章引擎整本兜底等）若不切会在上传时被服务端 413 拒绝、留下半成品书。
  * 返回 { chapters, extra }：extra = 因切分多出的章节数（>0 时调用方提示用户）。 */
-export function fitChapters(chapters, maxBytes = 1_900_000) {
+export function fitChapters(chapters, maxBytes = FIT_CHAPTER_BYTES) {
   const out = [];
   let extra = 0;
   const enc = new TextEncoder();

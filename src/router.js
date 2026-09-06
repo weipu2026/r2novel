@@ -1027,9 +1027,19 @@ async function apiTrashClear(store) {
  *   截断（宁漏勿错），避免大书库把「检查残留」点成 500。
  */
 const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
-const DIAG_SUB_BUDGET = 40; // 扫描/删除单请求子请求软预算（留余量给响应与其他读取）
+const DIAG_LIST_PAGE_BUDGET = 20; // list 分页软上限（每页 ≤1000 对象）：大库只扫前 N 页，截断即 incomplete，防 503
+const DIAG_SUB_BUDGET = 45; // 扫描/删除单请求子请求软预算
 
 async function apiDiagOrphans(store) {
+  try {
+    return await doDiagScan(store);
+  } catch (e) {
+    // 扫描过程本身失败（R2 超限/超时等）→ 透传真实原因，前端可展示而非笼统 HTTP 503
+    return json({ error: '残留扫描失败：' + (e && e.message ? e.message : e) }, 502);
+  }
+}
+
+async function doDiagScan(store) {
   const budget = { used: 2, incomplete: false }; // 2 = readIndex + readTrash
   const bump = () => {
     if (budget.used >= DIAG_SUB_BUDGET) {
@@ -1052,9 +1062,11 @@ async function apiDiagOrphans(store) {
   const chapterOrphans = [];
   const orphanBooks = [];
 
-  // 全库一次遍历（R2 list 每页 ≤1000，页数近似计入预算）
-  const all = await store.list();
-  budget.used += Math.ceil(all.length / 1000);
+  // 全库一次遍历（分页受 DIAG_LIST_PAGE_BUDGET 约束：大库只扫前 N 页，截断即标记 incomplete）
+  const lst = await store.list('', DIAG_LIST_PAGE_BUDGET);
+  const all = lst.objects;
+  budget.used += Math.max(1, lst.pages);
+  if (lst.truncated) budget.incomplete = true;
 
   // meta/{id}.json → 无主书（系统 meta 文件排除）
   for (const o of all) {

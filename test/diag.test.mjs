@@ -46,7 +46,7 @@ function memStore() {
       for (const [k, v] of m) {
         if (k.startsWith(prefix)) out.push({ key: k, size: typeof v === 'string' ? v.length : v.byteLength });
       }
-      return out;
+      return { objects: out, truncated: false, pages: 1 };
     },
     _map: m,
   };

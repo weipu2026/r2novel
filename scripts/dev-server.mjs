@@ -90,7 +90,8 @@ const fsStore = {
       /* ignore */
     }
   },
-  /** 遍历对象清单（与生产 R2 list 同形）；walk 全树后按前缀过滤 */
+  /** 遍历对象清单（与生产 R2 list 同形）；walk 全树后按前缀过滤。
+   *  返回 { objects, truncated, pages }：fs 无分页，恒 pages=1、truncated=false。 */
   async list(prefix = '') {
     const out = [];
     const walk = (dir, rel) => {
@@ -111,7 +112,7 @@ const fsStore = {
       }
     };
     walk(DATA, '');
-    return out;
+    return { objects: out, truncated: false, pages: 1 };
   },
 };
 

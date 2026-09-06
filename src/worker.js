@@ -29,16 +29,24 @@ function r2Store(bucket) {
     async delete(key) {
       await bucket.delete(key);
     },
-    /** 遍历对象清单（含子前缀递归）；返回 [{ key, size }]，自动翻页拉全 */
-    async list(prefix = '') {
+    /** 遍历对象清单（含前缀过滤）。返回 { objects:[{key,size}], truncated, pages }；
+     *  分页每页 ≤1000，受 maxPages 约束：超出即截断并置 truncated（大库防单请求子请求/耗时爆表）。 */
+    async list(prefix = '', maxPages = 0) {
       const out = [];
       let cursor;
+      let pages = 0;
+      let truncated = false;
       do {
+        if (maxPages > 0 && pages >= maxPages) {
+          truncated = true;
+          break;
+        }
         const page = await bucket.list(prefix ? { prefix } : {});
         for (const o of page.objects) out.push({ key: o.key, size: o.size });
+        pages++;
         cursor = page.truncated ? page.cursor : undefined;
       } while (cursor);
-      return out;
+      return { objects: out, truncated, pages };
     },
   };
 }

@@ -60,7 +60,8 @@ self.addEventListener('fetch', (event) => {
           if (res && res.status === 200) cache.put(req, res.clone()).catch(() => {});
           return res;
         })
-        .catch(() => cached);
+        // 离线且从未缓存过 → 兜底 503，避免 respondWith 解析出 undefined 抛错
+        .catch(() => cached || new Response('', { status: 503 }));
       return cached || network;
     })
   );

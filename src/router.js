@@ -98,7 +98,7 @@ function clientIp(req) {
  * 锁定期内即使口令正确也 429（防止绕过限速试探）；成功登录即清零。
  */
 const BRUTE_FAIL_WINDOW = 15 * 60000;
-const BRUTE_MAX_IPS = 5000;
+const BRUTE_MAX_IPS = 5000; // brute.json 最多保留的 IP 记录数（防分布式伪造 IP 撑大文件）
 
 const bruteCfg = (env) => ({
   limit: Number(env.BRUTE_LIMIT) || 5,
@@ -112,13 +112,19 @@ async function ipHash(req) {
   return [...new Uint8Array(d)].slice(0, 10).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** 读取爆破状态（顺手清掉过期条目，文件保持极小） */
+/** 读取爆破状态（顺手清掉过期条目 + 按数量截断，文件保持极小） */
 async function readBrute(store) {
   const b = await readJson(store, KEY.BRUTE, { ips: {} });
   const now = Date.now();
   const ips = {};
   for (const [k, rec] of Object.entries(b.ips || {})) {
     if ((rec.until || 0) > now || (rec.updatedAt || 0) > now - BRUTE_FAIL_WINDOW) ips[k] = rec;
+  }
+  // 上限保护：超量时按最近活跃裁掉最旧的（防御分布式伪造 IP 让 brute.json 无限膨胀）
+  const entries = Object.entries(ips);
+  if (entries.length > BRUTE_MAX_IPS) {
+    entries.sort((a, b2) => (a[1].updatedAt || 0) - (b2[1].updatedAt || 0));
+    for (const [k] of entries.slice(0, entries.length - BRUTE_MAX_IPS)) delete ips[k];
   }
   return { ips };
 }
@@ -228,6 +234,9 @@ function newId() {
 
 const safeStr = (v, max = 200) => String(v == null ? '' : v).replace(/[\u0000-\u001f<>"'\\/]/g, '').slice(0, max).trim();
 
+/** 字数统计：去所有空白后计数（与上传/就地编辑/插入共用，唯一实现） */
+const wordsOf = (text) => String(text == null ? '' : text).replace(/\s/g, '').length;
+
 async function readJson(store, key, fallback) {
   const t = await store.getText(key);
   if (t == null) return fallback;
@@ -293,7 +302,9 @@ const apiLogout = (req) =>
 
 /* ---------------- 回收站惰性清理 / 彻底删除（分批，尊重 50 子请求预算） ---------------- */
 
-const PURGE_BATCH = 40; // 每请求最多删的正文对象数（留余量给 raw/meta/progress/trash 写入）
+const DELETE_BATCH = 40; // 单请求/单次惰性清理最多删除的对象数（分批评删与孤儿清理共用同一上限）
+const PURGE_BATCH = DELETE_BATCH; // 彻底删除单批上限（留余量给 raw/meta/progress/trash 写入）
+const ORPHAN_BATCH = DELETE_BATCH; // replace 遗留孤儿惰性清理单批上限
 
 /**
  * 对 trash 里一本书执行一批彻底删除。返回 { entry(更新后), deleted, done, remaining }。
@@ -345,8 +356,6 @@ async function sweepTrash(store, env, maxBooks = 1) {
 }
 
 /* ---------------- 孤儿章节清理（replace 后章节数变少时旧正文对象残留） ---------------- */
-
-const ORPHAN_BATCH = 40; // 每次惰性清理最多删的孤儿对象数（尊重子请求预算）
 
 /** 对一本书的一批孤儿 key 执行删除；只改 meta.orphans，持久化由调用方负责。返回剩余数。 */
 async function sweepOrphans(store, meta, max = ORPHAN_BATCH) {
@@ -408,16 +417,7 @@ async function apiCreateBook(req, env, store) {
     return json({
       ok: true,
       duplicate: true,
-      book: {
-        id: dup.id,
-        title: dup.title,
-        author: dup.author,
-        tags: dup.tags || [],
-        chapterCount: dup.chapterCount,
-        wordCount: dup.wordCount,
-        createdAt: dup.createdAt,
-        updatedAt: dup.updatedAt,
-      },
+      book: indexEntryFromMeta(dup), // index 条目字段齐全，直接复用车架摘要（多带 pinned/cleanVer，无害）
       // 占位 id：客户端若选「新建」，需要重新调用一次（本次直接返回提示）
       needCreate: true,
     });
@@ -477,7 +477,7 @@ async function apiPutChapter(req, env, store, id, key) {
   const buf = await req.arrayBuffer();
   if (buf.byteLength > max) return json({ error: '章节超过上限' }, 413);
   const text = new TextDecoder().decode(buf);
-  const words = String(text).replace(/\s/g, '').length;
+  const words = wordsOf(text);
   await store.putText(KEY.text(id, key), text);
   return json({ ok: true, words });
 }
@@ -694,8 +694,13 @@ async function apiPatchBook(req, store, id) {
   return json({ ok: true });
 }
 
-/** 读一章正文。?v=cleanVer 做缓存击穿，rewash 后立即生效 */
+/** 读一章正文。?v=cleanVer 做缓存击穿，rewash 后立即生效
+ * 只放行已发布书：replace/append 期间书处于 creating，旧正文不应被读到（与 bookMeta/export 一致）；
+ * 也避免「replace 后旧 key 正文残留、发布抽样未命中」时旧正文顶着新章表长期被读。 */
 async function apiChapter(store, id, key) {
+  const meta = await readBook(store, id);
+  if (!meta) return json({ error: '章节不存在' }, 404);
+  if (meta.status !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
   const t = await store.getText(KEY.text(id, key));
   if (t == null) return json({ error: '章节不存在' }, 404);
   return new Response(t, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
@@ -715,7 +720,6 @@ function chIndex(meta, key) {
   const arr = Array.isArray(meta.chapters) ? meta.chapters : [];
   return arr.findIndex((c) => c.key === key);
 }
-const wordsOf = (text) => String(text == null ? '' : text).replace(/\s/g, '').length;
 
 /** 就地编辑前提：书在架 + 存在 + 已发布；返回 { meta } 或 { resp }（直接作为响应） */
 async function editableMeta(store, id) {
@@ -901,10 +905,14 @@ async function apiProgressPut(req, store, id) {
     const index = await readIndex(store);
     const book = (index.books || []).find((b) => b.id === id);
     if (!book) return json({ ok: true });
+    // 越界进度压回末章（镜像供书架角标直接显示，不能出现「读到 999/10 章」）
+    // 恶意/异常客户端可能直接 PUT 超章数 ch；正常前端已 clamp，这里做服务端兜底。
+    const cap = Number(book.chapterCount) || 0;
+    const mch = cap > 0 && ch > cap ? cap : ch;
     const cur = book.prog;
-    const changed = !cur || cur.ch !== ch || Math.abs((cur.ratio || 0) - ratio) > 0.02;
+    const changed = !cur || cur.ch !== mch || Math.abs((cur.ratio || 0) - ratio) > 0.02;
     if (changed) {
-      const books = (index.books || []).map((b) => (b.id === id ? { ...b, prog: { ch, ratio, updatedAt: data.updatedAt } } : b));
+      const books = (index.books || []).map((b) => (b.id === id ? { ...b, prog: { ch: mch, ratio, updatedAt: data.updatedAt } } : b));
       await writeIndex(store, { books });
     }
   } catch {
@@ -923,9 +931,12 @@ async function apiSoftDelete(store, id) {
   const b = (index.books || []).find((x) => x.id === id);
   const meta = b ? null : await readBook(store, id);
   if (!b && !meta) return json({ error: '书不存在或已删除' }, 404);
-  await writeIndexBak(store);
-  const books = (index.books || []).filter((x) => x.id !== id);
-  await writeIndex(store, { books });
+  // 只在架书才需要从 index 摘除（半成品书本就不在 index，filter 结果不变，跳过两次无谓 R2 写）
+  if (b) {
+    await writeIndexBak(store);
+    const books = (index.books || []).filter((x) => x.id !== id);
+    await writeIndex(store, { books });
+  }
 
   const trash = await readTrash(store);
   if (!trash.books.some((x) => x.id === id)) {
@@ -1002,7 +1013,7 @@ async function apiTrashClear(store) {
     budget -= Math.max(r.deleted, 1);
     if (!r.done) break; // 这一本就吃满预算，下一请求再来
   }
-  const remaining = (await readTrash(store)).books.length;
+  const remaining = trash.books.length; // purgeOnce 就地维护并已持久化 trash，内存即真值
   return json({ ok: true, deleted, remaining });
 }
 
@@ -1069,17 +1080,14 @@ function pumpParts(gen) {
     await pumpChapter(controller);
   }
   async function pumpChapter(controller) {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        reader = null;
-        cur = null;
-        await nextPart(controller); // 读尽本段 → 立即接下一段
-        return;
-      }
-      controller.enqueue(value); // 背压：推一块就交还，等下次 pull
+    const { done, value } = await reader.read();
+    if (done) {
+      reader = null;
+      cur = null;
+      await nextPart(controller); // 读尽本段 → 立即接下一段
       return;
     }
+    controller.enqueue(value); // 背压：推一块就交还，下一块由 pull 再次驱动
   }
   return new ReadableStream({
     pull(controller) {

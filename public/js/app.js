@@ -1338,6 +1338,23 @@ function ceBuildRow(ch, i) {
   save.disabled = true;
   let bodyOpen = false;
   ta.addEventListener('input', () => { save.disabled = false; });
+  // 清洗排版：本地跑 cleaner.cleanText 后回填（与上传页同一套默认规则）。
+  // 所见即所得，用户主动点才洗，不会覆盖自己排的版；回填后需点「保存本章」才入库。
+  const cleanBtn = document.createElement('button');
+  cleanBtn.type = 'button';
+  cleanBtn.className = 'pv-btn';
+  cleanBtn.textContent = '清洗排版';
+  cleanBtn.title = '用与上传页相同的规则清洗本章（去[x]脚注/Markdown/多余空行/站点残留等）。可反复点，保存后生效。';
+  cleanBtn.addEventListener('click', () => {
+    const cleaned = cleaner.cleanText(ta.value, cleaner.DEFAULT_CLEAN_OPTS);
+    if (cleaned === ta.value) {
+      toast('正文已是干净格式', 1200);
+      return;
+    }
+    ta.value = cleaned;
+    save.disabled = false; // 内容已变，放行保存
+    toast('已清洗排版，保存后生效', 1400);
+  });
   save.addEventListener('click', async () => {
     ceBusy('保存正文…');
     save.disabled = true;
@@ -1355,7 +1372,7 @@ function ceBuildRow(ch, i) {
       ceBusy('');
     }
   });
-  acts.append(tip, save);
+  acts.append(tip, cleanBtn, save);
   bodyBox.append(ta, acts);
 
   const toggleBody = async () => {

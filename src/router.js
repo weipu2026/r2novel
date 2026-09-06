@@ -381,6 +381,7 @@ function indexEntryFromMeta(meta, extra = {}) {
     author: meta.author,
     tags: meta.tags || [],
     pinned: !!meta.pinned,
+    finished: !!meta.finished,
     chapterCount: meta.chapterCount || (meta.chapters || []).length,
     wordCount: meta.wordCount || 0,
     cleanVer: meta.cleanVer || 1,
@@ -709,6 +710,10 @@ async function apiPatchBook(req, store, id) {
     meta.pinned = !!body.pinned;
     patch.pinned = meta.pinned;
   }
+  if (body.finished !== undefined) {
+    meta.finished = !!body.finished;
+    patch.finished = meta.finished;
+  }
   meta.updatedAt = Date.now();
   patch.updatedAt = meta.updatedAt;
   await store.putText(KEY.book(id), JSON.stringify(meta));
@@ -722,6 +727,7 @@ async function apiPatchBook(req, store, id) {
       author: patch.author !== undefined ? patch.author : b.author,
       tags: patch.tags !== undefined ? patch.tags : b.tags,
       pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
+      finished: patch.finished !== undefined ? patch.finished : !!b.finished,
       updatedAt: patch.updatedAt,
     };
   });

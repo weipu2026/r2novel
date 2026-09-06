@@ -267,6 +267,23 @@ test('M2：批量上传章节（bulk）—— 一次校验一次写，正文可�
   assert.equal(t.text, '批量正文二');
 });
 
+test('M2：PATCH finished —— meta 与书架条目同步，完结状态可持久化', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '完结书', 3);
+
+  let shelf = await call(store, req('/api/books', { cookie }));
+  assert.equal(shelf.data.books.find((b) => b.id === id).finished, false, '默认未完结');
+
+  const p = await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { finished: true } }));
+  assert.equal(p.status, 200);
+
+  shelf = await call(store, req('/api/books', { cookie }));
+  assert.equal(shelf.data.books.find((b) => b.id === id).finished, true, '书架条目应同步 finished');
+  const meta = await call(store, req(`/api/books/${id}`, { cookie }));
+  assert.equal(meta.data.finished, true, 'meta 应持久化 finished');
+});
+
 test('M2：对已软删书 PATCH/update 拒绝', async () => {
   const store = memStore();
   const cookie = await login(store);

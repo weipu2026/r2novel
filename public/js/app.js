@@ -12,9 +12,12 @@ const normTitle = (s) => String(s || '').replace(/\s+/g, '');
 
 const PAGE = 60; // 书库分页
 
+/** 上传表单的常用分类（可点选；也可在输入框里自由输入自定义标签） */
+const PRESET_TAGS = ['玄幻', '仙侠', '武侠', '系统', '调教', '都市', '催眠'];
+
 const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
-let ui = { sort: 'recent', q: '', tag: '', page: 1 };
+let ui = { sort: 'recent', q: '', tag: '', finished: '', page: 1 };
 
 export function init() {
   ['login', 'shelf', 'upload', 'trash'].forEach((v) => {
@@ -57,6 +60,7 @@ export function init() {
   els.upTitle = $('#upTitle');
   els.upAuthor = $('#upAuthor');
   els.upTags = $('#upTags');
+  els.upTagChips = $('#upTagChips');
   els.upNote = $('#upNote');
   els.upClean = $('#upClean');
   els.upCleanOpts = $('#upCleanOpts');
@@ -128,6 +132,7 @@ export function init() {
 
   reader.bindReader(els.readRoot, onNavBack);
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
+  renderPresetChips();
   boot();
 }
 
@@ -206,6 +211,8 @@ function filteredBooks() {
     list = list.filter((b) => b.title.toLowerCase().includes(q) || (b.tags || []).some((t) => t.toLowerCase().includes(q)));
   }
   if (ui.tag) list = list.filter((b) => (b.tags || []).includes(ui.tag));
+  if (ui.finished === 'done') list = list.filter((b) => b.finished);
+  if (ui.finished === 'ongoing') list = list.filter((b) => !b.finished);
   return list;
 }
 
@@ -240,7 +247,7 @@ function renderShelf() {
   }
 
   const list = sortedBooks(filteredBooks());
-  els.filterNote.textContent = ui.q || ui.tag ? `筛选出 ${list.length} 本` : '';
+  els.filterNote.textContent = ui.q || ui.tag || ui.finished ? `筛选出 ${list.length} 本` : '';
   renderTagCloud();
   renderGrid(list);
 }
@@ -287,23 +294,90 @@ function tagCounts() {
   return Array.from(m.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh')).slice(0, 12);
 }
 
+/** 分类导航栏（方向1）：状态频道（全部/完结/连载中）+ 全部标签 chips */
 function renderTagCloud() {
   const cloud = els.tagCloud;
   cloud.innerHTML = '';
-  const tags = tagCounts();
-  if (!tags.length) return;
-  tags.forEach(([t, n]) => {
+  const mk = (label, on) => {
     const b = document.createElement('button');
     b.type = 'button';
-    b.textContent = `${t} ${n}`;
-    b.classList.toggle('on', ui.tag === t);
+    b.textContent = label;
+    b.classList.toggle('on', !!on);
+    return b;
+  };
+  const stateBtn = (label, val) => {
+    const b = mk(label, ui.finished === val);
     b.addEventListener('click', () => {
-      ui.tag = ui.tag === t ? '' : t;
+      ui.finished = ui.finished === val ? '' : val;
       ui.page = 1;
       renderShelf();
     });
     cloud.appendChild(b);
+  };
+  const all = mk('全部', !ui.tag && !ui.finished);
+  all.addEventListener('click', () => {
+    ui.tag = '';
+    ui.finished = '';
+    ui.page = 1;
+    renderShelf();
   });
+  cloud.appendChild(all);
+  stateBtn('完结', 'done');
+  stateBtn('连载中', 'ongoing');
+  const tags = tagCounts();
+  if (tags.length) {
+    cloud.appendChild(docEle('span', 'tagcloud-sep', '·'));
+    tags.forEach(([t, n]) => {
+      const b = mk(`${t} ${n}`, ui.tag === t);
+      b.addEventListener('click', () => {
+        ui.tag = ui.tag === t ? '' : t;
+        ui.page = 1;
+        renderShelf();
+      });
+      cloud.appendChild(b);
+    });
+  }
+}
+
+/** 小工具：造 <tag class=...>text</tag> */
+function docEle(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+/* ---------- 上传表单的常用分类点选（方向2） ---------- */
+function currentTagsFromInput() {
+  return els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+}
+/** 按输入框当前值点亮/熄灭预设分类 chips */
+function syncPresetChips() {
+  if (!els.upTagChips) return;
+  const have = new Set(currentTagsFromInput());
+  for (const b of els.upTagChips.children) {
+    b.classList.toggle('on', have.has(b.dataset.tag));
+  }
+}
+/** 渲染预设分类 chips：点选即写入标签输入框（与自定义输入共存） */
+function renderPresetChips() {
+  if (!els.upTagChips) return;
+  els.upTagChips.innerHTML = '';
+  for (const t of PRESET_TAGS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.tag = t;
+    b.textContent = t;
+    b.addEventListener('click', () => {
+      const have = new Set(currentTagsFromInput());
+      if (have.has(t)) have.delete(t);
+      else have.add(t);
+      els.upTags.value = Array.from(have).join(', ');
+      syncPresetChips();
+    });
+    els.upTagChips.appendChild(b);
+  }
+  syncPresetChips();
 }
 
 function progBadgeText(b) {
@@ -337,6 +411,12 @@ function makeCard(b, big) {
   m.textContent = [tags, `${b.chapterCount || 0} 章`, fmtWords(b.wordCount)].filter(Boolean).join(' · ');
   info.appendChild(t);
   info.appendChild(m);
+  if (b.finished) {
+    const f = document.createElement('span');
+    f.className = 'finish-pill';
+    f.textContent = '完结';
+    info.appendChild(f);
+  }
   c.appendChild(block);
   c.appendChild(info);
   const badge = progBadgeText(b);
@@ -442,9 +522,13 @@ async function safePatch(id, patch) {
 /* ---------- 编辑信息模态 ---------- */
 async function openEditModal(b) {
   let note = '';
+  let finished = !!b.finished;
   try {
     const meta = await api.bookMeta(b.id);
-    if (meta) note = meta.note || '';
+    if (meta) {
+      note = meta.note || '';
+      if (typeof meta.finished === 'boolean') finished = meta.finished;
+    }
   } catch {
     /* 用书架摘要（无 note 则空） */
   }
@@ -454,6 +538,7 @@ async function openEditModal(b) {
     <div class="m-field"><label>书名</label><input id="mdTitle" value="${esc(b.title)}"></div>
     <div class="m-field"><label>作者</label><input id="mdAuthor" value="${esc(b.author || '')}"></div>
     <div class="m-field"><label>标签（逗号分隔）</label><input id="mdTags" value="${esc((b.tags || []).join(', '))}"></div>
+    <div class="m-field"><label class="finish-row"><span>已完结</span><input type="checkbox" id="mdFinished" ${finished ? 'checked' : ''}></label></div>
     <div class="m-field"><label>备注</label><input id="mdNote" value="${esc(note)}" placeholder="这本书的备注（个人备忘）"></div>
     <div class="m-acts">
       <button class="ghost" id="mdCancel" type="button">取消</button>
@@ -466,6 +551,7 @@ async function openEditModal(b) {
       author: $('#mdAuthor', els.modalBox).value.trim(),
       tags: $('#mdTags', els.modalBox).value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
       note: $('#mdNote', els.modalBox).value.trim(),
+      finished: $('#mdFinished', els.modalBox).checked,
     };
     if (!patch.title) return toast('书名不能为空', 1600);
     closeModal();
@@ -781,6 +867,7 @@ function openUpload(opts = {}) {
   els.upProgWrap.classList.add('hidden');
   els.upConfirm.disabled = true;
   pending = null;
+  syncPresetChips(); // 重洗/新建都会重置标签输入 → 同步常用分类 chips 高亮
   if (opts.book) {
     // 重新清洗入口
     pending = {
@@ -792,6 +879,7 @@ function openUpload(opts = {}) {
     els.upTitle.value = opts.book.title || '';
     els.upAuthor.value = opts.book.author || '';
     els.upTags.value = (opts.book.tags || []).join(', ');
+    syncPresetChips();
     els.upNote.value = opts.book.note || '';
     hint(`正在用原件重新清洗《${opts.book.title}》，确认后整本替换`);
     busy(0.05, '下载原件…');

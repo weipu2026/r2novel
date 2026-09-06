@@ -401,6 +401,22 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer;
 }
 .tagcloud button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tagcloud-sep { color: var(--muted); font-size: 12px; align-self: center; }
+.tag-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.tag-chips button {
+  border: 1px solid var(--line); background: transparent; color: var(--muted);
+  border-radius: 999px; padding: 3px 12px; font-size: 12.5px; cursor: pointer;
+}
+.tag-chips button:hover { border-color: var(--accent); color: var(--accent); }
+.tag-chips button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.card .finish-pill {
+  display: inline-block; align-self: flex-start; margin-top: 4px;
+  background: #2f9e8f; color: #fff; border-radius: 999px; padding: 1px 8px; font-size: 11px;
+}
+.modal-box .m-field label.finish-row {
+  display: flex; align-items: center; justify-content: space-between; cursor: pointer;
+}
+.modal-box .m-field input[type='checkbox'] { width: auto; }
 button.ghost.slim { padding: 5px 9px; font-size: 12.5px; }
 button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font-size: 14px; }
 

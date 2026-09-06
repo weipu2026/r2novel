@@ -27,6 +27,7 @@ export function init() {
   els.logoutBtn = $('#logoutBtn');
   els.uploadBtn = $('#uploadBtn');
   els.trashBtn = $('#trashBtn');
+  els.diagBtn = $('#diagBtn');
   els.continueCard = $('#continueCard');
   els.continueWrap = $('#continueWrap');
   els.grid = $('#bookGrid');
@@ -85,6 +86,8 @@ export function init() {
   els.logoutBtn.addEventListener('click', logout);
   els.uploadBtn.addEventListener('click', () => openUpload());
   els.trashBtn.addEventListener('click', openTrash);
+  els.diagBtn.addEventListener('click', openDiag);
+  els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
   els.trashBack.addEventListener('click', () => { showView('shelf'); loadShelf().catch(() => {}); });
   els.trashClear.addEventListener('click', clearTrashFlow);
   els.searchInput.addEventListener('input', () => { ui.q = els.searchInput.value.trim(); ui.page = 1; renderShelf(); });
@@ -469,11 +472,13 @@ async function openEditModal(b) {
 
 /* ---------- 模态通用 ---------- */
 function openModal(html) {
+  els.modalBox.classList.remove('ce', 'diag'); // 清掉上个弹层可能加的加宽类
   els.modalBox.innerHTML = html;
   els.modalMask.classList.remove('hidden');
 }
 function closeModal() {
-  els.modalBox.classList.remove('ce');
+  els.modalBox.classList.remove('ce', 'diag');
+  els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
 }
 function confirmModal(text, okText = '确定') {
@@ -491,6 +496,144 @@ function confirmModal(text, okText = '确定') {
 }
 
 const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/* ---------- 残留诊断（书架「检查残留」：只读扫描 + 删无主对象 / 无主书移入回收站） ---------- */
+let diagData = null; // 最近一次扫描结果（删除 / 移入回收站动作读取）
+const fmtBytes = (n) => {
+  n = Number(n) || 0;
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+};
+const diagShort = (key) => {
+  const s = String(key || '');
+  return s.length > 64 ? s.slice(0, 30) + '…' + s.slice(-26) : s;
+};
+
+async function openDiag() {
+  openModal('<h3>残留检查</h3><p class="modal-sub">正在扫描全库对象…</p>');
+  try {
+    diagData = await api.diagOrphans();
+    if (els.modalMask.classList.contains('hidden')) return; // 扫描期间用户已关闭
+    renderDiag();
+  } catch (e) {
+    if (els.modalMask.classList.contains('hidden')) return;
+    els.modalBox.innerHTML = `<h3>残留检查</h3>
+      <p class="modal-sub">扫描失败：${esc(e.message || e)}</p>
+      <div class="m-acts"><button class="ghost" id="diagErrClose" type="button">关闭</button></div>`;
+    $('#diagErrClose', els.modalBox).addEventListener('click', closeModal);
+  }
+}
+
+async function diagRefresh() {
+  try {
+    diagData = await api.diagOrphans();
+  } catch (e) {
+    toast('扫描失败：' + (e.message || e), 2200);
+    return;
+  }
+  renderDiag(); // 无论面板当前是否可见都渲染（调用方需保证面板开着；可见性由 openDiag 入口控制）
+}
+
+function renderDiag() {
+  const d = diagData;
+  const st = d.summary || {};
+  const rs = d.residue || [];
+  const obs = d.orphanBooks || [];
+  const cos = d.chapterOrphans || [];
+  const total = rs.length + obs.length + cos.length;
+  const badge = total ? `<span class="diag-badge diag-badge-warn">发现 ${total} 项残留</span>` : `<span class="diag-badge diag-badge-ok">一切干净</span>`;
+
+  const sec = (dotCls, title, n, bodyHtml) => `<div class="diag-sec">
+    <p class="diag-sec-head"><span class="diag-dot ${dotCls}"></span>${esc(title)}<span class="diag-count">${n}</span></p>
+    ${bodyHtml}</div>`;
+
+  const objRow = (o, extra) => `<div class="diag-row">
+    <div class="diag-row-main">
+      <code class="diag-key" title="${esc(o.key)}">${esc(diagShort(o.key))}</code>
+      <div class="diag-row-sub">${fmtBytes(o.size)}${extra || ''}</div>
+    </div>
+    <button class="ghost slim" type="button" data-diag="del-one" data-key="${esc(o.key)}">删除</button>
+  </div>`;
+
+  const bookRow = (b) => `<div class="diag-row">
+    <div class="diag-row-main">
+      <span class="diag-name">${esc(b.title || '（未命名）')}</span>
+      <div class="diag-row-sub">${fmtBytes(b.size)} · ${b.chapterCount || 0} 章 · ${esc(b.status)}${b.texts ? ` · 关联正文 ${b.texts} 段` : ''}</div>
+    </div>
+    <button class="ghost slim" type="button" data-diag="move-book" data-id="${esc(b.id)}" data-title="${esc(b.title || '')}">移入回收站</button>
+  </div>`;
+
+  const chTag = (o) => (o.known ? ' · <span class="diag-tag">已在惰性清理名单</span>' : ' · <span class="diag-tag diag-tag-orphan">未登记</span>');
+
+  let body;
+  if (!total) {
+    body = `<p class="diag-clean">库中无残留文件：所有对象都能被书架或回收站引用到。</p>`;
+  } else {
+    body = sec('diag-dot-red', '已删书的残留对象', rs.length,
+      rs.length ? `<div class="diag-rows">${rs.map((o) => objRow(o, '')).join('')}</div>
+        <p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="residue">删除全部 ${rs.length} 项</button></p>`
+        : '<p class="diag-none">无</p>')
+      + sec('diag-dot-amber', '未入架的无主书', obs.length,
+        obs.length ? `<div class="diag-rows">${obs.map((b) => bookRow(b)).join('')}</div>`
+          : '<p class="diag-none">无</p>')
+      + sec('diag-dot-gray', '章节孤儿', cos.length,
+        cos.length ? `<div class="diag-rows">${cos.map((o) => objRow(o, ` · ${esc(o.bookTitle || o.bookId)}${chTag(o)}`)).join('')}</div>
+          <p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="chapters">删除全部 ${cos.length} 项</button></p>`
+          : '<p class="diag-none">无（自动惰性清理工作正常）</p>');
+  }
+
+  openModal(`<h3>残留检查</h3>
+    <p class="modal-sub">扫描于 ${new Date(d.scannedAt).toLocaleString()} · 在架 ${d.liveBooks} 本 ${badge}</p>
+    <div class="diag-body">${body}</div>
+    <div class="m-acts">
+      <button class="ghost" id="diagRefreshBtn" type="button">重新扫描</button>
+      <button class="primary" id="diagCloseBtn" type="button">关闭</button>
+    </div>`);
+  els.modalBox.classList.add('diag'); // 诊断面板加宽（openModal 会先清掉旧类）
+  $('#diagCloseBtn', els.modalBox).addEventListener('click', closeModal);
+  $('#diagRefreshBtn', els.modalBox).addEventListener('click', () => diagRefresh());
+}
+
+/* modalBox 上一次性委托：诊断动作（由 init 绑定；diagData 为空时忽略） */
+async function onDiagBoxClick(e) {
+  const btn = e.target.closest('[data-diag]');
+  if (!btn || !diagData) return;
+  const act = btn.dataset.diag;
+  if (act === 'del-one') {
+    const key = btn.dataset.key;
+    if (!(await confirmModal(`永久删除无主对象「${diagShort(key)}」？此操作不可恢复。`, '删除'))) return;
+    try {
+      await api.purgeOrphans([key]);
+      toast('已删除 1 个对象', 1400);
+      await diagRefresh();
+    } catch (err) {
+      toast('删除失败：' + (err.message || err), 2400);
+    }
+  } else if (act === 'del-all') {
+    const keys = (btn.dataset.what === 'residue' ? diagData.residue : diagData.chapterOrphans).map((o) => o.key);
+    if (!keys.length) return;
+    if (!(await confirmModal(`永久删除 ${keys.length} 个无主对象？此操作不可恢复。`, '全部删除'))) return;
+    try {
+      await api.purgeOrphans(keys);
+      toast(`已删除 ${keys.length} 个对象`, 1600);
+      await diagRefresh();
+    } catch (err) {
+      toast('删除失败：' + (err.message || err), 2400);
+    }
+  } else if (act === 'move-book') {
+    const id = btn.dataset.id;
+    const title = btn.dataset.title;
+    if (!(await confirmModal(`把未入架的书《${esc(title || '未命名')}》移入回收站？可在回收站恢复或彻底删除。`, '移入回收站'))) return;
+    try {
+      await api.deleteBook(id); // 服务端 softDelete 已支持无主书
+      toast('已移入回收站', 1600);
+      await diagRefresh();
+    } catch (err) {
+      toast('操作失败：' + (err.message || err), 2400);
+    }
+  }
+}
 
 /* ---------- 导出清洗后 txt（F13，共用 exporter.js） ---------- */
 async function exportBook(b) {

@@ -75,6 +75,11 @@ export const api = {
   putProgress(id, data) {
     return request('/api/progress/' + encodeURIComponent(id), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
   },
+  // 残留诊断（书架「检查残留」）
+  diagOrphans: () => request('/api/diag/orphans'),
+  purgeOrphans(keys) {
+    return request('/api/diag/orphans', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ objects: keys }) });
+  },
 };
 
 /* 本地镜像：进度 / 最近打开 / 阅读偏好（离线与杀后台兜底） */

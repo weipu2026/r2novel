@@ -300,14 +300,15 @@ function sortedBooks(list) {
 function renderShelf() {
   els.shelfCount.textContent = books.length ? `共 ${books.length} 本 · ${fmtWords(books.reduce((s, b) => s + (b.wordCount || 0), 0))}` : '';
 
-  // 最近阅读（继续阅读位）
-  const last = local.getLast();
-  const lastBook = last && books.find((b) => b.id === last.id);
-  els.continueWrap.classList.toggle('hidden', !lastBook);
-  if (lastBook) {
-    // 用书架完整数据渲染（local 里只存了 id/书名，缺章数/字数/进度，会显示成 0）
+  // 继续阅读：所有有进度的书按「云端最后阅读时间」倒序取前 3（prog 镜像，电脑/手机一致）
+  const reading = books
+    .filter((b) => b.prog && b.prog.updatedAt > 0)
+    .sort((a, b) => (b.prog.updatedAt || 0) - (a.prog.updatedAt || 0))
+    .slice(0, 3);
+  els.continueWrap.classList.toggle('hidden', !reading.length);
+  if (reading.length) {
     els.continueCard.innerHTML = '';
-    els.continueCard.appendChild(makeCard(lastBook, true));
+    for (const b of reading) els.continueCard.appendChild(makeCard(b, false));
   }
 
   const list = sortedBooks(filteredBooks());

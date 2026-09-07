@@ -75,6 +75,11 @@ button { font-family: inherit; }
 .brand-name { font-size: 17.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brand:hover .brand-name { color: var(--accent); }
 .count { margin-left: 8px; }
+/* 继续阅读：最近在读的前 3 本（纵排列表态，与全部书籍卡片同形态；桌面 3 列横排） */
+#continueCard { display: grid; gap: 8px; }
+@media (min-width: 900px) {
+  #continueCard { grid-template-columns: repeat(3, 1fr); }
+}
 .top-actions {
   display: flex; gap: 8px; align-items: center; flex: none;
   flex-wrap: wrap; justify-content: flex-end; /* 手机窄屏按钮自动换行，不撑破视口 */

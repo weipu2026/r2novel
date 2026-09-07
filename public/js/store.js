@@ -106,7 +106,6 @@ export const api = {
 /* 本地镜像：进度 / 最近打开 / 阅读偏好（离线与杀后台兜底） */
 const LS = {
   prog: (id) => 'rn_prog_' + id,
-  last: 'rn_last_book',
   pref: 'rn_read_pref',
   shelf: 'rn_shelf_cache',
 };
@@ -123,20 +122,6 @@ export const local = {
       localStorage.setItem(LS.prog(id), JSON.stringify(p));
     } catch {
       /* 存不下忽略 */
-    }
-  },
-  getLast() {
-    try {
-      return JSON.parse(localStorage.getItem(LS.last)) || null;
-    } catch {
-      return null;
-    }
-  },
-  setLast(v) {
-    try {
-      localStorage.setItem(LS.last, JSON.stringify(v));
-    } catch {
-      /* ignore */
     }
   },
   getPref() {

@@ -223,7 +223,7 @@ async function renderChapter(idx, restoreRatio) {
       el.scrollTop = restoreRatio * (el.scrollHeight - el.clientHeight) || 0;
     });
   }
-  saveLocal();
+  saveProgress(); // 翻章即同步云端（一章一次写，频率低）：保证「继续阅读/最近在读」跨设备准确
   markCur();
   // 预取下一章（静默）
   if (idx + 1 < state.chapters.length) loadChapter(idx + 1).catch(() => {});
@@ -512,7 +512,6 @@ function saveProgress() {
   if (!state.book) return;
   const p = { ch: state.cur + 1, ratio: curRatio(), updatedAt: Date.now() };
   local.setProg(state.book.id, p);
-  local.setLast({ id: state.book.id, title: state.book.title, at: p.updatedAt });
   if (navigator.onLine === false) {
     // 离线：入队，回网自动上送
     offline.queueProgress(state.book.id, p).catch(() => {});

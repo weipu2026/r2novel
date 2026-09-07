@@ -25,10 +25,9 @@
  *     剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
  */
 
-import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS } from '../public/js/shared-const.js';
+import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS } from '../public/js/shared-const.js';
 
 const SESSION_COOKIE = 'rn_session';
-const TRASH_DAYS = 15; // 回收站保留天数（惰性清理，无 cron）
 
 export const KEY = {
   INDEX: 'meta/index.json',

@@ -1,6 +1,6 @@
 /* app.js — 登录 / 书架（M2 管理）/ 上传 / 回收站 / 阅读入口（电脑上传为主，手机阅读为主） */
 import { api, local, fmtWords, ApiError } from './store.js';
-import { BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, CHAPTER_MAX } from './shared-const.js';
+import { BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, CHAPTER_MAX, TRASH_DAYS } from './shared-const.js';
 import * as cleaner from './cleaner.js';
 import * as reader from './reader.js';
 import { bindBusy, busy, busyDone } from './ui.js';
@@ -851,8 +851,8 @@ function renderTagMgr(data) {
         <span class="tm-name" title="${esc(t.tag)}">${esc(t.tag)}</span>
         <span class="tm-count">${t.count} 本</span>
         <input class="input tm-input" type="text" placeholder="改名 / 合并到…" autocomplete="off">
-        <button class="ghost slim tm-go" type="button" title="把「${esc(t.tag)}」改成或合并到左侧输入的标签">→</button>
-        <button class="ghost slim tm-del danger" type="button" title="从所有书上移除该标签">×</button>
+        <button class="ghost slim tm-go" type="button" title="把「${esc(t.tag)}」改成或合并到左侧输入的标签">${IC.arrow}</button>
+        <button class="ghost slim tm-del danger" type="button" title="从所有书上移除该标签">${IC.x}</button>
       </div>`
     )
     .join('');
@@ -1122,6 +1122,12 @@ function trashRow(b) {
   const acts = document.createElement('div');
   acts.className = 't-acts';
   if (b.restorable) {
+    // 保留期徽章：还剩几天可恢复（≤3 天红色警示）——免去用户心算 15 天期限
+    const left = Math.max(0, TRASH_DAYS - Math.floor((Date.now() - (b.deletedAt || 0)) / 86400000));
+    const ttl = document.createElement('span');
+    ttl.className = 'ttl-badge' + (left <= 3 ? ' warn' : '');
+    ttl.textContent = left > 0 ? `剩 ${left} 天` : '即将清除';
+    acts.appendChild(ttl);
     const restore = document.createElement('button');
     restore.type = 'button';
     restore.className = 'ghost';
@@ -1472,6 +1478,20 @@ function pvIconBtn(text, title, onClick, danger) {
   return b;
 }
 
+/** 细线 SVG 图标（与阅读工具栏同款语言）：受控字面量，非用户输入，innerHTML 安全 */
+const IC = {
+  plus: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  x: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  pen: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>',
+  arrow: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m0 0l-5-5m5 5l-5 5"/></svg>',
+};
+/** 图标版小按钮（与 pvIconBtn 同构，内容为 SVG） */
+function pvIconBtnSvg(name, title, onClick, danger) {
+  const b = pvIconBtn('', title, onClick, danger);
+  b.innerHTML = IC[name];
+  return b;
+}
+
 function buildPreviewRow(ch, i) {
   const li = document.createElement('li');
   li.className = 'pv-row';
@@ -1501,12 +1521,12 @@ function buildPreviewRow(ch, i) {
     n,
     input,
     w,
-    pvIconBtn('✎', '编辑正文', () => {
+    pvIconBtnSvg('pen', '编辑正文', () => {
       bodyBox.classList.toggle('hidden');
       if (!bodyBox.classList.contains('hidden')) ta.focus();
     }),
-    pvIconBtn('＋', '在本章后插入一章', () => insertPreviewAfter(i)),
-    pvIconBtn('✕', '删除本章', () => {
+    pvIconBtnSvg('plus', '在本章后插入一章', () => insertPreviewAfter(i)),
+    pvIconBtnSvg('x', '删除本章', () => {
       pending.preview.chapters.splice(i, 1);
       renderPreviewChapters();
     }, true)
@@ -1920,16 +1940,16 @@ function ceBuildRow(ch, i) {
   };
 
   // 删除：双段确认（3s 内再点一次才执行）
-  const delBtn = pvIconBtn('✕', '删除本章（连点两次确认）', () => {}, true);
+  const delBtn = pvIconBtnSvg('x', '删除本章（连点两次确认）', () => {}, true);
   let armed = false;
   let armTimer = null;
   delBtn.addEventListener('click', () => {
     if (!armed) {
       armed = true;
-      delBtn.textContent = '确认删除';
+      delBtn.textContent = '确认删除'; // 文字提示比图标更醒目
       armTimer = setTimeout(() => {
         armed = false;
-        delBtn.textContent = '✕';
+        delBtn.innerHTML = IC.x; // 恢复图标
       }, 3200);
       return;
     }
@@ -1938,7 +1958,7 @@ function ceBuildRow(ch, i) {
   });
 
   const editBtn = pvIconBtn('正文', '查看 / 替换本章正文', () => toggleBody().catch(() => {}));
-  const insBtn = pvIconBtn('＋', '在本章后插入一章', () => ceInsert(ch.key));
+  const insBtn = pvIconBtnSvg('plus', '在本章后插入一章', () => ceInsert(ch.key));
   line.append(idx, input, editBtn, insBtn, delBtn);
   li.append(line, bodyBox);
   return li;

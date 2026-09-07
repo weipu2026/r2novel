@@ -111,6 +111,10 @@
     <form id="upForm">
       <label class="drop-zone" id="upDrop">
         <input id="upFile" type="file" accept=".txt,.text,text/plain" multiple>
+        <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 16V4m0 0l-4 4m4-4l4 4"/>
+          <path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/>
+        </svg>
         <strong>选择 .txt 文件</strong>
         <span class="muted">也可直接拖到此处，或粘贴整段文本（一次一本）</span>
       </label>
@@ -128,8 +132,8 @@
         <div class="field"><label>备注（可选）</label><input id="upNote" placeholder="给这本书留个备注"></div>
       </div>
 
-      <fieldset>
-        <legend><label><input type="checkbox" id="upClean" checked> 自动清洗排版</label></legend>
+      <div class="clean-sec">
+        <label class="clean-head"><input type="checkbox" id="upClean" checked> <strong>清洗排版</strong><span class="muted">关闭则只解码+分章，不做任何清理</span></label>
         <div id="upCleanOpts" class="chips">
           <label><input type="checkbox" name="cleanitem" value="ref" checked> 去 [1] 脚注</label>
           <label><input type="checkbox" name="cleanitem" value="garbled" checked> 清乱码</label>
@@ -140,7 +144,7 @@
           <label><input type="checkbox" name="cleanitem" value="site" checked> 去站点残留</label>
           <label><input type="checkbox" name="cleanitem" value="md" checked> 去 Markdown 符号</label>
         </div>
-      </fieldset>
+      </div>
 
       <div id="upPrev" class="preview hidden">
         <div class="detect-row">

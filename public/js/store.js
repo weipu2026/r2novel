@@ -131,11 +131,12 @@ export const api = {
   },
 };
 
-/* 本地镜像：进度 / 最近打开 / 阅读偏好（离线与杀后台兜底） */
+/* 本地镜像：进度 / 阅读偏好 / 书架与预设标签快照（离线与打开提速兜底） */
 const LS = {
   prog: (id) => 'rn_prog_' + id,
   pref: 'rn_read_pref',
   shelf: 'rn_shelf_cache',
+  presetTags: 'rn_preset_tags',
 };
 export const local = {
   getProg(id) {
@@ -180,6 +181,22 @@ export const local = {
       localStorage.setItem(LS.shelf, JSON.stringify({ books, at: Date.now() }));
     } catch {
       /* 容量满则忽略（快照只是提速，非关键数据） */
+    }
+  },
+  /** 预设标签快照（上传页 chips：库里实际标签 top N，云端刷新后覆盖） */
+  getPresetTags() {
+    try {
+      const s = JSON.parse(localStorage.getItem(LS.presetTags));
+      return Array.isArray(s) ? s : [];
+    } catch {
+      return [];
+    }
+  },
+  setPresetTags(tags) {
+    try {
+      localStorage.setItem(LS.presetTags, JSON.stringify(tags));
+    } catch {
+      /* 容量满则忽略 */
     }
   },
 };

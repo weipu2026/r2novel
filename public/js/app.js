@@ -13,8 +13,11 @@ const normTitle = (s) => String(s || '').replace(/\s+/g, '');
 
 const PAGE = 60; // 书库分页
 
-/** 上传表单的常用分类（可点选；也可在输入框里自由输入自定义标签） */
-const PRESET_TAGS = ['玄幻', '仙侠', '武侠', '系统', '调教', '都市', '催眠'];
+/** 上传/批量改标签的预设 chips：数据源 = 库里实际存在的标签（GET /api/tags 按使用频次取 top 20）。
+ * 无内置兜底——一本书都没打标签时就不显示，继续手动输入；打新标签/标签治理后 chips 自动跟随。
+ * 快照存 localStorage（打开即显），云端刷新后覆盖。 */
+const PRESET_SRC = 20;
+let presetTags = [];
 
 const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
@@ -169,7 +172,9 @@ export function init() {
 
   reader.bindReader(els.readRoot, onNavBack);
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
+  presetTags = local.getPresetTags();
   renderPresetChips();
+  refreshPresetTags(); // 异步：登录态确认后以云端标签覆盖快照（未登录时静默失败）
   boot();
 }
 
@@ -427,11 +432,12 @@ function syncPresetChips() {
     b.classList.toggle('on', have.has(b.dataset.tag));
   }
 }
-/** 渲染预设分类 chips：点选即写入标签输入框（与自定义输入共存） */
+/** 渲染预设分类 chips：点选即写入标签输入框（与自定义输入共存）；空列表整块隐藏 */
 function renderPresetChips() {
   if (!els.upTagChips) return;
   els.upTagChips.innerHTML = '';
-  for (const t of PRESET_TAGS) {
+  els.upTagChips.classList.toggle('hidden', !presetTags.length);
+  for (const t of presetTags) {
     const b = document.createElement('button');
     b.type = 'button';
     b.dataset.tag = t;
@@ -446,6 +452,18 @@ function renderPresetChips() {
     els.upTagChips.appendChild(b);
   }
   syncPresetChips();
+}
+
+/** 云端刷新预设标签：取使用频次 top N，写快照并重渲染；未登录/网络失败静默保留快照 */
+async function refreshPresetTags() {
+  try {
+    const data = await api.tags();
+    presetTags = (data.tags || []).slice(0, PRESET_SRC).map((t) => t.tag);
+    local.setPresetTags(presetTags);
+    renderPresetChips();
+  } catch {
+    /* 保留本地快照（可能为空 → 不显示 chips） */
+  }
 }
 
 function progBadgeText(b) {
@@ -756,8 +774,9 @@ function batchEditTags() {
     const have = new Set(parse());
     for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
   };
-  // 预设 chips 点选写入输入框（与上传表单同款交互）
-  for (const t of PRESET_TAGS) {
+  // 预设 chips 点选写入输入框（与上传表单同款数据源：库里实际存在的标签 top N）
+  chips.classList.toggle('hidden', !presetTags.length);
+  for (const t of presetTags) {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = t;
@@ -1149,6 +1168,7 @@ let createdId = null;
 
 function openUpload(opts = {}) {
   showView('upload');
+  refreshPresetTags(); // 每次进上传页后台刷新 top20（快照先显示，不阻塞；打了新标签立刻跟进）
   els.upForm.reset();
   els.upFile.value = '';
   els.upClean.checked = true;

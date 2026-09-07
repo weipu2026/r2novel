@@ -13,9 +13,9 @@ const normTitle = (s) => String(s || '').replace(/\s+/g, '');
 
 const PAGE = 60; // 书库分页
 
-/** 上传/批量改标签的预设 chips：数据源 = 库里实际存在的标签（GET /api/tags 按使用频次取 top 20）。
- * 无内置兜底——一本书都没打标签时就不显示，继续手动输入；打新标签/标签治理后 chips 自动跟随。
- * 快照存 localStorage（打开即显），云端刷新后覆盖。 */
+/** 上传/批量改标签/编辑信息三处的可选标签 chips：数据源 = 库里实际存在的标签
+ * （GET /api/tags 按使用频次取 top 20）。无内置兜底——一本书都没打标签时就不显示，
+ * 继续手动输入；打新标签/标签治理后 chips 自动跟随。快照存 localStorage（打开即显）。 */
 const PRESET_SRC = 20;
 let presetTags = [];
 
@@ -421,16 +421,18 @@ function docEle(tag, cls, text) {
 }
 
 /* ---------- 上传表单的常用分类点选（方向2） ---------- */
-function currentTagsFromInput() {
-  return els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+/** 解析逗号分隔的标签输入（全角/半角逗号皆可，去空白去空项）——唯一实现 */
+const parseTagInput = (v) =>
+  String(v == null ? '' : v).split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+/** 按 input 当前值点亮/熄灭 container 里的标签 chips（on 状态随输入同步——唯一实现） */
+function syncChipsOn(container, input) {
+  const have = new Set(parseTagInput(input.value));
+  for (const c of container.children) c.classList.toggle('on', have.has(c.textContent));
 }
 /** 按输入框当前值点亮/熄灭预设分类 chips */
 function syncPresetChips() {
   if (!els.upTagChips) return;
-  const have = new Set(currentTagsFromInput());
-  for (const b of els.upTagChips.children) {
-    b.classList.toggle('on', have.has(b.textContent));
-  }
+  syncChipsOn(els.upTagChips, els.upTags);
 }
 /** 生成点选标签 chips（编辑信息 / 批量改标签 / 上传页三处共用）：
  * 点选 toggle 写入 input（逗号分隔），on 状态由 syncOn 回调随输入同步；
@@ -442,7 +444,7 @@ function renderTagPickChips(container, input, syncOn) {
     b.type = 'button';
     b.textContent = t;
     b.addEventListener('click', () => {
-      const have = new Set(input.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean));
+      const have = new Set(parseTagInput(input.value));
       if (have.has(t)) have.delete(t);
       else have.add(t);
       input.value = Array.from(have).join(', ');
@@ -656,10 +658,7 @@ async function openEditModal(b) {
   // 可选标签 chips：点选 toggle 写回输入框，高亮跟随输入值（该书已打的标签一眼可见）
   const mdTags = $('#mdTags', els.modalBox);
   const mdChips = $('#mdTagChips', els.modalBox);
-  const syncMdChips = () => {
-    const have = new Set(mdTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean));
-    for (const c of mdChips.children) c.classList.toggle('on', have.has(c.textContent));
-  };
+  const syncMdChips = () => syncChipsOn(mdChips, mdTags);
   renderTagPickChips(mdChips, mdTags, syncMdChips);
   syncMdChips();
   $('#mdCancel', els.modalBox).addEventListener('click', closeModal);
@@ -667,7 +666,7 @@ async function openEditModal(b) {
     const patch = {
       title: $('#mdTitle', els.modalBox).value.trim(),
       author: $('#mdAuthor', els.modalBox).value.trim(),
-      tags: $('#mdTags', els.modalBox).value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+      tags: parseTagInput(mdTags.value),
       note: $('#mdNote', els.modalBox).value.trim(),
       finished: $('#mdFinished', els.modalBox).checked,
     };
@@ -781,19 +780,15 @@ function batchEditTags() {
   const chips = $('#btChips', els.modalBox);
   const btnAdd = $('#btAdd', els.modalBox);
   const btnRemove = $('#btRemove', els.modalBox);
-  const parse = () => input.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const parse = () => parseTagInput(input.value);
   const sync = () => {
     const has = parse().length > 0;
     btnAdd.disabled = !has;
     btnRemove.disabled = !has;
   };
-  const syncChipsOn = () => {
-    const have = new Set(parse());
-    for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
-  };
   // 预设 chips 点选写入输入框（与上传表单/编辑信息共用同一数据源与交互）
   renderTagPickChips(chips, input, () => {
-    syncChipsOn();
+    syncChipsOn(chips, input);
     sync();
   });
   input.addEventListener('input', sync);
@@ -1250,7 +1245,7 @@ async function handleFiles(files) {
 async function importBatch(files) {
   const n = files.length;
   const author = els.upAuthor.value.trim();
-  const tags = els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const tags = parseTagInput(els.upTags.value);
   const note = els.upNote.value.trim();
   const keepRaw = els.upKeepRaw.checked;
   const summary = `作者「${author || '空'}」· 标签「${tags.join('、') || '空'}」· 备注「${note || '空'}」`;
@@ -1544,7 +1539,7 @@ function collectPayload() {
   return {
     title: els.upTitle.value.trim() || pending.title,
     author: els.upAuthor.value.trim(),
-    tags: els.upTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+    tags: parseTagInput(els.upTags.value),
     note: els.upNote.value.trim(),
     chapters: preview.chapters.slice(0, CHAPTER_MAX).map((c) => c.title),
     // 字数由 refreshPreviewStats 在每次编辑后实时维护（预览可编辑后它是唯一事实源）

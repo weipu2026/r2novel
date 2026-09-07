@@ -3,7 +3,7 @@
    对本站 UI 区（chrome 栏/书架/登录/上传/弹层等）做强制反色。
    阅读区有独立的「夜间」主题（paper/white/green/night），但 chrome 等
    UI 区本就是固定的浅色系设计，强制反色会把深底反成浅底而字色不变 → 白字不可见。 */
-html { color-scheme: light; }
+html { color-scheme: only light; } /* only light：比 light 更强的声明，明确禁止浏览器任何暗色化（防 force dark 反色回归：深底栏被反浅后 chrome-fg 浅字不可见） */
 :root {
   --bg: #f4f4f1;
   --panel: #ffffff;
@@ -747,4 +747,10 @@ button.danger:hover { background: #fbeeec; }
   .batch-bar { top: 4px; padding: 7px 8px; }
   .batch-bar button { padding: 4px 9px; font-size: 12px; }
   .tm-name { max-width: 38%; }
+
+  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑化后 6 个按钮单行放下，消除错位与横向溢出） */
+  .top { flex-wrap: wrap; row-gap: 6px; padding-bottom: 8px; }
+  .top-actions { width: 100%; justify-content: flex-start; gap: 5px; }
+  .top-actions button { padding: 6px 9px; font-size: 12px; }
+  .top-actions button.primary { padding: 6px 11px; font-size: 12.5px; }
 }

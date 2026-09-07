@@ -8,7 +8,7 @@
  *
  * 离线能用的真正保障来自离线整本下载（IndexedDB），SW 只是「静态壳可缓存」。
  */
-const CACHE = 'r2novel-shell-v6';
+const CACHE = 'r2novel-shell-v7';
 const SHELL = [
   '/',
   '/index.html',
@@ -30,7 +30,9 @@ const SHELL = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting())
+    // 逐资源容错缓存：addAll 是"一损俱损"——慢网络/代理下单个资源失败会毁掉整个缓存，
+    // 之后每个静态资源都回落网络 → 打开明显变慢。改为单个 add，失败只影响该资源。
+    caches.open(CACHE).then((c) => Promise.allSettled(SHELL.map((u) => c.add(u)))).then(() => self.skipWaiting())
   );
 });
 

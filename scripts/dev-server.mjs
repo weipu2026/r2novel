@@ -113,7 +113,7 @@ const fsStore = {
       }
     };
     walk(DATA, '');
-    return { objects: out, truncated: false, pages: 1 };
+    return { objects: out, truncated: false, pages: 1, cursor: null };
   },
 };
 

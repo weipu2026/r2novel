@@ -35,6 +35,9 @@ export const KEY = {
   TRASH: 'meta/trash.json',
   BRUTE: 'meta/sec/brute.json',
   book: (id) => `meta/${id}.json`,
+  // 章节读取用的状态副档（meta/sec/ 前缀被 diag 扫描排除，不会成「无主书」误报）：
+  // 让 GET 章节只读 ~20B 判定可读性，免每章请求都全量解析 meta（2000 章书 meta≈1MB JSON.parse/次）
+  st: (id) => `meta/sec/st/${id}.json`,
   text: (id, key) => `text/${id}/${key}.txt`,
   raw: (id) => `raw/${id}.txt`,
   progress: (id) => `progress/${id}.json`,
@@ -64,6 +67,9 @@ async function dropBody(req) {
  * 超限抛 Error('解压后超过上限')，解压损坏抛 Error('请求体解压失败')，由调用方映射状态码。 */
 async function readBodyBytes(req, maxBytes) {
   const buf = await req.arrayBuffer();
+  // 明文路径同样受 maxBytes 约束：客户端可不发 Content-Length（chunked）绕过声明值检查，
+  // 不设此护栏的话超大明文体会被整个读进内存（Worker 128MB 上限）才在后续解析处失败。
+  if (buf.byteLength > maxBytes) throw new Error('请求体超过上限');
   if (req.headers.get('x-content-gzip') !== '1' || !buf.byteLength) return buf;
   let over = false;
   let n = 0;
@@ -307,6 +313,25 @@ async function readBook(store, id) {
   }
 }
 
+/** 状态副档读写：{ s: 'ready'|'creating' }，~20B。写点与 meta.status 赋值点一一对应（建书/更新/发布）。
+ * 副档缺失/损坏 → 回落全量 meta 并补写副档（存量书一次性迁移），meta 也没有 → null。 */
+const putStatus = (store, id, s) => store.putText(KEY.st(id), JSON.stringify({ s }));
+async function readStatus(store, id) {
+  try {
+    const t = await store.getText(KEY.st(id));
+    if (t) {
+      const s = JSON.parse(t);
+      if (s && (s.s === 'ready' || s.s === 'creating')) return s.s;
+    }
+  } catch {
+    /* 副档异常 → 回落 meta */
+  }
+  const meta = await readBook(store, id);
+  if (!meta) return null;
+  await putStatus(store, id, meta.status).catch(() => {}); // 尽力补档：失败不影响本次判定
+  return meta.status;
+}
+
 /** 书名规范化（去空白）→ 同名去重/更新提示用 */
 const normTitle = (s) => String(s || '').replace(/\s+/g, '');
 
@@ -380,7 +405,7 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
     await writeTrash(store, trash);
   } else {
     done = true;
-    await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id))]);
+    await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id)), store.delete(KEY.st(id))]);
     trash.books.splice(idx, 1);
     await writeTrash(store, trash);
   }
@@ -497,6 +522,7 @@ async function createBookRecord(store, body) {
     chapters: chTable,
   };
   await store.putText(KEY.book(id), JSON.stringify(meta));
+  await putStatus(store, id, 'creating');
   return json({ ok: true, duplicate: false, id, chapterKeys: chTable.map((c) => c.key) });
 }
 
@@ -544,7 +570,7 @@ async function apiPutChapters(req, env, store, id) {
   try {
     body = JSON.parse(await readBodyText(req, 24 * 1024 * 1024));
   } catch (e) {
-    if (e && e.message === '解压后超过上限') return json({ error: '请求体过大' }, 413);
+    if (e && (e.message === '解压后超过上限' || e.message === '请求体超过上限')) return json({ error: '请求体过大' }, 413);
     return json({ error: '无效的请求体' }, 400);
   }
   const list = Array.isArray(body.chapters) ? body.chapters : [];
@@ -568,7 +594,10 @@ async function apiPutChapters(req, env, store, id) {
   }
   // 批内并发写：子请求数不变（仍 ≤BULK_CHAPTER_BATCH），耗时从串行 N×RTT 降为一次并发
   await Promise.all(items.map((it) => store.putText(KEY.text(id, it.key), it.text)));
-  return json({ ok: true, count: items.length, words: items.map((it) => wordsOf(it.text)) });
+  // 响应不带逐章 words：前端只用 count，而对 ≤12MB 批正文逐章跑正则统计是纯 CPU 浪费
+  // （规模化后每本书几十批，累计可省数秒 CPU——Free 计划 10ms CPU/请求的贴边场景）。
+  // 字数入库时信任客户端 cleaner 统计，与 publish 同一策略。
+  return json({ ok: true, count: items.length });
 }
 
 /** 上传原件（原始字节留档，重洗/恢复依据）。前端大文件 gzip 传输（x-content-gzip 标记）：
@@ -585,7 +614,7 @@ async function apiPutRaw(req, env, store, id) {
   try {
     buf = await readBodyBytes(req, max);
   } catch (e) {
-    if (e && e.message === '解压后超过上限') return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+    if (e && (e.message === '解压后超过上限' || e.message === '请求体超过上限')) return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
     return json({ error: '原件解压失败' }, 400);
   }
   if (!buf.byteLength) return json({ error: '空文件' }, 400);
@@ -683,6 +712,7 @@ async function apiUpdateChapters(req, env, store, id) {
   meta.updatedAt = now;
   meta.status = 'creating'; // publish 前不可读
   await store.putText(KEY.book(id), JSON.stringify(meta));
+  await putStatus(store, id, 'creating');
   return json({ ok: true, op, cleanVer: meta.cleanVer, chapterKeys: meta.chapters.map((c) => c.key) });
 }
 
@@ -705,6 +735,9 @@ async function apiPublish(req, env, store, id) {
   meta.status = 'ready';
   meta.updatedAt = Date.now();
   if (Array.isArray(meta.orphans) && meta.orphans.length) await sweepOrphans(store, meta);
+  // 副档先行：先翻 ready 再写 meta，消除「meta 已 ready、副档仍 creating」的一 RTT 假 409 窗口；
+  // 中间失败（副档 ready + meta creating）的后果是章节可读但 bookMeta 409，重试发布即愈合——比全员 409 温和
+  await putStatus(store, id, 'ready');
   await store.putText(KEY.book(id), JSON.stringify(meta));
 
   const index = await readIndex(store);
@@ -800,9 +833,11 @@ async function apiPatchBook(req, store, id) {
  * 只放行已发布书：replace/append 期间书处于 creating，旧正文不应被读到（与 bookMeta/export 一致）；
  * 也避免「replace 后旧 key 正文残留、发布抽样未命中」时旧正文顶着新章表长期被读。 */
 async function apiChapter(store, id, key) {
-  const meta = await readBook(store, id);
-  if (!meta) return json({ error: '章节不存在' }, 404);
-  if (meta.status !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
+  // 只读状态副档（~20B）判定可读性：千本规模下每章 GET 省一次全量 meta JSON.parse
+  // （2000 章书 meta≈1MB，在 Free 10ms CPU 上是主要开销）。副档缺失时回落 meta 并补档。
+  const st = await readStatus(store, id);
+  if (st == null) return json({ error: '章节不存在' }, 404);
+  if (st !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
   const t = await store.getText(KEY.text(id, key));
   if (t == null) return json({ error: '章节不存在' }, 404);
   // 章节正文可长缓存：URL 已带 ?v=cleanVer 作为失效键（任何编辑/重洗都会 cleanVer+1），
@@ -1006,8 +1041,10 @@ async function apiProgressPut(req, store, id) {
   const data = { ch, ratio, updatedAt: Date.now() };
   await store.putText(KEY.progress(id), JSON.stringify(data));
 
-  // 书架进度角标镜像：只在「书确实在书架」且「位置有明显变化」（换章或比例变动 >2%）时
-  // 才重写整个 index —— 降低写频、缩小与 publish 并发时全量覆盖的窗口
+  // 书架进度角标镜像：只在「换章」时重写整个 index。章内滚动只写 progress 小文件（真值），
+  // 不再全量重写 index —— 消除写放大（千本规模 index≈300KB/次，长章滚几屏就是几十次），
+  // 同时收窄 index 读-改-写与 publish 并发时的覆盖窗口。
+  // 代价：镜像百分比停留在最近一次换章时的值（书架角标「第几章」仍准确；恢复阅读读 progress 真值，不受影响）。
   try {
     const index = await readIndex(store);
     const book = (index.books || []).find((b) => b.id === id);
@@ -1017,8 +1054,7 @@ async function apiProgressPut(req, store, id) {
     const cap = Number(book.chapterCount) || 0;
     const mch = cap > 0 && ch > cap ? cap : ch;
     const cur = book.prog;
-    const changed = !cur || cur.ch !== mch || Math.abs((cur.ratio || 0) - ratio) > 0.02;
-    if (changed) {
+    if (!cur || cur.ch !== mch) {
       const books = (index.books || []).map((b) => (b.id === id ? { ...b, prog: { ch: mch, ratio, updatedAt: data.updatedAt } } : b));
       await writeIndex(store, { books });
     }
@@ -1030,9 +1066,9 @@ async function apiProgressPut(req, store, id) {
 
 /* ---------------- 批量操作 / 标签治理（书架百本量级的治理工具） ---------------- */
 
-/** 标签合并单请求上限（同样受 2N 约束；未完成的部分返回 remaining 让前端续调）。
- * 书架批量操作上限 BATCH_BOOKS_MAX 见 shared-const.js（前后端共用，防漂移）。 */
-const TAG_MERGE_MAX = 18;
+/** 标签合并单请求上限：与书架批量同一预算模型（readIndex + N×(readBook+putText) + bak/write
+ * ≈ 2N+4 ≤50），直接复用 shared-const 的 BATCH_BOOKS_MAX，杜绝两处数字各自漂移。 */
+const TAG_MERGE_MAX = BATCH_BOOKS_MAX;
 
 /**
  * 批量操作：一次请求改多本书（标签增删/整设、完结状态、软删）。
@@ -1274,20 +1310,21 @@ const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
 // list 预算拆两类：meta/raw/progress 是「书数级」对象（每本各 1 个，千本 = 各 1 页）→ 给足预算保证完整；
 // text/ 是「章数级」大头（每章 1 个，千本 50 章 = 50 页）→ 只给部分页数，截断即 incomplete（宁漏勿错）
 const DIAG_META_PAGE_BUDGET = 3; // meta/raw/progress 各自翻页上限（每页 ≤1000 对象 → 覆盖约 3000 本）
-const DIAG_TEXT_PAGE_BUDGET = 20; // text/ 翻页上限（扫描约 20000 个章对象）
+const DIAG_TEXT_PAGE_BUDGET = 12; // text/ 单请求翻页上限（每页 ≤1000 对象）；超预算回传 textCursor 由前端续扫
 const DIAG_SUB_BUDGET = 45; // 扫描/删除单请求子请求软预算
 
-async function apiDiagOrphans(store) {
+async function apiDiagOrphans(url, store) {
   try {
-    return await doDiagScan(store);
+    return await doDiagScan(store, url.searchParams.get('textCursor') || '');
   } catch (e) {
     // 扫描过程本身失败（R2 超限/超时等）→ 透传真实原因，前端可展示而非笼统 HTTP 503
     return json({ error: '残留扫描失败：' + (e && e.message ? e.message : e) }, 502);
   }
 }
 
-async function doDiagScan(store) {
-  const budget = { used: 2, incomplete: false }; // 2 = readIndex + readTrash
+async function doDiagScan(store, textCursor = '') {
+  const cont = !!textCursor; // 续扫窗：跳过 meta/raw/progress（书数级前缀，首页已完整），只扫 text/ 下一窗
+  const budget = { used: 2, incomplete: false }; // 2 = readIndex + readTrash（续扫窗同样需要 live 集合）
   const bump = () => {
     if (budget.used >= DIAG_SUB_BUDGET) {
       budget.incomplete = true;
@@ -1310,26 +1347,31 @@ async function doDiagScan(store) {
   const orphanBooks = [];
 
   // 分前缀并发 list：meta/raw/progress 是「书数级」对象（每本各 1 个，千本各 1 页）→
-  // 给足预算保证无主书/已删残留永远完整；text/ 是「章数级」大头（每章 1 个，千本 50 章 = 50 页）
-  // → 只给 DIAG_TEXT_PAGE_BUDGET 页，截断即标记 incomplete（宁漏勿错）。
-  // 四个前缀互不依赖，并发翻页：list 总耗时从「全库 20 页串行」降为「书数级前缀几页 + text 预算内页」的并发最值。
+  // 给足预算保证无主书/已删残留永远完整；text/ 是「章数级」大头（每章 1 个，3 万章 = 30 页
+  // > 单请求预算）→ 每窗只扫 DIAG_TEXT_PAGE_BUDGET 页，超出回传 textCursor，前端循环续扫直到 null。
+  // 注意 meta/ 续扫窗也要重列：无主书 id 集合必须每窗重推，否则无主书的跨窗正文会被
+  // 误判成「可直接删的 residue」（无主书本应移入回收站保全正文）——只多花 1-3 个子请求。
+  const NO_LIST = { objects: [], truncated: false, pages: 0, cursor: null };
   const [lMeta, lRaw, lProg, lText] = await Promise.all([
     store.list('meta/', DIAG_META_PAGE_BUDGET),
-    store.list('raw/', DIAG_META_PAGE_BUDGET),
-    store.list('progress/', DIAG_META_PAGE_BUDGET),
-    store.list('text/', DIAG_TEXT_PAGE_BUDGET),
+    cont ? NO_LIST : store.list('raw/', DIAG_META_PAGE_BUDGET),
+    cont ? NO_LIST : store.list('progress/', DIAG_META_PAGE_BUDGET),
+    store.list('text/', DIAG_TEXT_PAGE_BUDGET, textCursor),
   ]);
   budget.used += lMeta.pages + lRaw.pages + lProg.pages + lText.pages;
-  if (lMeta.truncated || lRaw.truncated || lProg.truncated || lText.truncated) budget.incomplete = true;
+  if (lMeta.truncated || lRaw.truncated || lProg.truncated) budget.incomplete = true;
 
   // meta/{id}.json → 无主书（系统 meta 文件排除）。候选先收集、预算内批量并发回读：
-  // 预算尽则剩余标 unknown（宁漏勿错），已允许的并发一次读完（RTT 从串行 N 次降到一次）
+  // 预算尽则剩余标 unknown（宁漏勿错），已允许的并发一次读完（RTT 从串行 N 次降到一次）。
+  // 续扫窗只重推 orphanSet 不再回读 meta 内容，orphanBooks 明细只在首页上报（前端只合并首页）。
   const orphanCands = [];
+  const orphanSet = new Set();
   for (const o of lMeta.objects) {
     if (DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
     const id = o.key.slice(5, -5); // 去 'meta/' 前缀与 '.json' 后缀
     if (live.has(id)) continue;
-    orphanCands.push({ o, id, canRead: bump() });
+    orphanSet.add(id);
+    orphanCands.push({ o, id, canRead: !cont && bump() });
   }
   const mArr = await Promise.all(orphanCands.map((c) => (c.canRead ? readBook(store, c.id) : Promise.resolve(null))));
   for (let i = 0; i < orphanCands.length; i++) {
@@ -1345,7 +1387,6 @@ async function doDiagScan(store) {
       wordCount: m && Number(m.wordCount) ? Number(m.wordCount) : 0,
     });
   }
-  const orphanSet = new Set(orphanBooks.map((b) => b.id));
 
   // text/{id}/{key}.txt → 章表外正文 / 无主正文
   const textById = new Map();
@@ -1362,9 +1403,13 @@ async function doDiagScan(store) {
   for (const [id, items] of textById) {
     if (!live.has(id)) {
       if (orphanSet.has(id)) {
-        const ob = orphanBooks.find((b) => b.id === id);
-        ob.texts = (ob.texts || 0) + items.length;
-        ob.textBytes = (ob.textBytes || 0) + items.reduce((s, x) => s + x.size, 0);
+        // 续扫窗跳过：无主书正文已随首页 orphanBooks 呈现（跨窗大书可能少量少计「关联正文 N 段」，展示层小误差），
+        // 绝不能落到 residue——无主书正文是要保全的，误列可删残留会被「删除全部」清掉
+        if (!cont) {
+          const ob = orphanBooks.find((b) => b.id === id);
+          ob.texts = (ob.texts || 0) + items.length;
+          ob.textBytes = (ob.textBytes || 0) + items.reduce((s, x) => s + x.size, 0);
+        }
       } else {
         for (const it of items) residue.push({ key: it.key, size: it.size });
       }
@@ -1373,13 +1418,19 @@ async function doDiagScan(store) {
     liveTextIds.push({ id, items });
   }
   // 活书正文分类：预算内并发 readBook（子请求数不变，RTT 从串行 N 次降到一次）
+  let skippedBooks = 0;
   const liveMeta = await Promise.all(
     liveTextIds.map((x) => (bump() ? readBook(store, x.id) : Promise.resolve(null)))
   );
   for (let i = 0; i < liveTextIds.length; i++) {
     const { id, items } = liveTextIds[i];
     const m = liveMeta[i];
-    if (!m) continue; // 预算尽 / meta 读不到：宁漏勿错，留待下次扫描
+    if (!m) {
+      // 预算尽 / meta 读不到：该书的窗内对象无法核验。计入 skippedBooks → incomplete，
+      // 前端会提示「部分书未能核验」而不是静默漏检（宁漏勿错，但要说出来）。
+      skippedBooks++;
+      continue;
+    }
     const have = new Set((m.chapters || []).map((c) => c.key));
     const known = new Set(Array.isArray(m.orphans) ? m.orphans : []);
     for (const it of items) {
@@ -1412,7 +1463,12 @@ async function doDiagScan(store) {
     residue,
     orphanBooks,
     chapterOrphans,
-    incomplete: budget.incomplete,
+    // text/ 下一窗的续扫游标：null = text/ 已扫完。前端循环带上它续调，直到 null，
+    // 期间把 residue/chapterOrphans 增量合并（orphanBooks/summary 只在首页有意义）。
+    textCursor: lText.cursor || null,
+    scannedPages: lText.pages,
+    skippedBooks,
+    incomplete: budget.incomplete || skippedBooks > 0,
   });
 }
 
@@ -1595,12 +1651,19 @@ async function opdsExport(req, env, store, id) {
   });
 }
 
-/** GET /opds — OPDS 1.2 目录（全量书目，每书一个 acquisition 下载链接） */
+/** GET /opds — OPDS 1.2 目录（?p=N 分页，每页 OPDS_PAGE 条；阅读器按 rel="next" 自动翻页）
+ * 千本全量单 feed ≈300KB XML，第三方阅读器解析吃力 → 分页必备。feedUpdated 仍取全库最新时间。 */
+const OPDS_PAGE = 100;
+
 async function opdsCatalog(req, env, store) {
   const auth = await opdsAuth(req, env, store);
   if (!auth.ok) return auth.status === 429 ? opdsLocked(auth.retryAfterMs) : opds401();
   const index = await readIndex(store);
   const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  const page = Math.min(10000, Math.max(1, parseInt(new URL(req.url).searchParams.get('p'), 10) || 1));
+  const slice = books.slice((page - 1) * OPDS_PAGE, page * OPDS_PAGE);
+  const href = (n) => (n <= 1 ? '/opds' : `/opds?p=${n}`);
+  const hasNext = page * OPDS_PAGE < books.length;
   // feed 级 updated 用内容的最新时间（而非当前时间）：固定值让阅读器按条件请求判断
   // 「feed 没变化」，避免每次拉取都被误判有更新而反复全量重拉
   const feedUpdated = books.length ? Math.max(...books.map((b) => b.updatedAt || b.createdAt || 0)) : Date.now();
@@ -1616,15 +1679,20 @@ ${author}${cats}      <summary>${b.chapterCount || 0} 章 · ${b.wordCount || 0}
       <link rel="http://opds-spec.org/acquisition" href="/export/${encodeURIComponent(b.id)}.txt" type="text/plain" title="下载整本 TXT"/>
     </entry>`;
   };
+  const nav = [
+    `  <link rel="self" href="${href(page)}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`,
+    `  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`,
+    hasNext ? `  <link rel="next" href="${href(page + 1)}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>` : '',
+    page > 1 ? `  <link rel="previous" href="${href(page - 1)}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>` : '',
+  ].filter(Boolean).join('\n');
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <id>urn:r2novel:opds</id>
-  <title>私人书屋</title>
+  <id>urn:r2novel:opds:p${page}</id>
+  <title>私人书屋${page > 1 ? `（第 ${page} 页）` : ''}</title>
   <updated>${new Date(feedUpdated).toISOString()}</updated>
   <author><name>私人书屋</name></author>
-  <link rel="self" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
-  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
-${books.map(entry).join('\n')}
+${nav}
+${slice.map(entry).join('\n')}
 </feed>
 `;
   return new Response(xml, {
@@ -1685,7 +1753,7 @@ async function handleApi(req, env, store, url, p) {
 
   // 残留诊断：GET 全库扫描分类 / DELETE 批量删无主对象（书架「检查残留」）
   if (p === '/api/diag/orphans') {
-    if (req.method === 'GET') return apiDiagOrphans(store);
+    if (req.method === 'GET') return apiDiagOrphans(url, store);
     if (req.method === 'DELETE') return apiPurgeOrphans(req, store);
     await dropBody(req);
     return json({ error: 'method' }, 405);

@@ -58,6 +58,21 @@ export function init() {
   els.sheet = $('#sheet');
   els.modalMask = $('#modalMask');
   els.modalBox = $('#modalBox');
+
+  // 弹层通用关闭：遮罩空白处点击 / Esc。确认弹层走「取消」语义（resolve(false)），
+  // 其余弹层直接关；sheet（底部操作菜单）只挂 Esc，避免与打开它的按钮点击冒泡互踩。
+  els.modalMask.addEventListener('click', (e) => {
+    if (e.target === els.modalMask) modalDismiss();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!els.sheet.classList.contains('hidden')) {
+      closeSheet();
+      return;
+    }
+    if (!els.modalMask.classList.contains('hidden')) modalDismiss();
+  });
+
   els.busyMask = $('#busyMask');
   els.busyBar = $('#busyBar');
   els.busyText = $('#busyText');
@@ -166,8 +181,7 @@ export function init() {
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
   presetTags = local.getPresetTags();
   renderPresetChips();
-  refreshPresetTags(); // 异步：登录态确认后以云端标签覆盖快照（未登录时静默失败）
-  boot();
+  boot(); // 预设标签的云端刷新挪进 boot 登录校验成功之后（登录前调用必 401，白费一个请求）
 }
 
 function onNavBack() {
@@ -188,6 +202,7 @@ async function boot() {
     const data = await api.books(); // 一次拉取，鉴权预检 + 首屏数据共用
     showView('shelf');
     await loadShelf(data);
+    refreshPresetTags(); // 已确认登录 → 云端标签覆盖本地快照（打新标签/治理后 chips 跟进）
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) showView('login');
     else if (snap) {
@@ -679,6 +694,15 @@ function closeModal() {
   els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
 }
+/** 遮罩点击 / Esc 的统一退出：确认弹层点「取消」（Promise resolve(false)），其余直接关 */
+function modalDismiss() {
+  const cancel = $('#cfNo', els.modalBox);
+  if (cancel) {
+    cancel.click();
+    return;
+  }
+  closeModal();
+}
 function confirmModal(text, okText = '确定') {
   return new Promise((resolve) => {
     openModal(`
@@ -895,15 +919,18 @@ function renderTagMgr(data) {
   }
 }
 
-/** 标签合并执行：remaining>0 时自动续调直到清完（每批 20 本受子请求预算约束） */
+/** 标签合并执行：remaining>0 时自动续调直到清完（每批 18 本受子请求预算约束）；
+ * guard 用尽仍有剩余 → 明确提示续跑，不再静默截断 */
 async function tagMergeRun(from, to) {
   busy('更新书籍标签…');
   let updated = 0;
+  let left = 0;
   try {
     for (let guard = 0; guard < 60; guard++) {
       const r = await api.tagsMerge(from, to);
       updated += r.updated || 0;
-      if (!r.remaining) break;
+      left = r.remaining || 0;
+      if (!left) break;
     }
   } catch (e) {
     busyDone();
@@ -912,7 +939,7 @@ async function tagMergeRun(from, to) {
   }
   busyDone();
   await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
-  toast(to ? `已更新 ${updated} 本` : `已从 ${updated} 本书上移除`, 2400);
+  toast(left ? `已更新 ${updated} 本，仍有 ${left} 本未处理——请重试一次` : to ? `已更新 ${updated} 本` : `已从 ${updated} 本书上移除`, 2600);
   // 确认弹层（confirmModal 共用 modalBox）已把标签管理弹层顶掉并关闭：
   // 无条件重新拉取渲染，既"操作后刷新结果"，也保证改名/合并后的后续操作基于最新行名
   await openTagMgr();
@@ -931,10 +958,39 @@ const diagShort = (key) => {
   return s.length > 64 ? s.slice(0, 30) + '…' + s.slice(-26) : s;
 };
 
+/** 全库扫描（含大库 text/ 分窗续扫）：循环带上服务端回传的 textCursor，直到 null 扫完。
+ * 期间把 residue/chapterOrphans 增量合并（orphanBooks/summary 只在首页有意义），onPage 回调做进度展示。 */
+async function diagScanAll(onPage) {
+  let merged = null;
+  let cursor = '';
+  let incomplete = false;
+  for (let guard = 0; guard < 200; guard++) {
+    const d = await api.diagOrphans(cursor);
+    if (!merged) {
+      merged = d;
+    } else {
+      merged.residue = (merged.residue || []).concat(d.residue || []);
+      merged.chapterOrphans = (merged.chapterOrphans || []).concat(d.chapterOrphans || []);
+      merged.scannedAt = d.scannedAt;
+      merged.scannedPages = (merged.scannedPages || 0) + (d.scannedPages || 0);
+    }
+    incomplete = incomplete || !!d.incomplete;
+    cursor = d.textCursor || '';
+    if (!cursor) break;
+    if (onPage) onPage(merged);
+  }
+  merged.incomplete = incomplete;
+  return merged;
+}
+
 async function openDiag() {
   openModal('<h3>残留检查</h3><p class="modal-sub">正在扫描全库对象…</p>');
   try {
-    diagData = await api.diagOrphans();
+    diagData = await diagScanAll((m) => {
+      if (els.modalMask.classList.contains('hidden')) return;
+      const el = $('.modal-sub', els.modalBox);
+      if (el) el.textContent = `正在扫描全库对象… 已扫 ${m.scannedPages || 0} 页，暂发现 ${(m.residue || []).length + (m.chapterOrphans || []).length} 项残留`;
+    });
     if (els.modalMask.classList.contains('hidden')) return; // 扫描期间用户已关闭
     renderDiag();
   } catch (e) {
@@ -948,7 +1004,7 @@ async function openDiag() {
 
 async function diagRefresh() {
   try {
-    diagData = await api.diagOrphans();
+    diagData = await diagScanAll(null);
   } catch (e) {
     toast('扫描失败：' + (e.message || e), 2200);
     return;
@@ -1005,7 +1061,7 @@ function renderDiag() {
   }
 
   openModal(`<h3>残留检查</h3>
-    <p class="modal-sub">扫描于 ${new Date(d.scannedAt).toLocaleString()} · 在架 ${d.liveBooks} 本 ${badge}${d.incomplete ? '<span class="diag-tag diag-tag-orphan"> · 对象过多，扫描按预算截断、部分结果不完整</span>' : ''}</p>
+    <p class="modal-sub">扫描于 ${new Date(d.scannedAt).toLocaleString()} · 在架 ${d.liveBooks} 本 ${badge}${d.incomplete ? '<span class="diag-tag diag-tag-orphan"> · 部分书因预算所限未能核验，结果可能不完整</span>' : ''}</p>
     <div class="diag-body">${body}</div>
     <div class="m-acts">
       <button class="ghost" id="diagRefreshBtn" type="button">重新扫描</button>
@@ -1711,9 +1767,11 @@ async function uploadChapters(id, keys, keepRaw) {
   await finalizeUpload(id, keepRaw);
 }
 
-/** 批量上传章节正文（bulk 接口，分批串行）：
+/** 批量上传章节正文（bulk 接口，按批切 + 3 批在途流水线）：
  * 服务端 meta 校验从「每章一次」收敛到「每批一次」，请求数也从每章 1 个降到每批 1 个，
  * 连续上传大幅减负（Free 计划请求数/天是硬配额）。
+ * 并发：慢链路（CF 边缘 RTT 200ms+）下纯串行会在等服务端响应时闲置上行，
+ * 3 批在途把上行带宽喂满；批与批的 key 互不相同、服务端只是并发写独立对象，乱序到达无影响。
  * 分批双护栏：章数 ≤ BULK_CHAPTER_BATCH（与后端共享常量对齐，防 413 拒收），
  * 且批字节 ≤ 12MB——后端 bulk 单批还有 16MB 总字节护栏，40 章×1.9MB 最坏 76MB 会撞上；
  * 按字节再切批，保证任何大书都能上传而不被单批上限误伤。 */
@@ -1722,26 +1780,44 @@ async function uploadMany(id, keys, chapters) {
   if (!n) return;
   const BATCH = BULK_CHAPTER_BATCH; // 与后端共享常量对齐（shared-const.js）
   const BATCH_BYTES = 12 * 1024 * 1024; // 批字节护栏（< 后端 16MB maxTotal，留 JSON 转义余量）
+  const CONC = 3; // 在途批数：再高对单用户上行收益递减，且抬高手机端内存峰值
   const enc = new TextEncoder();
-  let done = 0;
+
+  // 第一步：按护栏把批次边界全部算好（[start,end) 区间，纯本地零网络）
+  const bounds = [];
   let i = 0;
   while (i < n) {
-    const items = [];
+    const start = i;
     let bytes = 0;
-    while (items.length < BATCH && i < n) {
+    while (i < n && i - start < BATCH) {
       const c = chapters[i];
       const text = c && c.content != null ? c.content : '';
       const size = enc.encode(text).byteLength;
       // 至少发 1 章（单章 ≤FIT 上限远小于预算），之后字节将超则切下一批
-      if (items.length && bytes + size > BATCH_BYTES) break;
-      items.push({ key: keys[i], text });
+      if (i > start && bytes + size > BATCH_BYTES) break;
       bytes += size;
       i++;
     }
-    const r = await api.putChapters(id, items);
-    done += (r && r.count) || 0;
-    setProg(done / n, `上传章节 ${done}/${n}`);
+    bounds.push([start, i]);
   }
+
+  // 第二步：3 个 worker 从队列领批并发上传（单线程 JS，next 游标无竞态）
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < bounds.length) {
+      const [s, e] = bounds[next++];
+      const items = [];
+      for (let k = s; k < e; k++) {
+        const c = chapters[k];
+        items.push({ key: keys[k], text: c && c.content != null ? c.content : '' });
+      }
+      const r = await api.putChapters(id, items);
+      done += (r && r.count) || 0;
+      setProg(done / n, `上传章节 ${done}/${n}`);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONC, bounds.length) }, worker));
 }
 
 /* ---------- 重洗（raw → 前端重新清洗 → 整本替换） ---------- */

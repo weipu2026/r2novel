@@ -6,7 +6,7 @@
  */
 import { handleRequest } from './router.js';
 
-function r2Store(bucket) {
+export function r2Store(bucket) {
   return {
     async getText(key) {
       const o = await bucket.get(key);
@@ -29,11 +29,14 @@ function r2Store(bucket) {
     async delete(key) {
       await bucket.delete(key);
     },
-    /** 遍历对象清单（含前缀过滤）。返回 { objects:[{key,size}], truncated, pages }；
-     *  分页每页 ≤1000，受 maxPages 约束：超出即截断并置 truncated（大库防单请求子请求/耗时爆表）。 */
-    async list(prefix = '', maxPages = 0) {
+    /** 遍历对象清单（含前缀过滤）。返回 { objects:[{key,size}], truncated, pages, cursor }；
+     *  分页每页 ≤1000，受 maxPages 约束：超出即截断并置 truncated（大库防单请求子请求/耗时爆表）。
+     *  cursor 必须逐页回传——漏传会让每一页都重读第 1 页（对象重复、1000 之后永不出现、
+     *  maxPages=0 时无限循环烧穿 CPU）。返回的 cursor 为下一窗续扫游标（null=已扫完），
+     *  可作为 startCursor 回传续扫（diag 大库分窗扫描依赖此语义）。 */
+    async list(prefix = '', maxPages = 0, startCursor = '') {
       const out = [];
-      let cursor;
+      let cursor = startCursor || undefined;
       let pages = 0;
       let truncated = false;
       do {
@@ -41,12 +44,12 @@ function r2Store(bucket) {
           truncated = true;
           break;
         }
-        const page = await bucket.list(prefix ? { prefix } : {});
+        const page = await bucket.list({ ...(prefix ? { prefix } : {}), ...(cursor ? { cursor } : {}) });
         for (const o of page.objects) out.push({ key: o.key, size: o.size });
         pages++;
         cursor = page.truncated ? page.cursor : undefined;
       } while (cursor);
-      return { objects: out, truncated, pages };
+      return { objects: out, truncated, pages, cursor: cursor || null };
     },
   };
 }

@@ -233,9 +233,13 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 }
 .pv-btn:hover { color: var(--accent); border-color: var(--accent); }
 .pv-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
-/* 图标版小按钮：方形触区、图标随字色 */
+/* 图标版小按钮：方形触区、图标随字色。触达区 ≥38×34（触屏 ≥42×38），低于常规 44px 建议值的折中：
+   行内按钮过大会把章节行撑爆，用网格居中 + padding 撑出可点面积（视觉图标仍 15px） */
 .pv-btn .ic { width: 15px; height: 15px; display: block; }
-.pv-btn:has(.ic) { display: grid; place-items: center; min-width: 26px; min-height: 25px; padding: 0 6px; }
+.pv-btn:has(.ic) { display: grid; place-items: center; min-width: 38px; min-height: 34px; padding: 0 8px; }
+@media (pointer: coarse) {
+  .pv-btn:has(.ic) { min-width: 42px; min-height: 38px; }
+}
 /* 上传分章预览：每行改为可编辑（序号 + 标题输入 + 字数 + 操作钮 / 可展开正文） */
 .chapter-preview li.pv-row { flex-direction: column; align-items: stretch; gap: 6px; padding: 8px 10px; }
 /* 行 hover 落点 + 展开正文时轻微强调（:has 不支持时仅无此反馈，无害） */
@@ -802,7 +806,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
 .tm-row .tm-input { flex: 1 1 90px; min-width: 0; padding: 6px 9px; font-size: 13px; border-radius: 8px; }
 .tm-row .tm-go, .tm-row .tm-del { flex: none; padding: 5px 9px; font-size: 13px; }
 .tm-row .tm-go .ic, .tm-row .tm-del .ic { width: 15px; height: 15px; display: block; }
-.tm-row .tm-go:has(.ic), .tm-row .tm-del:has(.ic) { display: grid; place-items: center; padding: 5px 7px; }
+.tm-row .tm-go:has(.ic), .tm-row .tm-del:has(.ic) { display: grid; place-items: center; min-width: 38px; min-height: 34px; padding: 0 8px; }
 button.danger { color: var(--danger); border-color: #ecc9c4; }
 button.danger:hover { background: #fbeeec; }
 @media (max-width: 480px) {

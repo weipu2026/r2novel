@@ -57,9 +57,8 @@ export const api = {
   createBook(payload) {
     return request('/api/books', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
   },
-  async putChapter(id, key, text) {
-    const r = await request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PUT', body: text });
-    return r;
+  putChapter(id, key, text) {
+    return request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PUT', body: text });
   },
   async putChapters(id, chapters) {
     // 批量上传（≤服务端单批上限）：连续上传时 meta 校验从每章一次收敛到每批一次
@@ -112,7 +111,10 @@ export const api = {
     return request('/api/progress/' + encodeURIComponent(id), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
   },
   // 残留诊断（书架「检查残留」）
-  diagOrphans: () => request('/api/diag/orphans'),
+  // 大库 text/ 超单请求预算 → 服务端回传 textCursor，前端循环带上续扫直到 null
+  diagOrphans(textCursor) {
+    return request('/api/diag/orphans' + (textCursor ? `?textCursor=${encodeURIComponent(textCursor)}` : ''));
+  },
   purgeOrphans(keys) {
     return request('/api/diag/orphans', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ objects: keys }) });
   },

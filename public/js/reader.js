@@ -343,7 +343,8 @@ function fillToc(ul, until) {
 }
 
 function renderDrawerToc() {
-  state.toc.draw = Math.max(TOC_PAGE, state.cur + 1);
+  // 已加载量只增不减：重开抽屉保留「加载更多」进度，只需保证当前章可见
+  state.toc.draw = Math.max(state.toc.draw, TOC_PAGE, state.cur + 1);
   els.drawerList.innerHTML = '';
   fillToc(els.drawerList, state.toc.draw);
   els.tocTitle.textContent = state.book.title;
@@ -351,7 +352,7 @@ function renderDrawerToc() {
 }
 
 function renderSideToc() {
-  state.toc.side = Math.max(TOC_PAGE, state.cur + 1);
+  state.toc.side = Math.max(state.toc.side, TOC_PAGE, state.cur + 1);
   els.sideList.innerHTML = '';
   fillToc(els.sideList, state.toc.side);
   els.sideMore.classList.toggle('hidden', state.chapters.length <= state.toc.side);

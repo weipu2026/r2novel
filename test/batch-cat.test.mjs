@@ -239,8 +239,9 @@ test('bulk：返回逐章字数，与正文一致（空格不计）', async () =
     })
   );
   assert.equal(r.status, 200);
-  assert.deepEqual(r.data.words, [5, 3], 'words 应为去空白后的逐章字数（空格不计）');
+  // bulk 响应不再带逐章 words（前端只用 count；对大批正文逐章正则统计是纯 CPU 浪费）
   assert.equal(r.data.count, 2);
+  assert.equal(r.data.words, undefined);
 });
 
 test('maybeGzip：中文文本必须被压缩（收益用字节数判断，防字符数误判）', async () => {

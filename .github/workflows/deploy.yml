@@ -67,6 +67,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # SW 缓存版本自动化（路径 B）：每次部署用时间戳替换 CACHE 版本号，
+          # 保证「push 后用户第一次打开就是新前端」，消除手动 bump 的遗忘风险；
+          # 只改 runner 上的副本，仓库文件不受影响
+          sed -i "s/const CACHE = 'r2novel-shell-v[0-9]*';/const CACHE = 'r2novel-shell-$(date +%s)';/" public/sw.js
           npx wrangler deploy 2>&1 | tee deploy.log
 
       # 先部署代码（保证 Worker 存在，secret put 才有目标），再同步密钥；改 Secret 后跑一次部署即生效

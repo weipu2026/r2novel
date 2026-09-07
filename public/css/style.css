@@ -753,11 +753,13 @@ button.danger:hover { background: #fbeeec; }
   .batch-bar button { padding: 4px 9px; font-size: 12px; }
   .tm-name { max-width: 38%; }
 
-  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑 + 精简文案后 6 个按钮单行放下） */
+  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑 + 精简文案后单行放下） */
   .top { flex-wrap: wrap; row-gap: 6px; padding-bottom: 8px; }
   .top-actions { width: 100%; justify-content: flex-start; gap: 4px; }
   .top-actions button { padding: 6px 8px; font-size: 12px; }
   .top-actions button.primary { padding: 6px 9px; font-size: 12.5px; }
+  /* 低频治理入口（标签改名/合并、多选批量）手机隐藏：顶栏单行更从容；这些操作在电脑端进行 */
+  .top-actions #tagsBtn, .top-actions #batchBtn { display: none; }
 
   /* 继续阅读大卡也走列表形态（与全部书籍一致）：大色块→小色点、去 accent 边框 */
   .card.big { background: var(--panel); border: 0; }

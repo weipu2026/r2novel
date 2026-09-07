@@ -52,6 +52,12 @@ jobs:
             echo "· 跳过域名绑定（CUSTOM_DOMAIN 未设置），使用 workers.dev 地址"
             exit 0
           fi
+          # 幂等：每次 push 都追加 [[routes]] 会让 wrangler.toml 积累多段重复路由；
+          # 已注入过（含 custom_domain 标记）则跳过
+          if grep -q 'custom_domain = true' wrangler.toml; then
+            echo "· 已注入过域名，跳过（幂等）"
+            exit 0
+          fi
           printf '\n[[routes]]\npattern = "%s"\ncustom_domain = true\n' \
             "${{ secrets.CUSTOM_DOMAIN }}" >> wrangler.toml
           echo "· 已绑定域名（值不打印到日志）"

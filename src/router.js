@@ -508,7 +508,7 @@ async function apiPutChapters(req, env, store, id) {
   const items = [];
   let total = 0;
   for (const it of list) {
-    const key = String(it && it.key == null ? '' : it.key);
+    const key = String((it && it.key) != null ? it.key : ''); // 防御 null 元素（旧版写法会在 it=null 时读 it.key 崩溃）
     if (!table.has(key)) return json({ error: `章节 ${key} 不在章表中` }, 404);
     const text = it && typeof it.text === 'string' ? it.text : '';
     const size = enc.encode(text).byteLength;

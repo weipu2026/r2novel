@@ -52,7 +52,7 @@ function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
   if (cookie) h.set('Cookie', cookie);
   let opts = { method, headers: h };
   if (body !== undefined) {
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    opts.body = typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body);
     if (!h.has('content-type') && typeof body !== 'string') h.set('content-type', 'application/json');
   }
   return new Request(BASE + path, opts);
@@ -294,4 +294,34 @@ test('整本导出：Cookie 会话可访问；非法 id 404；无正文书 404',
   let c = await call(store2, req('/api/books', { method: 'POST', cookie2, body: { title: '空书', chapters: ['x'] } }));
   r = await call(store2, req(`/export/${c.data.id}.txt`, { headers: { authorization: basic('r', 'test-pass') } }));
   assert.equal(r.status, 404, '无章节正文的书不可导出');
+});
+
+test('raw：gzip 压缩上传与明文等效（慢链路上行优化；原件底片完整可重洗）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const r0 = await call(
+    store,
+    req('/api/books', { method: 'POST', cookie, body: { title: '压缩原件书', chapters: ['第一章'], wordCount: 2 } })
+  );
+  const id = r0.data.id;
+  const raw = new TextEncoder().encode('这是需要留档的原始底片内容，包含中文与空格。'.repeat(200));
+  const stream = new Response(raw).body.pipeThrough(new CompressionStream('gzip'));
+  const gz = new Uint8Array(await new Response(stream).arrayBuffer());
+  assert.ok(gz.length < raw.length, '中文文本 gzip 应有压缩收益');
+
+  let r = await call(
+    store,
+    req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: gz, headers: { 'x-content-gzip': '1' } })
+  );
+  assert.equal(r.status, 200);
+  assert.equal(r.data.size, raw.length, '服务端应解压后按明文长度落盘（存储格式不变）');
+
+  r = await call(store, req(`/api/books/${id}/raw`, { cookie }));
+  assert.equal(r.status, 200);
+  assert.equal(r.text, new TextDecoder().decode(raw), '取回的原件应为解压后的明文（重洗依赖）');
+
+  // 未打标记的 gzip 字节按明文落盘——是调用方的错用，但服务端不猜：存进来的字节原样保留
+  r = await call(store, req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: gz }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.size, gz.length, '无标记时不解压（与旧行为兼容）');
 });

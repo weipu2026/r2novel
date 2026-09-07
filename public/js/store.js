@@ -1,6 +1,24 @@
 /* store.js — r2novel API 客户端（登录 + 书架/章节/进度） */
 const j = (r) => r.json().catch(() => ({}));
 
+/** 大请求体 gzip 压缩（慢链路上行提速 3~4 倍）：
+ * body ≥64KB 且浏览器支持 CompressionStream 才压（老 WebView 自动降级原样发）；
+ * 压缩无收益（已压缩数据）也不白包一层。返回 { body, gzip }——gzip=false 时 body 保持原样
+ * （putRaw 的输入本就是 Uint8Array，不能靠类型判断是否压缩过）。服务端按 x-content-gzip 标记头
+ * 识别解压；用自定义头而非标准 Content-Encoding——避免 Cloudflare 边缘对标准头的不可控行为。 */
+const GZIP_MIN = 64 * 1024;
+async function maybeGzip(body) {
+  const plain = { body, gzip: false };
+  if (typeof CompressionStream === 'undefined' || body.length < GZIP_MIN) return plain;
+  try {
+    const stream = new Response(body).body.pipeThrough(new CompressionStream('gzip'));
+    const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+    return buf.length < body.length ? { body: buf, gzip: true } : plain;
+  } catch {
+    return plain; // 压缩失败不阻断上传，降级明文
+  }
+}
+
 export class ApiError extends Error {
   constructor(status, message) {
     super(message || ('HTTP ' + status));
@@ -39,16 +57,22 @@ export const api = {
     const r = await request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PUT', body: text });
     return r;
   },
-  putChapters(id, chapters) {
+  async putChapters(id, chapters) {
     // 批量上传（≤服务端单批上限）：连续上传时 meta 校验从每章一次收敛到每批一次
+    const { body, gzip } = await maybeGzip(JSON.stringify({ chapters }));
     return request(`/api/books/${encodeURIComponent(id)}/chapters/bulk`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chapters }),
+      headers: { 'content-type': 'application/json', ...(gzip ? { 'x-content-gzip': '1' } : {}) },
+      body,
     });
   },
   async putRaw(id, bytes) {
-    return request(`/api/books/${encodeURIComponent(id)}/raw`, { method: 'PUT', body: bytes });
+    const { body, gzip } = await maybeGzip(bytes);
+    return request(`/api/books/${encodeURIComponent(id)}/raw`, {
+      method: 'PUT',
+      headers: gzip ? { 'x-content-gzip': '1' } : {},
+      body,
+    });
   },
   publish: (id) => request(`/api/books/${encodeURIComponent(id)}/publish`, { method: 'POST' }),
   // M2：书库管理

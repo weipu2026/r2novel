@@ -50,7 +50,7 @@ function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
   if (cookie) h.set('Cookie', cookie);
   const opts = { method, headers: h };
   if (body !== undefined) {
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    opts.body = typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body);
     if (!h.has('content-type') && typeof body !== 'string') h.set('content-type', 'application/json');
   }
   return new Request(BASE + path, opts);
@@ -240,6 +240,37 @@ test('bulk：返回逐章字数，与正文一致（空格不计）', async () =
   assert.equal(r.status, 200);
   assert.deepEqual(r.data.words, [5, 3], 'words 应为去空白后的逐章字数（空格不计）');
   assert.equal(r.data.count, 2);
+});
+
+/* ---------------- 分类 / 完结（finished）边界 ---------------- */
+
+test('bulk：gzip 压缩请求体与明文等效（慢链路上行优化回归）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id, keys } = await makeDraftBook(store, cookie, '压缩书', 2);
+  const stream = new Response(JSON.stringify({ chapters: keys.map((k) => ({ key: k, text: '压缩正文' + k })) }))
+    .body.pipeThrough(new CompressionStream('gzip'));
+  const body = new Uint8Array(await new Response(stream).arrayBuffer());
+  assert.ok(body.length < 256, 'gzip 应显著缩小 body');
+
+  const r = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body, headers: { 'x-content-gzip': '1' } })
+  );
+  assert.equal(r.status, 200, 'gzip bulk 应正常入库');
+  assert.equal(r.data.count, 2);
+  // 章节正文只读已发布书 → 先 publish 再验证解压内容
+  const p = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(p.status, 200, '抽样校验应通过（解压内容真实落盘）');
+  const t = await call(store, req(`/api/books/${id}/chapters/${keys[0]}`, { cookie }));
+  assert.equal(t.text, '压缩正文1', '解压后的正文应与明文一致');
+
+  // 未打标记的 gzip 字节必须被拒（JSON.parse 失败 → 400），防止压缩数据被当明文静默误存
+  const bad = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body, headers: { 'x-content-gzip': '0' } })
+  );
+  assert.equal(bad.status, 400);
 });
 
 /* ---------------- 分类 / 完结（finished）边界 ---------------- */

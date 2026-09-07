@@ -85,8 +85,6 @@ export function bindReader(root, navCb) {
     else if (act === 'prefClose') closePref();
     else if (act === 'fontUp') setFont(1);
     else if (act === 'fontDown') setFont(-1);
-    else if (act === 'lineUp') setLine(1);
-    else if (act === 'lineDown') setLine(-1);
     else if (act === 'download') downloadCurrent();
     else if (act === 'export') exportCurrentText();
   });
@@ -430,20 +428,12 @@ function applyPref() {
   }
 }
 
-const FS_MIN = 10, FS_MAX = 30, LH_MIN = 1.5, LH_MAX = 2.6, LH_STEP = 0.15;
+const FS_MIN = 10, FS_MAX = 30, LH_MIN = 1.5, LH_MAX = 2.6;
 
 function setFont(d) {
   state.pref.fs = Math.min(FS_MAX, Math.max(FS_MIN, state.pref.fs + d));
   savePref();
   applyPref();
-}
-
-function setLine(d) {
-  const next = state.pref.lh + LH_STEP * d;
-  state.pref.lh = Math.round(Math.min(LH_MAX, Math.max(LH_MIN, next)) * 100) / 100;
-  savePref();
-  applyPref();
-  showTip('行距 ' + state.pref.lh.toFixed(2), 700);
 }
 
 /** 滑杆直接设定（设置面板拖动实时预览） */

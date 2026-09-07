@@ -75,10 +75,13 @@ button { font-family: inherit; }
 .brand-name { font-size: 17.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brand:hover .brand-name { color: var(--accent); }
 .count { margin-left: 8px; }
-/* 继续阅读：最近在读的前 3 本（纵排列表态，与全部书籍卡片同形态；桌面 3 列横排） */
+/* 继续阅读：最近在读的前 3 本（纵排列表态，与全部书籍卡片同形态；桌面自适应列且限宽，不拉满整行） */
 #continueCard { display: grid; gap: 8px; }
 @media (min-width: 900px) {
-  #continueCard { grid-template-columns: repeat(3, 1fr); }
+  #continueCard {
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    max-width: 840px;
+  }
 }
 .top-actions {
   display: flex; gap: 8px; align-items: center; flex: none;
@@ -136,7 +139,10 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 .card.big .card-block { width: 52px; height: 68px; font-size: 24px; }
 .card-info { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .card.big .card-info { margin-top: 0; }
-.card-info em { font-style: normal; font-weight: 600; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-info em {
+  font-style: normal; font-weight: 600; font-size: 14.5px; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; /* 书名最多两行，多余截断 */
+}
 .card-info small { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 上传 */
@@ -771,9 +777,6 @@ button.danger:hover { background: #fbeeec; }
   .card { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 12px; }
   .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; padding: 0; }
   .card-info { margin-top: 0; flex: 1 1 auto; min-width: 0; gap: 3px; }
-  .card-info em {
-    white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  }
   .card .prog-badge {
     position: static; order: 5; flex: 1 1 100%; margin-top: 1px; padding-right: 34px; /* 右下角 ⋯ 菜单留位 */
     background: none; color: var(--muted); font-size: 11.5px; text-align: right;

@@ -747,7 +747,12 @@ async function apiChapter(store, id, key) {
   if (meta.status !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
   const t = await store.getText(KEY.text(id, key));
   if (t == null) return json({ error: '章节不存在' }, 404);
-  return new Response(t, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+  // 章节正文可长缓存：URL 已带 ?v=cleanVer 作为失效键（任何编辑/重洗都会 cleanVer+1），
+  // 回翻章节/重开书籍零网络请求；cleanVer 变化 → URL 变化 → 缓存天然失效
+  return new Response(t, {
+    status: 200,
+    headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'private, max-age=31536000, immutable' },
+  });
 }
 
 /* ---------------- v1.1：已发布书的章节就地编辑（改标题/改正文/插入/删除） ----------------
@@ -1415,7 +1420,7 @@ async function opdsAuth(req, env, store) {
 }
 
 const opds401 = () =>
-  new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="r2novel"' } });
+  new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="r2novel", charset="UTF-8"' } });
 
 const opdsLocked = (retryAfterMs) =>
   json({ error: '尝试次数过多，请稍后再试' }, 429, { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
@@ -1514,6 +1519,9 @@ async function opdsCatalog(req, env, store) {
   if (!auth.ok) return auth.status === 429 ? opdsLocked(auth.retryAfterMs) : opds401();
   const index = await readIndex(store);
   const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  // feed 级 updated 用内容的最新时间（而非当前时间）：固定值让阅读器按条件请求判断
+  // 「feed 没变化」，避免每次拉取都被误判有更新而反复全量重拉
+  const feedUpdated = books.length ? Math.max(...books.map((b) => b.updatedAt || b.createdAt || 0)) : Date.now();
   const entry = (b) => {
     const ts = b.updatedAt || b.createdAt || Date.now();
     const author = b.author ? `      <author><name>${escXml(b.author)}</name></author>\n` : '';
@@ -1530,7 +1538,7 @@ ${author}${cats}      <summary>${b.chapterCount || 0} 章 · ${b.wordCount || 0}
 <feed xmlns="http://www.w3.org/2005/Atom">
   <id>urn:r2novel:opds</id>
   <title>私人书屋</title>
-  <updated>${new Date().toISOString()}</updated>
+  <updated>${new Date(feedUpdated).toISOString()}</updated>
   <author><name>私人书屋</name></author>
   <link rel="self" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
   <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
@@ -1540,7 +1548,7 @@ ${books.map(entry).join('\n')}
   return new Response(xml, {
     status: 200,
     headers: {
-      'content-type': 'application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8',
+      'content-type': 'application/atom+xml; profile=opds-catalog; kind=acquisition; charset=utf-8',
       'cache-control': 'no-store',
     },
   });

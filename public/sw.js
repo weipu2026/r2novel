@@ -32,8 +32,19 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     // 逐资源容错缓存：addAll 是"一损俱损"——慢网络/代理下单个资源失败会毁掉整个缓存，
     // 之后每个静态资源都回落网络 → 打开明显变慢。改为单个 add，失败只影响该资源。
-    // cache: 'reload' 绕过浏览器 HTTP 缓存（js/css 有 5 分钟缓存头），bump 版本后 install 拿到的一定是最新的
-    caches.open(CACHE).then((c) => Promise.allSettled(SHELL.map((u) => c.add(new Request(u, { cache: 'reload' }))))).then(() => self.skipWaiting())
+    // 分类处理：js/css/HTML/manifest 部署后必须拿到最新 → cache:'reload' 绕过浏览器 HTTP 缓存；
+    // icons 几乎不变且 HTTP 层有 7 天缓存 → 走默认缓存（命中即用，不重复下载），
+    // 部署后 install 的重下量从 14 降到 11，首开负担更小
+    caches
+      .open(CACHE)
+      .then((c) =>
+        Promise.allSettled(
+          SHELL.map((u) =>
+            c.add(new Request(u, u.endsWith('.png') ? undefined : { cache: 'reload' }))
+          )
+        )
+      )
+      .then(() => self.skipWaiting())
   );
 });
 

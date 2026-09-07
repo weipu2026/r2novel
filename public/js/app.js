@@ -1563,7 +1563,7 @@ async function onConfirm() {
     pending = null;
     els.upFile.value = '';
     showView('shelf');
-    await loadShelf();
+    await loadShelf().catch(() => {}); // 刷新失败不吞入库结果（书已成功，稍后重进书架即见）
   } catch (e) {
     // 新建流程中途失败 → 书停在 creating 且从未进书架：看不见、回收站也清不掉。
     // 移入回收站，让用户能看见并彻底删除（或重试），不留孤儿数据。
@@ -1646,20 +1646,33 @@ async function uploadChapters(id, keys, keepRaw) {
   await finalizeUpload(id, keepRaw);
 }
 
-/** 批量上传章节正文（bulk 接口，≤40 章一批串行）：
+/** 批量上传章节正文（bulk 接口，分批串行）：
  * 服务端 meta 校验从「每章一次」收敛到「每批一次」，请求数也从每章 1 个降到每批 1 个，
- * 连续上传大幅减负（Free 计划请求数/天是硬配额）。 */
+ * 连续上传大幅减负（Free 计划请求数/天是硬配额）。
+ * 分批双护栏：章数 ≤ BULK_CHAPTER_BATCH（与后端共享常量对齐，防 413 拒收），
+ * 且批字节 ≤ 12MB——后端 bulk 单批还有 16MB 总字节护栏，40 章×1.9MB 最坏 76MB 会撞上；
+ * 按字节再切批，保证任何大书都能上传而不被单批上限误伤。 */
 async function uploadMany(id, keys, chapters) {
   const n = keys.length;
   if (!n) return;
-  const BATCH = BULK_CHAPTER_BATCH; // 与后端共享常量对齐（shared-const.js），防止 >单批上限被 413 拒收
+  const BATCH = BULK_CHAPTER_BATCH; // 与后端共享常量对齐（shared-const.js）
+  const BATCH_BYTES = 12 * 1024 * 1024; // 批字节护栏（< 后端 16MB maxTotal，留 JSON 转义余量）
+  const enc = new TextEncoder();
   let done = 0;
-  for (let i = 0; i < n; i += BATCH) {
-    const keySlice = keys.slice(i, i + BATCH);
-    const items = keySlice.map((k, j) => {
-      const c = chapters[i + j];
-      return { key: k, text: c && c.content != null ? c.content : '' };
-    });
+  let i = 0;
+  while (i < n) {
+    const items = [];
+    let bytes = 0;
+    while (items.length < BATCH && i < n) {
+      const c = chapters[i];
+      const text = c && c.content != null ? c.content : '';
+      const size = enc.encode(text).byteLength;
+      // 至少发 1 章（单章 ≤FIT 上限远小于预算），之后字节将超则切下一批
+      if (items.length && bytes + size > BATCH_BYTES) break;
+      items.push({ key: keys[i], text });
+      bytes += size;
+      i++;
+    }
     const r = await api.putChapters(id, items);
     done += (r && r.count) || 0;
     setProg(done / n, `上传章节 ${done}/${n}`);

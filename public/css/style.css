@@ -153,6 +153,7 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
   background: #fdf9f3; margin-bottom: 14px; text-align: center;
 }
 .drop-zone input { display: none; }
+.drop-zone.over { border-color: var(--accent); background: var(--accent-weak); box-shadow: inset 0 0 0 1px var(--accent); } /* 拖拽悬停高亮（JS 在 dragenter/dragover 加 .over，leav/drop 移除） */
 .drop-zone strong { font-size: 15px; color: var(--accent); }
 .field { margin-bottom: 10px; }
 .field-row { display: flex; gap: 12px; flex-wrap: wrap; }

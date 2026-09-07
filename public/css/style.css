@@ -258,10 +258,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .read-top {
   position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: 44px;
   padding: calc(env(safe-area-inset-top) + 0px) 8px 0;
-  /* 栏色跟随阅读主题背景（与正文同进退）：Alook 等第三方浏览器的强制反色对
-     固定深色 chrome 栏会"栏反字不反"导致按钮无色/底色不一致；跟随主题后
-     反色时栏与正文整体同步反转，对比保持一致 */
-  background: var(--read-bg, var(--chrome)); color: var(--read-fg, var(--chrome-fg));
+  background: var(--chrome); color: var(--chrome-fg);
   display: flex; align-items: center; justify-content: space-between;
 }
 .read-top span {
@@ -270,13 +267,13 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   padding: 0 6px;
 }
 .read-top button, .read-bar button {
-  background: none; border: 0; color: var(--read-fg, var(--chrome-fg)); font-size: 13.5px;
+  background: none; border: 0; color: var(--chrome-fg); font-size: 13.5px;
   padding: 6px 8px; cursor: pointer; white-space: nowrap;
 }
 .read-bar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; height: 46px;
   padding: 0 6px env(safe-area-inset-bottom);
-  background: var(--read-bg, var(--chrome)); color: var(--read-fg, var(--chrome-fg));
+  background: var(--chrome); color: var(--chrome-fg);
   display: flex; align-items: center; justify-content: space-between;
 }
 #readScroll {

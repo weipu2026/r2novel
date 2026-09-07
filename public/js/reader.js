@@ -501,13 +501,9 @@ function onHidden() {
   saveProgress();
 }
 
-/* 进度：state.cur 为数组下标（0-based），落盘统一转 1-based 章节号 */
-function saveLocal() {
-  if (!state.book) return;
-  const p = { ch: state.cur + 1, ratio: curRatio(), updatedAt: Date.now() };
-  local.setProg(state.book.id, p);
-}
-
+/* 进度：state.cur 为数组下标（0-based），落盘统一转 1-based 章节号。
+ * 本地镜像 + 云端同步一体：翻章立即上云（保证「继续阅读/最近在读」跨设备准确），
+ * 滚动中由 8s 节流与切后台触发；离线入队、回网补传。 */
 function saveProgress() {
   if (!state.book) return;
   const p = { ch: state.cur + 1, ratio: curRatio(), updatedAt: Date.now() };

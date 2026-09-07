@@ -62,6 +62,8 @@ export function bindReader(root, navCb) {
     prefPanel: root.querySelector('#prefPanel'),
     ppFs: root.querySelector('#ppFs'),
     ppLh: root.querySelector('#ppLh'),
+    ppFsRange: root.querySelector('#ppFsRange'),
+    ppLhRange: root.querySelector('#ppLhRange'),
     ppThemes: root.querySelector('#ppThemes'),
   };
   onNav = navCb;
@@ -101,6 +103,9 @@ export function bindReader(root, navCb) {
     fillToc(els.drawerList, state.toc.draw);
     els.tocMore.classList.toggle('hidden', state.chapters.length <= state.toc.draw);
   });
+  // 设置面板滑杆：拖动实时预览（值域与钳制在 setFontSize/setLineHeight 内）
+  if (els.ppFsRange) els.ppFsRange.addEventListener('input', () => setFontSize(els.ppFsRange.value));
+  if (els.ppLhRange) els.ppLhRange.addEventListener('input', () => setLineHeight(els.ppLhRange.value));
   // 点正文空白处：有浮层就关浮层；触屏窄屏下切换工具栏显隐（不再随滚动自动隐藏，避免翻页闪烁）
   els.scroll.addEventListener('click', (e) => {
     const onBody = e.target === els.art || e.target === els.scroll;
@@ -216,6 +221,10 @@ async function renderChapter(idx, restoreRatio) {
   }
   const docFrag = renderParas(text, els.art, makeChHead(idx));
   els.art.replaceChildren(docFrag);
+  // 翻章淡入：消除内容瞬间替换的生硬感（重排触发重播动画；系统减动效时 CSS 侧自动关闭）
+  els.art.classList.remove('fade-in');
+  void els.art.offsetWidth;
+  els.art.classList.add('fade-in');
   els.scroll.scrollTop = 0;
   if (restoreRatio && restoreRatio > 0) {
     requestAnimationFrame(() => {
@@ -409,8 +418,12 @@ function applyPref() {
   root.style.setProperty('--lh', state.pref.lh);
   root.style.setProperty('--read-bg', th.bg);
   root.style.setProperty('--read-fg', th.fg);
+  // 工具栏/设置面板的毛玻璃底：当前主题色 + 85% 不透明（hex8，兼容性优于 color-mix）
+  root.style.setProperty('--read-chrome', th.bg + 'D9');
   els.art.style.fontSize = state.pref.fs + 'px';
   els.art.style.lineHeight = String(state.pref.lh);
+  if (els.ppFsRange) els.ppFsRange.value = String(state.pref.fs);
+  if (els.ppLhRange) els.ppLhRange.value = String(state.pref.lh);
   if (appliedTheme !== state.pref.theme) {
     appliedTheme = state.pref.theme;
     renderPrefPanel();
@@ -431,6 +444,20 @@ function setLine(d) {
   savePref();
   applyPref();
   showTip('行距 ' + state.pref.lh.toFixed(2), 700);
+}
+
+/** 滑杆直接设定（设置面板拖动实时预览） */
+function setFontSize(v) {
+  state.pref.fs = Math.min(FS_MAX, Math.max(FS_MIN, Math.round(Number(v) || state.pref.fs)));
+  savePref();
+  applyPref();
+}
+function setLineHeight(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return;
+  state.pref.lh = Math.round(Math.min(LH_MAX, Math.max(LH_MIN, n)) * 100) / 100;
+  savePref();
+  applyPref();
 }
 
 function setTheme(key) {
@@ -456,7 +483,6 @@ function renderPrefPanel() {
     b.title = t.name;
     b.style.background = t.bg;
     b.style.color = t.fg;
-    b.style.borderColor = t.key === 'white' ? '#b9b3a8' : 'transparent';
     els.ppThemes.appendChild(b);
   }
 }

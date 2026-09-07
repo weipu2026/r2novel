@@ -31,12 +31,8 @@ export function init() {
   els.loginPwd = $('#loginPwd');
   els.loginBtn = $('#loginBtn');
   els.loginErr = $('#loginErr');
-  els.logoutBtn = $('#logoutBtn');
+  els.moreBtn = $('#moreBtn');
   els.uploadBtn = $('#uploadBtn');
-  els.trashBtn = $('#trashBtn');
-  els.diagBtn = $('#diagBtn');
-  els.tagsBtn = $('#tagsBtn');
-  els.batchBtn = $('#batchBtn');
   els.batchBar = $('#batchBar');
   els.bbCount = $('#bbCount');
   els.bbAll = $('#bbAll');
@@ -102,13 +98,9 @@ export function init() {
 
   // 书架事件
   els.login.addEventListener('submit', doLogin);
-  els.logoutBtn.addEventListener('click', logout);
   els.uploadBtn.addEventListener('click', () => openUpload());
-  els.trashBtn.addEventListener('click', openTrash);
-  els.diagBtn.addEventListener('click', openDiag);
+  els.moreBtn.addEventListener('click', openMoreSheet);
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
-  els.tagsBtn.addEventListener('click', openTagMgr);
-  els.batchBtn.addEventListener('click', enterBatchMode);
   els.bbExit.addEventListener('click', exitBatchMode);
   els.bbAll.addEventListener('click', () => {
     for (const b of filteredBooks()) selected.add(b.id);
@@ -711,7 +703,6 @@ const BATCH_PAGE = BATCH_BOOKS_MAX; // 与后端共享常量对齐（shared-cons
 function enterBatchMode() {
   batchMode = true;
   selected.clear();
-  els.batchBtn.classList.add('hidden');
   els.batchBar.classList.remove('hidden');
   syncBatchBar();
   renderShelf();
@@ -721,9 +712,42 @@ function enterBatchMode() {
 function exitBatchMode() {
   batchMode = false;
   selected.clear();
-  els.batchBtn.classList.remove('hidden');
   els.batchBar.classList.add('hidden');
   renderShelf();
+}
+
+/** 顶栏「⋯」收纳菜单：低频治理入口统一收进来，顶栏只留「＋ 上传」+「⋯」 */
+function openMoreSheet() {
+  els.sheet.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'sheet-title';
+  title.textContent = '更多';
+  els.sheet.appendChild(title);
+  const items = [
+    { text: '回收站', act: openTrash },
+    { text: '标签管理', act: openTagMgr },
+    { text: '检查残留', act: openDiag },
+    { text: '批量管理', act: enterBatchMode },
+    { text: '退出登录', act: logout, danger: true },
+  ];
+  for (const it of items) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    if (it.danger) btn.className = 'danger';
+    btn.textContent = it.text;
+    btn.addEventListener('click', () => {
+      closeSheet();
+      it.act();
+    });
+    els.sheet.appendChild(btn);
+  }
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'dim';
+  cancel.textContent = '取消';
+  cancel.addEventListener('click', closeSheet);
+  els.sheet.appendChild(cancel);
+  els.sheet.classList.remove('hidden');
 }
 
 function syncBatchBar() {

@@ -44,11 +44,7 @@
     </button>
     <div class="top-actions">
       <button id="uploadBtn" class="primary" type="button">＋ 上传</button>
-      <button id="trashBtn" class="ghost" type="button">回收站</button>
-      <button id="tagsBtn" class="ghost slim" type="button" title="查看全部标签，合并/改名/删除">标签</button>
-      <button id="diagBtn" class="ghost slim" type="button" title="扫描库中无引用的残留文件">检查残留</button>
-      <button id="batchBtn" class="ghost slim" type="button" title="多选书籍批量打标签/改状态/删除">批量</button>
-      <button id="logoutBtn" class="ghost slim" type="button">退出</button>
+      <button id="moreBtn" class="ghost" type="button" title="回收站 / 标签 / 检查残留 / 批量 / 退出">⋯</button>
     </div>
   </header>
   <main class="shelf-body">
@@ -183,24 +179,30 @@
     <button id="sideOpen" class="side-open hidden" type="button" title="展开目录"><span id="sideOpenTitle">目</span></button>
   </aside>
   <div id="readTop" class="read-top">
-    <button data-act="back" type="button">‹ 书架</button>
+    <button data-act="back" type="button" title="返回书架" aria-label="返回书架">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
     <span id="readTopTitle"></span>
     <div class="read-top-actions">
-      <button data-act="download" type="button" title="下载整本离线">⤓ 离线</button>
-      <button data-act="export" type="button" title="导出清洗后 txt">⇩ txt</button>
-      <button data-act="toc" type="button" title="目录">目录 ☰</button>
+      <button data-act="download" type="button" title="下载整本离线">离线</button>
+      <button data-act="export" type="button" title="导出清洗后 txt">导出</button>
+      <button data-act="toc" type="button" title="目录">目录</button>
     </div>
   </div>
   <div id="readScroll">
     <article id="readArt"></article>
   </div>
   <div class="read-bar">
-    <button data-act="prev" type="button">‹ 上章</button>
+    <button data-act="prev" type="button" title="上一章" aria-label="上一章">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg>
+    </button>
     <button data-act="toc" type="button">目录</button>
     <button data-act="fontDown" type="button" title="减小字号">A−</button>
     <button data-act="fontUp" type="button" title="增大字号">A＋</button>
     <button data-act="pref" type="button" title="字号/行距/背景">Aa</button>
-    <button data-act="next" type="button">下章 ›</button>
+    <button data-act="next" type="button" title="下一章" aria-label="下一章">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 17l5-5-5-5M6 17l5-5-5-5"/></svg>
+    </button>
   </div>
   <!-- 阅读设置面板（字号 / 行距 / 背景） -->
   <div id="prefPanel" class="pref-panel hidden">
@@ -210,19 +212,13 @@
     </div>
     <div class="pp-row">
       <span class="pp-k">字号</span>
-      <div class="pp-ctl">
-        <button data-act="fontDown" type="button" title="减小字号">A−</button>
-        <b id="ppFs">18</b>
-        <button data-act="fontUp" type="button" title="增大字号">A＋</button>
-      </div>
+      <input id="ppFsRange" type="range" min="10" max="30" step="1" aria-label="字号">
+      <b id="ppFs">18</b>
     </div>
     <div class="pp-row">
       <span class="pp-k">行距</span>
-      <div class="pp-ctl">
-        <button data-act="lineDown" type="button" title="缩小行距">−</button>
-        <b id="ppLh">1.95</b>
-        <button data-act="lineUp" type="button" title="放大行距">＋</button>
-      </div>
+      <input id="ppLhRange" type="range" min="1.5" max="2.6" step="0.05" aria-label="行距">
+      <b id="ppLh">1.95</b>
     </div>
     <div class="pp-row">
       <span class="pp-k">背景</span>

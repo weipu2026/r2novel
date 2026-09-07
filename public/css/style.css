@@ -5,7 +5,7 @@
    UI 区本就是固定的浅色系设计，强制反色会把深底反成浅底而字色不变 → 白字不可见。 */
 html { color-scheme: only light; } /* only light：比 light 更强的声明，明确禁止浏览器任何暗色化（防 force dark 反色回归：深底栏被反浅后 chrome-fg 浅字不可见） */
 :root {
-  --bg: #f4f4f1;
+  --bg: #f6f5f2;
   --panel: #ffffff;
   --line: #e3e2dc;
   --fg: #2a2a28;
@@ -23,6 +23,12 @@ html { color-scheme: only light; } /* only light：比 light 更强的声明，�
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; overflow-x: hidden; overflow-x: clip; } /* 兜底：任何未预料的溢出不再产生页面级横向滑动 */
+/* 细滚动条：默认宽滚动条很毁观感（移动端覆盖式滚动条不受影响） */
+* { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,.2) transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,.18); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,.32); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
   background: var(--bg); color: var(--fg); font-size: 15px;
@@ -267,10 +273,19 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 
 /* 阅读器 */
 #view-read { position: relative; }
+/* 工具栏毛玻璃：跟随当前阅读主题色调（--read-chrome 由 reader.js 随主题写入），
+   blur 把滚动正文融进工具栏——四主题下都不再是突兀的死黑条；
+   backdrop-filter 不支持时退化为 85% 实色，依然可读 */
+.read-top, .read-bar {
+  background: var(--read-chrome, var(--chrome));
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  backdrop-filter: blur(14px) saturate(1.15);
+  color: var(--read-fg);
+  box-shadow: inset 0 1px 0 rgba(127,127,127,.14), inset 0 -1px 0 rgba(127,127,127,.14);
+}
 .read-top {
   position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: 44px;
   padding: calc(env(safe-area-inset-top) + 0px) 8px 0;
-  background: var(--chrome); color: var(--chrome-fg);
   display: flex; align-items: center; justify-content: space-between;
 }
 .read-top span {
@@ -279,13 +294,18 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   padding: 0 6px;
 }
 .read-top button, .read-bar button {
-  background: none; border: 0; color: var(--chrome-fg); font-size: 13.5px;
+  background: none; border: 0; color: var(--read-fg); font-size: 13.5px;
   padding: 6px 8px; cursor: pointer; white-space: nowrap;
 }
+/* 方位类按钮的细线图标：方形触区 ≥40px，随字色（即随主题） */
+.read-top button .ic, .read-bar button .ic {
+  width: 22px; height: 22px; display: block;
+}
+.read-top button:first-child, .read-bar button:first-child,
+.read-bar button:last-child { min-width: 40px; min-height: 40px; display: grid; place-items: center; padding: 0; }
 .read-bar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; height: 46px;
   padding: 0 6px env(safe-area-inset-bottom);
-  background: var(--chrome); color: var(--chrome-fg);
   display: flex; align-items: center; justify-content: space-between;
 }
 #readScroll {
@@ -302,6 +322,12 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 
 /* ============ 章节头（章名 + 位置，随正文滚动） ============ */
 .ch-head { text-align: center; margin: 2px 0 20px; padding-bottom: 16px; border-bottom: 1px solid rgba(120,110,90,.18); }
+/* 翻章淡入：消除内容瞬间替换的生硬感（reader.js 每章重触发；系统减动效时关闭） */
+#readArt.fade-in { animation: artFade .18s ease-out; }
+@keyframes artFade { from { opacity: 0; transform: translateY(6px); } }
+@media (prefers-reduced-motion: reduce) {
+  #readArt.fade-in { animation: none; }
+}
 .ch-head h2 {
   font-size: 1.14em; font-weight: 600; margin: 0 0 7px; letter-spacing: .5px;
   font-family: inherit; overflow-wrap: break-word;
@@ -357,39 +383,39 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .toast.show, .tip.show { opacity: 1; }
 
 /* ============ F9：阅读设置面板（字号/行距/背景） ============ */
+/* 面板与工具栏同款毛玻璃、跟随阅读主题——不再是一块独立的深灰 */
 .pref-panel {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(52px + env(safe-area-inset-bottom));
   z-index: 20;
   width: min(94vw, 460px);
-  background: #262a33; color: #e8e6e0;
+  background: var(--read-chrome, var(--chrome));
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  backdrop-filter: blur(14px) saturate(1.15);
+  color: var(--read-fg);
   border-radius: 14px; padding: 10px 14px 14px;
-  box-shadow: 0 -4px 26px rgba(0,0,0,.35);
+  box-shadow: 0 -4px 26px rgba(0,0,0,.22), inset 0 0 0 1px rgba(127,127,127,.16);
   animation: slideup .16s ease-out;
 }
 .pp-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,.1);
+  padding-bottom: 8px; border-bottom: 1px solid rgba(127,127,127,.2);
 }
 .pp-head strong { font-size: 14px; }
 .pp-head button {
-  background: none; border: 0; color: #a9a69e; font-size: 14px; cursor: pointer;
+  background: none; border: 0; color: inherit; opacity: .6; font-size: 14px; cursor: pointer;
   padding: 4px 8px;
 }
 .pp-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-.pp-k { width: 34px; flex: none; font-size: 13px; color: #b9b6ae; }
-.pp-ctl { flex: 1; display: flex; align-items: center; gap: 8px; }
-.pp-ctl b { width: 52px; text-align: center; font-size: 14px; font-variant-numeric: tabular-nums; }
-.pp-ctl button {
-  background: rgba(255,255,255,.07); border: 0; color: #f2efe8;
-  border-radius: 8px; padding: 4px 14px; font-size: 14px; cursor: pointer;
-  min-width: 44px;
+.pp-k { width: 34px; flex: none; font-size: 13px; opacity: .65; }
+.pp-row input[type="range"] {
+  flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer;
 }
-.pp-ctl button:active { background: rgba(255,255,255,.16); }
+.pp-row b { width: 52px; text-align: center; font-size: 14px; font-variant-numeric: tabular-nums; flex: none; }
 .pp-themes { flex: 1; display: flex; gap: 10px; }
 .pp-theme {
   width: 40px; height: 30px; border-radius: 8px; cursor: pointer;
-  border: 2px solid transparent; position: relative; padding: 0;
+  border: 1px solid rgba(127,127,127,.3); position: relative; padding: 0;
 }
 .pp-theme.on { box-shadow: 0 0 0 2px #d29922; }
 .pp-theme:not(.on):hover { opacity: .85; }
@@ -760,13 +786,11 @@ button.danger:hover { background: #fbeeec; }
   .batch-bar button { padding: 4px 9px; font-size: 12px; }
   .tm-name { max-width: 38%; }
 
-  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑 + 精简文案后单行放下） */
+  /* 手机顶栏两行布局：品牌一行、按钮一行（上传 + ⋯ 收纳后单行从容） */
   .top { flex-wrap: wrap; row-gap: 6px; padding-bottom: 8px; }
   .top-actions { width: 100%; justify-content: flex-start; gap: 4px; }
   .top-actions button { padding: 6px 8px; font-size: 12px; }
   .top-actions button.primary { padding: 6px 9px; font-size: 12.5px; }
-  /* 低频治理入口（标签改名/合并、多选批量）手机隐藏：顶栏单行更从容；这些操作在电脑端进行 */
-  .top-actions #tagsBtn, .top-actions #batchBtn { display: none; }
 
   /* 继续阅读大卡也走列表形态（与全部书籍一致）：大色块→小色点、去 accent 边框 */
   .card.big { background: var(--panel); border: 0; }

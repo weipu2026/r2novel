@@ -8,7 +8,7 @@
  *
  * 离线能用的真正保障来自离线整本下载（IndexedDB），SW 只是「静态壳可缓存」。
  */
-const CACHE = 'r2novel-shell-v7';
+const CACHE = 'r2novel-shell-v8';
 const SHELL = [
   '/',
   '/index.html',
@@ -32,7 +32,8 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     // 逐资源容错缓存：addAll 是"一损俱损"——慢网络/代理下单个资源失败会毁掉整个缓存，
     // 之后每个静态资源都回落网络 → 打开明显变慢。改为单个 add，失败只影响该资源。
-    caches.open(CACHE).then((c) => Promise.allSettled(SHELL.map((u) => c.add(u)))).then(() => self.skipWaiting())
+    // cache: 'reload' 绕过浏览器 HTTP 缓存（js/css 有 5 分钟缓存头），bump 版本后 install 拿到的一定是最新的
+    caches.open(CACHE).then((c) => Promise.allSettled(SHELL.map((u) => c.add(new Request(u, { cache: 'reload' }))))).then(() => self.skipWaiting())
   );
 });
 

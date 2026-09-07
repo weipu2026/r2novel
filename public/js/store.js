@@ -108,6 +108,7 @@ const LS = {
   prog: (id) => 'rn_prog_' + id,
   last: 'rn_last_book',
   pref: 'rn_read_pref',
+  shelf: 'rn_shelf_cache',
 };
 export const local = {
   getProg(id) {
@@ -150,6 +151,22 @@ export const local = {
       localStorage.setItem(LS.pref, JSON.stringify(p));
     } catch {
       /* ignore */
+    }
+  },
+  /** 书架快照（打开提速：先渲染上次的书架，网络刷新后覆盖；仅本地本人数据） */
+  getShelfCache() {
+    try {
+      const s = JSON.parse(localStorage.getItem(LS.shelf));
+      return s && Array.isArray(s.books) ? s : null;
+    } catch {
+      return null;
+    }
+  },
+  setShelfCache(books) {
+    try {
+      localStorage.setItem(LS.shelf, JSON.stringify({ books, at: Date.now() }));
+    } catch {
+      /* 容量满则忽略（快照只是提速，非关键数据） */
     }
   },
 };

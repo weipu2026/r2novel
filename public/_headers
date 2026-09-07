@@ -4,3 +4,18 @@
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
   Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+
+# 浏览器缓存：js/css 短缓存（前端改动靠 sw.js 版本 bump 强制刷新，SW install 用 cache:reload 拿最新）；
+# 图标不变更长缓存；HTML/SW/manifest 永远协商（保证入口与 SW 即时更新）
+/js/*
+  Cache-Control: public, max-age=300
+/css/*
+  Cache-Control: public, max-age=300
+/icons/*
+  Cache-Control: public, max-age=604800
+/index.html
+  Cache-Control: no-cache
+/sw.js
+  Cache-Control: no-cache
+/manifest.webmanifest
+  Cache-Control: no-cache

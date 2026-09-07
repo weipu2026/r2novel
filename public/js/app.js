@@ -126,7 +126,12 @@ export function init() {
   els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？15 天内可恢复`));
   els.trashBack.addEventListener('click', () => { showView('shelf'); loadShelf().catch(() => {}); });
   els.trashClear.addEventListener('click', clearTrashFlow);
-  els.searchInput.addEventListener('input', () => { ui.q = els.searchInput.value.trim(); ui.page = 1; renderShelf(); });
+  // 搜索防抖：千本规模下每次按键全量过滤+重建网格，150ms 合并输入更顺滑
+  let searchTimer = null;
+  els.searchInput.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { ui.q = els.searchInput.value.trim(); ui.page = 1; renderShelf(); }, 150);
+  });
   els.sortSel.addEventListener('change', () => { ui.sort = els.sortSel.value; ui.page = 1; renderShelf(); });
   els.loadMoreBtn.addEventListener('click', () => { ui.page++; renderShelf(); });
 
@@ -174,13 +179,24 @@ function onNavBack() {
 }
 
 async function boot() {
+  // 打开提速：有本地快照 → 先渲染书架（老用户秒开），网络校验登录态后按需切换
+  const snap = local.getShelfCache();
+  if (snap) {
+    books = snap.books;
+    tagCache = null;
+    showView('shelf');
+    renderShelf();
+  }
   try {
     const data = await api.books(); // 一次拉取，鉴权预检 + 首屏数据共用
     showView('shelf');
     await loadShelf(data);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) showView('login');
-    else {
+    else if (snap) {
+      // 网络失败但有快照 → 留在快照书架（可离线浏览，操作时会再报网络错误）
+      toast('网络异常，当前显示本地缓存的书架', 2600);
+    } else {
       showView('login');
       els.loginErr.textContent = '连接服务器失败';
     }
@@ -233,9 +249,19 @@ function colorOf(title) {
 }
 
 async function loadShelf(data) {
-  if (!data) data = await api.books();
+  if (!data) {
+    // 打开提速：先用本地快照渲染上次的书架（打开即有内容），网络刷新后覆盖
+    const snap = local.getShelfCache();
+    if (snap) {
+      books = snap.books;
+      tagCache = null;
+      renderShelf();
+    }
+    data = await api.books();
+  }
   books = data.books || [];
   tagCache = null; // books 已更新 → 标签计数缓存失效，下次 renderShelf 重算
+  local.setShelfCache(books);
   // 校正可能失效的筛选项
   if (ui.tag && !books.some((b) => (b.tags || []).includes(ui.tag))) ui.tag = '';
   ui.page = 1;

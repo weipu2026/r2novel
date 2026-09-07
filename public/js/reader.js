@@ -417,7 +417,7 @@ function applyPref() {
   }
 }
 
-const FS_MIN = 15, FS_MAX = 30, LH_MIN = 1.5, LH_MAX = 2.6, LH_STEP = 0.15;
+const FS_MIN = 10, FS_MAX = 30, LH_MIN = 1.5, LH_MAX = 2.6, LH_STEP = 0.15;
 
 function setFont(d) {
   state.pref.fs = Math.min(FS_MAX, Math.max(FS_MIN, state.pref.fs + d));

@@ -22,7 +22,7 @@ html { color-scheme: light; }
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { margin: 0; height: 100%; }
+html, body { margin: 0; height: 100%; overflow-x: hidden; overflow-x: clip; } /* 兜底：任何未预料的溢出不再产生页面级横向滑动 */
 body {
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
   background: var(--bg); color: var(--fg); font-size: 15px;
@@ -75,7 +75,10 @@ button { font-family: inherit; }
 .brand-name { font-size: 17.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brand:hover .brand-name { color: var(--accent); }
 .count { margin-left: 8px; }
-.top-actions { display: flex; gap: 8px; align-items: center; flex: none; }
+.top-actions {
+  display: flex; gap: 8px; align-items: center; flex: none;
+  flex-wrap: wrap; justify-content: flex-end; /* 手机窄屏按钮自动换行，不撑破视口 */
+}
 button.primary {
   border: 0; background: var(--accent); color: #fff; padding: 8px 14px;
   border-radius: 999px; font-size: 14px; cursor: pointer; font-weight: 500;
@@ -141,7 +144,7 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 .drop-zone input { display: none; }
 .drop-zone strong { font-size: 15px; color: var(--accent); }
 .field { margin-bottom: 10px; }
-.field-row { display: flex; gap: 12px; }
+.field-row { display: flex; gap: 12px; flex-wrap: wrap; }
 .field.grow { flex: 1; }
 .field label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
 .field input, .field select {
@@ -259,6 +262,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   display: flex; align-items: center; justify-content: space-between;
 }
 .read-top span {
+  flex: 1 1 auto; min-width: 0; /* 长书名收缩截断，不撑破阅读顶栏 */
   font-size: 14.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding: 0 6px;
 }

@@ -429,28 +429,33 @@ function syncPresetChips() {
   if (!els.upTagChips) return;
   const have = new Set(currentTagsFromInput());
   for (const b of els.upTagChips.children) {
-    b.classList.toggle('on', have.has(b.dataset.tag));
+    b.classList.toggle('on', have.has(b.textContent));
+  }
+}
+/** 生成点选标签 chips（编辑信息 / 批量改标签 / 上传页三处共用）：
+ * 点选 toggle 写入 input（逗号分隔），on 状态由 syncOn 回调随输入同步；
+ * 空列表整块隐藏；textContent 渲染无注入面。 */
+function renderTagPickChips(container, input, syncOn) {
+  container.classList.toggle('hidden', !presetTags.length);
+  for (const t of presetTags) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = t;
+    b.addEventListener('click', () => {
+      const have = new Set(input.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean));
+      if (have.has(t)) have.delete(t);
+      else have.add(t);
+      input.value = Array.from(have).join(', ');
+      syncOn();
+    });
+    container.appendChild(b);
   }
 }
 /** 渲染预设分类 chips：点选即写入标签输入框（与自定义输入共存）；空列表整块隐藏 */
 function renderPresetChips() {
   if (!els.upTagChips) return;
   els.upTagChips.innerHTML = '';
-  els.upTagChips.classList.toggle('hidden', !presetTags.length);
-  for (const t of presetTags) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.dataset.tag = t;
-    b.textContent = t;
-    b.addEventListener('click', () => {
-      const have = new Set(currentTagsFromInput());
-      if (have.has(t)) have.delete(t);
-      else have.add(t);
-      els.upTags.value = Array.from(have).join(', ');
-      syncPresetChips();
-    });
-    els.upTagChips.appendChild(b);
-  }
+  renderTagPickChips(els.upTagChips, els.upTags, syncPresetChips);
   syncPresetChips();
 }
 
@@ -622,6 +627,7 @@ async function safePatch(id, patch) {
 
 /* ---------- 编辑信息模态 ---------- */
 async function openEditModal(b) {
+  refreshPresetTags(); // 打开弹层顺带后台刷新可选标签（快照先显示，与进上传页同款逻辑）
   let note = '';
   let finished = !!b.finished;
   try {
@@ -638,13 +644,24 @@ async function openEditModal(b) {
     <p class="modal-sub">《${esc(b.title)}》 · ${b.chapterCount || 0} 章</p>
     <div class="m-field"><label>书名</label><input id="mdTitle" value="${esc(b.title)}"></div>
     <div class="m-field"><label>作者</label><input id="mdAuthor" value="${esc(b.author || '')}"></div>
-    <div class="m-field"><label>标签（逗号分隔）</label><input id="mdTags" value="${esc((b.tags || []).join(', '))}"></div>
+    <div class="m-field"><label>标签（逗号分隔，可点选）</label><input id="mdTags" value="${esc((b.tags || []).join(', '))}">
+      <div id="mdTagChips" class="tag-chips"></div>
+    </div>
     <div class="m-field"><label class="finish-row"><span>已完结</span><input type="checkbox" id="mdFinished" ${finished ? 'checked' : ''}></label></div>
     <div class="m-field"><label>备注</label><input id="mdNote" value="${esc(note)}" placeholder="这本书的备注（个人备忘）"></div>
     <div class="m-acts">
       <button class="ghost" id="mdCancel" type="button">取消</button>
       <button class="primary" id="mdOk" type="button">保存</button>
     </div>`);
+  // 可选标签 chips：点选 toggle 写回输入框，高亮跟随输入值（该书已打的标签一眼可见）
+  const mdTags = $('#mdTags', els.modalBox);
+  const mdChips = $('#mdTagChips', els.modalBox);
+  const syncMdChips = () => {
+    const have = new Set(mdTags.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean));
+    for (const c of mdChips.children) c.classList.toggle('on', have.has(c.textContent));
+  };
+  renderTagPickChips(mdChips, mdTags, syncMdChips);
+  syncMdChips();
   $('#mdCancel', els.modalBox).addEventListener('click', closeModal);
   $('#mdOk', els.modalBox).addEventListener('click', async () => {
     const patch = {
@@ -774,22 +791,11 @@ function batchEditTags() {
     const have = new Set(parse());
     for (const b of chips.children) b.classList.toggle('on', have.has(b.textContent));
   };
-  // 预设 chips 点选写入输入框（与上传表单同款数据源：库里实际存在的标签 top N）
-  chips.classList.toggle('hidden', !presetTags.length);
-  for (const t of presetTags) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = t;
-    b.addEventListener('click', () => {
-      const have = new Set(parse());
-      if (have.has(t)) have.delete(t);
-      else have.add(t);
-      input.value = Array.from(have).join(', ');
-      syncChipsOn();
-      sync();
-    });
-    chips.appendChild(b);
-  }
+  // 预设 chips 点选写入输入框（与上传表单/编辑信息共用同一数据源与交互）
+  renderTagPickChips(chips, input, () => {
+    syncChipsOn();
+    sync();
+  });
   input.addEventListener('input', sync);
   $('#btCancel', els.modalBox).addEventListener('click', closeModal);
   const go = async (action) => {

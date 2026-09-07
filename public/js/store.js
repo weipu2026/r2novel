@@ -2,18 +2,22 @@
 const j = (r) => r.json().catch(() => ({}));
 
 /** 大请求体 gzip 压缩（慢链路上行提速 3~4 倍）：
+ * body 统一先归一成字节再比较收益——字符串的 length 是「字符数」不是「字节数」，
+ * 中文 1 字 = UTF-8 3 字节，若用字符数比较会把中文文本误判成「压缩无收益」而不压缩。
  * body ≥64KB 且浏览器支持 CompressionStream 才压（老 WebView 自动降级原样发）；
- * 压缩无收益（已压缩数据）也不白包一层。返回 { body, gzip }——gzip=false 时 body 保持原样
+ * gzip 后不小于原文也不白包一层。返回 { body, gzip }——gzip=false 时 body 保持原样
  * （putRaw 的输入本就是 Uint8Array，不能靠类型判断是否压缩过）。服务端按 x-content-gzip 标记头
  * 识别解压；用自定义头而非标准 Content-Encoding——避免 Cloudflare 边缘对标准头的不可控行为。 */
 const GZIP_MIN = 64 * 1024;
-async function maybeGzip(body) {
+export async function maybeGzip(body) {
   const plain = { body, gzip: false };
-  if (typeof CompressionStream === 'undefined' || body.length < GZIP_MIN) return plain;
+  if (typeof CompressionStream === 'undefined') return plain;
+  const bytes = typeof body === 'string' ? new TextEncoder().encode(body) : body;
+  if (bytes.length < GZIP_MIN) return plain;
   try {
-    const stream = new Response(body).body.pipeThrough(new CompressionStream('gzip'));
+    const stream = new Response(bytes).body.pipeThrough(new CompressionStream('gzip'));
     const buf = new Uint8Array(await new Response(stream).arrayBuffer());
-    return buf.length < body.length ? { body: buf, gzip: true } : plain;
+    return buf.length < bytes.length ? { body: buf, gzip: true } : plain;
   } catch {
     return plain; // 压缩失败不阻断上传，降级明文
   }

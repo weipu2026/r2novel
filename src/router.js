@@ -59,15 +59,40 @@ async function dropBody(req) {
   }
 }
 
-/** 读取（可选 gzip 的）请求体文本：前端对大 body（bulk/raw ≥64KB）会 gzip 上传并打
- * x-content-gzip 标记，小 body / 老客户端原样。用自定义头而非标准 Content-Encoding——
- * 避免 Cloudflare 边缘对标准头的不可控行为；解压失败由调用方按坏请求处理。 */
-async function readBodyText(req) {
+/** 读取请求体字节；带 x-content-gzip 标记时解压（产物超过 maxBytes 即中断流）。
+ * 护栏动机：gzip 炸弹（KB 级压缩体解压成 GB）会把 Worker 内存（128MB）打爆——
+ * 计数 TransformStream 在超限瞬间 error 掉管道，上游解压随之取消，内存有界。
+ * 超限抛 Error('解压后超过上限')，解压损坏抛 Error('请求体解压失败')，由调用方映射状态码。 */
+async function readBodyBytes(req, maxBytes) {
   const buf = await req.arrayBuffer();
-  if (req.headers.get('x-content-gzip') === '1' && buf.byteLength) {
-    const stream = new Response(buf).body.pipeThrough(new DecompressionStream('gzip'));
-    return new Response(stream).text();
+  if (req.headers.get('x-content-gzip') !== '1' || !buf.byteLength) return buf;
+  let over = false;
+  let n = 0;
+  const stream = new Response(buf).body
+    .pipeThrough(new DecompressionStream('gzip'))
+    .pipeThrough(
+      new TransformStream({
+        transform(chunk, ctrl) {
+          n += chunk.byteLength;
+          if (n > maxBytes) {
+            over = true;
+            throw new Error('gunzip-over-limit');
+          }
+          ctrl.enqueue(chunk);
+        },
+      })
+    );
+  try {
+    return await new Response(stream).arrayBuffer();
+  } catch (e) {
+    if (over) throw new Error('解压后超过上限');
+    throw new Error('请求体解压失败');
   }
+}
+
+/** 读取（可选 gzip 的）请求体文本：readBodyBytes 的文本版。 */
+async function readBodyText(req, maxBytes) {
+  const buf = await readBodyBytes(req, maxBytes);
   return new TextDecoder().decode(buf);
 }
 
@@ -513,9 +538,16 @@ async function apiPutChapter(req, env, store, id, key) {
  * 单章 PUT 保留兼容。规则与单章一致：只放行 creating、只收章表内 key、每章 ≤ MAX_CHAPTER。
  * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + BULK_CHAPTER_BATCH 并发写。 */
 async function apiPutChapters(req, env, store, id) {
-  const body = await readBodyText(req)
-    .then((t) => JSON.parse(t))
-    .catch(() => ({}));
+  const maxTotal = 16 * 1024 * 1024; // 单批正文字节护栏（body/内存）
+  // 解压护栏 24MB：正文 ≤16MB + JSON 转义/键名开销余量（换行转义 \n 最坏翻倍也已覆盖），
+  // 挡住 gzip 炸弹同时绝不误伤合法批次
+  let body;
+  try {
+    body = JSON.parse(await readBodyText(req, 24 * 1024 * 1024));
+  } catch (e) {
+    if (e && e.message === '解压后超过上限') return json({ error: '请求体过大' }, 413);
+    return json({ error: '无效的请求体' }, 400);
+  }
   const list = Array.isArray(body.chapters) ? body.chapters : [];
   if (!list.length) return json({ error: '没有章节' }, 400);
   if (list.length > BULK_CHAPTER_BATCH) return json({ error: `单批最多 ${BULK_CHAPTER_BATCH} 章` }, 413);
@@ -524,7 +556,6 @@ async function apiPutChapters(req, env, store, id) {
   if (meta.status === 'ready') return json({ error: '书已发布，请改用章节编辑接口' }, 409);
   const table = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
   const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
-  const maxTotal = 16 * 1024 * 1024; // 单批总字节护栏（body/内存）
   const items = [];
   let total = 0;
   for (const it of list) {
@@ -542,7 +573,8 @@ async function apiPutChapters(req, env, store, id) {
 }
 
 /** 上传原件（原始字节留档，重洗/恢复依据）。前端大文件 gzip 传输（x-content-gzip 标记）：
- * 解压后校验、按明文落盘——存储格式不变（重洗读原件零改动，旧数据天然兼容）。 */
+ * 解压护栏 = MAX_UPLOAD（解压产物超限即中断流，防 gzip 炸弹），解压后按明文落盘——
+ * 存储格式不变（重洗读原件零改动，旧数据天然兼容）。 */
 async function apiPutRaw(req, env, store, id) {
   const max = Number(env.MAX_UPLOAD || MAX_UPLOAD_BYTES);
   const declared = Number(req.headers.get('content-length') || 0);
@@ -550,17 +582,14 @@ async function apiPutRaw(req, env, store, id) {
     await dropBody(req);
     return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
   }
-  const raw = await req.arrayBuffer();
-  if (!raw.byteLength) return json({ error: '空文件' }, 400);
-  let buf = raw;
-  if (req.headers.get('x-content-gzip') === '1') {
-    try {
-      const stream = new Response(raw).body.pipeThrough(new DecompressionStream('gzip'));
-      buf = await new Response(stream).arrayBuffer();
-    } catch {
-      return json({ error: '原件解压失败' }, 400);
-    }
+  let buf;
+  try {
+    buf = await readBodyBytes(req, max);
+  } catch (e) {
+    if (e && e.message === '解压后超过上限') return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+    return json({ error: '原件解压失败' }, 400);
   }
+  if (!buf.byteLength) return json({ error: '空文件' }, 400);
   if (buf.byteLength > max) return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
   await store.putBytes(KEY.raw(id), new Uint8Array(buf));
   return json({ ok: true, size: buf.byteLength });

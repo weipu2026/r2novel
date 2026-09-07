@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
 import { BULK_CHAPTER_BATCH } from '../public/js/shared-const.js';
+import { maybeGzip } from '../public/js/store.js';
 
 const BASE = 'http://r2novel.test';
 const ENV = {
@@ -242,7 +243,24 @@ test('bulk：返回逐章字数，与正文一致（空格不计）', async () =
   assert.equal(r.data.count, 2);
 });
 
-/* ---------------- 分类 / 完结（finished）边界 ---------------- */
+test('maybeGzip：中文文本必须被压缩（收益用字节数判断，防字符数误判）', async () => {
+  // 中文 1 字 = 3 UTF-8 字节；若按字符数比较会把大文本误判为「无收益」→ 不压缩（曾为真实 bug）
+  const zh = '第'.repeat(100000); // 10 万汉字 ≈ 300KB 字节
+  const plain = await maybeGzip(zh);
+  assert.equal(plain.gzip, true, '中文大文本应压缩');
+  assert.ok(plain.body.length < zh.length, 'gzip 后应显著小于原文');
+
+  // 小 body 不压缩
+  const small = await maybeGzip('small');
+  assert.equal(small.gzip, false);
+  assert.equal(small.body, 'small');
+
+  // Uint8Array（putRaw 路径）同样正确
+  const raw = new TextEncoder().encode('A'.repeat(200000));
+  const pr = await maybeGzip(raw);
+  assert.equal(pr.gzip, true);
+  assert.ok(pr.body.length < raw.length);
+});
 
 test('bulk：gzip 压缩请求体与明文等效（慢链路上行优化回归）', async () => {
   const store = memStore();
@@ -271,6 +289,36 @@ test('bulk：gzip 压缩请求体与明文等效（慢链路上行优化回归�
     req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body, headers: { 'x-content-gzip': '0' } })
   );
   assert.equal(bad.status, 400);
+});
+
+test('bulk：gzip 炸弹被解压护栏拦截（KB 级压缩体不得解压成超限内存）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeDraftBook(store, cookie, '炸弹书', 1);
+  // 25MB 高度可压文本 → 压缩后仅 ~25KB，解压超过 bulk 24MB 护栏
+  const bombSrc = 'A'.repeat(25 * 1024 * 1024);
+  const gz = new Uint8Array(
+    await new Response(new Response(bombSrc).body.pipeThrough(new CompressionStream('gzip'))).arrayBuffer()
+  );
+  assert.ok(gz.length < 100 * 1024, '炸弹压缩体应远小于原文（否则构造无效）');
+
+  const r = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body: gz, headers: { 'x-content-gzip': '1' } })
+  );
+  assert.equal(r.status, 413, '解压超限应 413 而非解压到底（内存有界）');
+
+  // 损坏的 gzip（标记了但不是 gzip 数据）→ 400
+  const corrupt = await call(
+    store,
+    req(`/api/books/${id}/chapters/bulk`, {
+      method: 'POST',
+      cookie,
+      body: new Uint8Array([0x00, 0x01, 0x02, 0x03]),
+      headers: { 'x-content-gzip': '1' },
+    })
+  );
+  assert.equal(corrupt.status, 400);
 });
 
 /* ---------------- 分类 / 完结（finished）边界 ---------------- */

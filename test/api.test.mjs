@@ -325,3 +325,27 @@ test('raw：gzip 压缩上传与明文等效（慢链路上行优化；原件底
   assert.equal(r.status, 200);
   assert.equal(r.data.size, gz.length, '无标记时不解压（与旧行为兼容）');
 });
+
+test('raw：gzip 炸弹被解压护栏拦截（解压产物超 MAX_UPLOAD 即 413，内存有界）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const r0 = await call(
+    store,
+    req('/api/books', { method: 'POST', cookie, body: { title: '炸弹原件书', chapters: ['第一章'], wordCount: 2 } })
+  );
+  const id = r0.data.id;
+  // 51MB 高度可压文本 > MAX_UPLOAD 50MB，压缩后仅 ~51KB
+  const bombSrc = 'A'.repeat(51 * 1024 * 1024);
+  const gz = new Uint8Array(
+    await new Response(new Response(bombSrc).body.pipeThrough(new CompressionStream('gzip'))).arrayBuffer()
+  );
+  assert.ok(gz.length < 200 * 1024, '炸弹压缩体应远小于原文');
+
+  const r = await call(
+    store,
+    req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: gz, headers: { 'x-content-gzip': '1' } })
+  );
+  assert.equal(r.status, 413, '解压超限应 413 而非解压到底');
+  // 未落盘任何数据
+  assert.equal(await store.getText(`raw/${id}.txt`), null, '超限原件不得落盘');
+});

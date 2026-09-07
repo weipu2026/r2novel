@@ -285,6 +285,12 @@ async function apiLogin(req, env, store) {
       'Retry-After': String(Math.ceil(st.retryAfterMs / 1000)),
     });
   }
+  // 公开端点加固：合法登录体不足 100 字节，声明超大的请求直接拒收（不给恶意大 JSON 读进内存的机会）
+  const cl = Number(req.headers.get('content-length') || 0);
+  if (cl > 65536) {
+    await dropBody(req);
+    return json({ error: '请求体过大' }, 413);
+  }
   const body = await req.json().catch(() => ({}));
   const pass = String(body.password || '');
   const admin = env.ADMIN_PASSWORD;
@@ -1367,7 +1373,7 @@ async function apiPurgeOrphans(req, store) {
       if (used >= DIAG_SUB_BUDGET) break; // 预算尽：不回验也不删（宁漏勿错）
       used++;
       meta = await readBook(store, id);
-      metaCache.set(id, meta === null ? null : meta);
+      metaCache.set(id, meta);
     }
     if (!meta) continue; // 活书 meta 读不到：宁漏勿错，留待下次扫描
     const have = new Set((meta.chapters || []).map((c) => c.key));

@@ -723,7 +723,7 @@ async function batchRun(action, payload, confirmText) {
     busyDone();
   }
   exitBatchMode();
-  await loadShelf();
+  await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
   toast(fail ? `完成 ${ok} 本，${fail} 本失败（可能是半成品书）` : `已更新 ${ok} 本`, 2600);
 }
 
@@ -835,7 +835,6 @@ function renderTagMgr(data) {
         toast('名字没变', 1600);
         return;
       }
-      const same = to === tag;
       const existing = (data.tags || []).some((x) => x.tag === to);
       const verb = existing ? `合并进「${to}」` : `改名为「${to}」`;
       if (!(await confirmModal(`把「${tag}」${verb}？改动会应用到所有打了这个标签的书`, '执行'))) return;
@@ -868,7 +867,7 @@ async function tagMergeRun(from, to) {
     return;
   }
   busyDone();
-  await loadShelf();
+  await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
   toast(to ? `已更新 ${updated} 本` : `已从 ${updated} 本书上移除`, 2400);
   // 确认弹层（confirmModal 共用 modalBox）已把标签管理弹层顶掉并关闭：
   // 无条件重新拉取渲染，既"操作后刷新结果"，也保证改名/合并后的后续操作基于最新行名
@@ -915,7 +914,6 @@ async function diagRefresh() {
 
 function renderDiag() {
   const d = diagData;
-  const st = d.summary || {};
   const rs = d.residue || [];
   const obs = d.orphanBooks || [];
   const cos = d.chapterOrphans || [];
@@ -1033,7 +1031,15 @@ async function exportBook(b) {
 /* ---------- 回收站 ---------- */
 async function openTrash() {
   showView('trash');
-  await loadTrash();
+  try {
+    await loadTrash();
+  } catch (e) {
+    els.trashList.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty muted';
+    p.textContent = '加载失败：' + (e.message || e);
+    els.trashList.appendChild(p);
+  }
 }
 
 async function loadTrash() {
@@ -1282,7 +1288,7 @@ async function importBatch(files) {
   els.upFile.value = '';
   toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : ''].filter(Boolean).join(' · '), 3200);
   showView('shelf');
-  await loadShelf();
+  await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
 }
 
 function onFileChosen() {

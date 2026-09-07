@@ -258,7 +258,10 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .read-top {
   position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: 44px;
   padding: calc(env(safe-area-inset-top) + 0px) 8px 0;
-  background: var(--chrome); color: var(--chrome-fg);
+  /* 栏色跟随阅读主题背景（与正文同进退）：Alook 等第三方浏览器的强制反色对
+     固定深色 chrome 栏会"栏反字不反"导致按钮无色/底色不一致；跟随主题后
+     反色时栏与正文整体同步反转，对比保持一致 */
+  background: var(--read-bg, var(--chrome)); color: var(--read-fg, var(--chrome-fg));
   display: flex; align-items: center; justify-content: space-between;
 }
 .read-top span {
@@ -267,13 +270,13 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   padding: 0 6px;
 }
 .read-top button, .read-bar button {
-  background: none; border: 0; color: var(--chrome-fg); font-size: 13.5px;
+  background: none; border: 0; color: var(--read-fg, var(--chrome-fg)); font-size: 13.5px;
   padding: 6px 8px; cursor: pointer; white-space: nowrap;
 }
 .read-bar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; height: 46px;
   padding: 0 6px env(safe-area-inset-bottom);
-  background: var(--chrome); color: var(--chrome-fg);
+  background: var(--read-bg, var(--chrome)); color: var(--read-fg, var(--chrome-fg));
   display: flex; align-items: center; justify-content: space-between;
 }
 #readScroll {
@@ -748,11 +751,15 @@ button.danger:hover { background: #fbeeec; }
   .batch-bar button { padding: 4px 9px; font-size: 12px; }
   .tm-name { max-width: 38%; }
 
-  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑化后 6 个按钮单行放下，消除错位与横向溢出） */
+  /* 手机顶栏两行布局：品牌一行、按钮一行（紧凑 + 精简文案后 6 个按钮单行放下） */
   .top { flex-wrap: wrap; row-gap: 6px; padding-bottom: 8px; }
-  .top-actions { width: 100%; justify-content: flex-start; gap: 5px; }
-  .top-actions button { padding: 6px 9px; font-size: 12px; }
-  .top-actions button.primary { padding: 6px 11px; font-size: 12.5px; }
+  .top-actions { width: 100%; justify-content: flex-start; gap: 4px; }
+  .top-actions button { padding: 6px 8px; font-size: 12px; }
+  .top-actions button.primary { padding: 6px 9px; font-size: 12.5px; }
+
+  /* 继续阅读大卡也走列表形态（与全部书籍一致）：大色块→小色点、去 accent 边框 */
+  .card.big { background: var(--panel); border: 0; }
+  .card.big .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; }
 
   /* 书架改单列紧凑列表（A1）：伪封面缩为小色点（保留同书同色辨识），
      书名不截断（最多两行），进度从右上胶囊改为信息行——一屏可见 ~14 本 */

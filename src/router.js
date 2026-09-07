@@ -1219,7 +1219,10 @@ async function apiTrashClear(store) {
  *   截断（宁漏勿错），避免大书库把「检查残留」点成 500。
  */
 const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
-const DIAG_LIST_PAGE_BUDGET = 20; // list 分页软上限（每页 ≤1000 对象）：大库只扫前 N 页，截断即 incomplete，防 503
+// list 预算拆两类：meta/raw/progress 是「书数级」对象（每本各 1 个，千本 = 各 1 页）→ 给足预算保证完整；
+// text/ 是「章数级」大头（每章 1 个，千本 50 章 = 50 页）→ 只给部分页数，截断即 incomplete（宁漏勿错）
+const DIAG_META_PAGE_BUDGET = 3; // meta/raw/progress 各自翻页上限（每页 ≤1000 对象 → 覆盖约 3000 本）
+const DIAG_TEXT_PAGE_BUDGET = 20; // text/ 翻页上限（扫描约 20000 个章对象）
 const DIAG_SUB_BUDGET = 45; // 扫描/删除单请求子请求软预算
 
 async function apiDiagOrphans(store) {
@@ -1254,19 +1257,32 @@ async function doDiagScan(store) {
   const chapterOrphans = [];
   const orphanBooks = [];
 
-  // 全库一次遍历（分页受 DIAG_LIST_PAGE_BUDGET 约束：大库只扫前 N 页，截断即标记 incomplete）
-  const lst = await store.list('', DIAG_LIST_PAGE_BUDGET);
-  const all = lst.objects;
-  budget.used += Math.max(1, lst.pages);
-  if (lst.truncated) budget.incomplete = true;
+  // 分前缀并发 list：meta/raw/progress 是「书数级」对象（每本各 1 个，千本各 1 页）→
+  // 给足预算保证无主书/已删残留永远完整；text/ 是「章数级」大头（每章 1 个，千本 50 章 = 50 页）
+  // → 只给 DIAG_TEXT_PAGE_BUDGET 页，截断即标记 incomplete（宁漏勿错）。
+  // 四个前缀互不依赖，并发翻页：list 总耗时从「全库 20 页串行」降为「书数级前缀几页 + text 预算内页」的并发最值。
+  const [lMeta, lRaw, lProg, lText] = await Promise.all([
+    store.list('meta/', DIAG_META_PAGE_BUDGET),
+    store.list('raw/', DIAG_META_PAGE_BUDGET),
+    store.list('progress/', DIAG_META_PAGE_BUDGET),
+    store.list('text/', DIAG_TEXT_PAGE_BUDGET),
+  ]);
+  budget.used += lMeta.pages + lRaw.pages + lProg.pages + lText.pages;
+  if (lMeta.truncated || lRaw.truncated || lProg.truncated || lText.truncated) budget.incomplete = true;
 
-  // meta/{id}.json → 无主书（系统 meta 文件排除）
-  for (const o of all) {
-    if (!o.key.startsWith('meta/') || DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
+  // meta/{id}.json → 无主书（系统 meta 文件排除）。候选先收集、预算内批量并发回读：
+  // 预算尽则剩余标 unknown（宁漏勿错），已允许的并发一次读完（RTT 从串行 N 次降到一次）
+  const orphanCands = [];
+  for (const o of lMeta.objects) {
+    if (DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
     const id = o.key.slice(5, -5); // 去 'meta/' 前缀与 '.json' 后缀
     if (live.has(id)) continue;
-    let m = null;
-    if (bump()) m = await readBook(store, id); // 预算尽则跳过读取，仅记 unknown
+    orphanCands.push({ o, id, canRead: bump() });
+  }
+  const mArr = await Promise.all(orphanCands.map((c) => (c.canRead ? readBook(store, c.id) : Promise.resolve(null))));
+  for (let i = 0; i < orphanCands.length; i++) {
+    const { o, id } = orphanCands[i];
+    const m = mArr[i];
     orphanBooks.push({
       id,
       key: o.key,
@@ -1281,8 +1297,7 @@ async function doDiagScan(store) {
 
   // text/{id}/{key}.txt → 章表外正文 / 无主正文
   const textById = new Map();
-  for (const o of all) {
-    if (!o.key.startsWith('text/')) continue;
+  for (const o of lText.objects) {
     const rest = o.key.slice(5);
     const slash = rest.indexOf('/');
     if (slash <= 0) continue; // 非预期 key 形状，忽略
@@ -1290,9 +1305,10 @@ async function doDiagScan(store) {
     if (!textById.has(id)) textById.set(id, []);
     textById.get(id).push({ key: o.key, size: o.size, chKey: rest.slice(slash + 1, -4) });
   }
+  // 先分出无主正文（书连 meta 都没有 → 列为残留可直接删；有 meta（无主书）→ 正文随书进回收站，不单列）
+  const liveTextIds = [];
   for (const [id, items] of textById) {
     if (!live.has(id)) {
-      // 无主正文：书连 meta 都没有 → 列为残留可直接删；有 meta（无主书）→ 正文随书进回收站，不单列
       if (orphanSet.has(id)) {
         const ob = orphanBooks.find((b) => b.id === id);
         ob.texts = (ob.texts || 0) + items.length;
@@ -1302,9 +1318,16 @@ async function doDiagScan(store) {
       }
       continue;
     }
-    if (!bump()) continue; // 预算尽：本活书正文不再分类（宁漏勿错）
-    const m = await readBook(store, id);
-    if (!m) continue; // 活书但 meta 读不到：宁漏勿错，留待下次扫描
+    liveTextIds.push({ id, items });
+  }
+  // 活书正文分类：预算内并发 readBook（子请求数不变，RTT 从串行 N 次降到一次）
+  const liveMeta = await Promise.all(
+    liveTextIds.map((x) => (bump() ? readBook(store, x.id) : Promise.resolve(null)))
+  );
+  for (let i = 0; i < liveTextIds.length; i++) {
+    const { id, items } = liveTextIds[i];
+    const m = liveMeta[i];
+    if (!m) continue; // 预算尽 / meta 读不到：宁漏勿错，留待下次扫描
     const have = new Set((m.chapters || []).map((c) => c.key));
     const known = new Set(Array.isArray(m.orphans) ? m.orphans : []);
     for (const it of items) {
@@ -1319,13 +1342,14 @@ async function doDiagScan(store) {
     }
   }
 
-  // raw/{id}.txt、progress/{id}.json → 无主残留
-  for (const prefix of ['raw/', 'progress/']) {
-    for (const o of all) {
-      if (!o.key.startsWith(prefix)) continue;
-      const id = o.key.slice(prefix.length).replace(/\.(txt|json)$/, '');
-      if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
-    }
+  // raw/{id}.txt、progress/{id}.json → 无主残留（书数级前缀已完整列出，不存在截断漏检）
+  for (const o of lRaw.objects) {
+    const id = o.key.slice('raw/'.length).replace(/\.(txt|json)$/, '');
+    if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
+  }
+  for (const o of lProg.objects) {
+    const id = o.key.slice('progress/'.length).replace(/\.(txt|json)$/, '');
+    if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
   }
 
   const summary = { residue: residue.length, orphanBooks: orphanBooks.length, chapterOrphans: chapterOrphans.length };

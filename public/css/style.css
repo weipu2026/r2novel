@@ -753,4 +753,22 @@ button.danger:hover { background: #fbeeec; }
   .top-actions { width: 100%; justify-content: flex-start; gap: 5px; }
   .top-actions button { padding: 6px 9px; font-size: 12px; }
   .top-actions button.primary { padding: 6px 11px; font-size: 12.5px; }
+
+  /* 书架改单列紧凑列表（A1）：伪封面缩为小色点（保留同书同色辨识），
+     书名不截断（最多两行），进度从右上胶囊改为信息行——一屏可见 ~14 本 */
+  .grid { grid-template-columns: 1fr; gap: 8px; }
+  .card { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 12px; }
+  .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; padding: 0; }
+  .card-info { margin-top: 0; flex: 1 1 auto; min-width: 0; gap: 3px; }
+  .card-info em {
+    white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+  .card .prog-badge {
+    position: static; order: 5; flex: 1 1 100%; margin-top: 1px; padding-right: 34px; /* 右下角 ⋯ 菜单留位 */
+    background: none; color: var(--muted); font-size: 11.5px; text-align: right;
+  }
+  .card .prog-badge.done { background: none; color: var(--accent); }
+  .card.picking .card-block { display: none; } /* 批量勾选：左上勾选圈替代色点 */
+  .card .pick-tick { top: 50%; transform: translateY(-50%); }
+  .card.pinned { box-shadow: inset 3px 0 0 #e0b23c, 0 1px 2px rgba(0,0,0,.04); } /* 置顶：左侧金条 */
 }

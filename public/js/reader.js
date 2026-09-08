@@ -104,10 +104,12 @@ export function bindReader(root, navCb) {
   // 设置面板滑杆：拖动实时预览（值域与钳制在 setFontSize/setLineHeight 内）
   if (els.ppFsRange) els.ppFsRange.addEventListener('input', () => setFontSize(els.ppFsRange.value));
   if (els.ppLhRange) els.ppLhRange.addEventListener('input', () => setLineHeight(els.ppLhRange.value));
-  // 点正文空白处：有浮层就关浮层；触屏窄屏下切换工具栏显隐（不再随滚动自动隐藏，避免翻页闪烁）
+  // 点正文：有浮层就关浮层；触屏窄屏下切换工具栏显隐（不再随滚动自动隐藏，避免翻页闪烁）。
+  // 注意：手机正文满屏是文字，若只认「空白处」点击，工具栏藏起后几乎唤不出——
+  // 因此正文区任意位置轻点均视为切换（按钮/链接等交互元素已被 closest 分支放行）。
   els.scroll.addEventListener('click', (e) => {
-    const onBody = e.target === els.art || e.target === els.scroll;
-    if (!onBody) return;
+    // 点到交互元素（按钮/输入框/选择区）不算「轻点正文」
+    if (e.target.closest && e.target.closest('button, a, input, textarea, select, .ch-retry')) return;
     if (!els.prefPanel.classList.contains('hidden') || !els.drawer.classList.contains('hidden')) {
       closePref();
       return;
@@ -382,6 +384,8 @@ function scrollSideCur() {
 
 function openToc() {
   closePref();
+  // 唤回工具栏：若此刻 bars-hid，抽屉关闭后正文轻点切换会让人误以为「点了没反应」
+  els.root.classList.remove('bars-hid');
   renderDrawerToc();
   const list = els.drawerList;
   list.scrollTop = 0;
@@ -421,8 +425,10 @@ function applyPref() {
   root.style.setProperty('--lh', state.pref.lh);
   root.style.setProperty('--read-bg', th.bg);
   root.style.setProperty('--read-fg', th.fg);
-  // 工具栏/设置面板的毛玻璃底：当前主题色 + 85% 不透明（hex8，兼容性优于 color-mix）
-  root.style.setProperty('--read-chrome', th.bg + 'D9');
+  // 工具栏/设置面板的毛玻璃底：当前主题色 + 97% 不透明（hex8）。
+  // 移动端 backdrop-filter 在 transform 动画中可能丢采样被合成成白条，
+  // 可读性必须不依赖 blur——97% 近实色兜底，blur 只做质感增强
+  root.style.setProperty('--read-chrome', th.bg + 'F7');
   els.art.style.fontSize = state.pref.fs + 'px';
   els.art.style.lineHeight = String(state.pref.lh);
   if (els.ppFsRange) els.ppFsRange.value = String(state.pref.fs);
@@ -486,6 +492,7 @@ function togglePref() {
   const panel = els.prefPanel;
   if (!panel) return;
   if (panel.classList.contains('hidden')) {
+    els.root.classList.remove('bars-hid'); // 打开设置面板时唤回工具栏，避免面板贴着隐形底栏
     renderPrefPanel();
     panel.classList.remove('hidden');
   } else {

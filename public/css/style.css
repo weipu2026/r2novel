@@ -293,7 +293,13 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 #view-read { position: relative; }
 /* 工具栏毛玻璃：跟随当前阅读主题色调（--read-chrome 由 reader.js 随主题写入），
    blur 把滚动正文融进工具栏——四主题下都不再是突兀的死黑条；
-   backdrop-filter 不支持时退化为 85% 实色，依然可读 */
+   backdrop-filter 不支持时退化为近实色，依然可读。
+   移动端坑位说明：backdrop-filter × transform 滑入动画在 iOS Safari / 部分
+   Android 合成器上会丢 backdrop 采样，把工具栏合成成「白条」（尤其夜间主题
+   浅字压白底 = 直接隐形）。两条对策：① --read-chrome 提高到 97% 不透明，
+   blur 只做质感、可读性不依赖它；② 滑入/滑出用 opacity+transform 双轨过渡，
+   隐藏时 opacity:0 + pointer-events:none，合成器不再对「带 backdrop 的层」
+   做位移重采样。 */
 .read-top, .read-bar {
   background: var(--read-chrome, var(--chrome));
   -webkit-backdrop-filter: blur(14px) saturate(1.15);
@@ -358,12 +364,16 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 #readArt .ch-retry:hover { opacity: 1; }
 
-/* 工具栏自动隐藏（仅触屏窄屏；滚动下移收起、上移/轻点唤出） */
+/* 工具栏自动隐藏（仅触屏窄屏；轻点正文空白唤出/收起）
+   双轨过渡：transform 负责滑入方向感，opacity 保证合成器全程持有正确的
+   backdrop 采样——纯 transform 位移会让部分手机把带 blur 的层渲染成白条 */
 @media (max-width: 899.98px) {
-  .read-top { transition: transform .22s ease; }
-  .read-bar { transition: transform .22s ease; }
-  #view-read.bars-hid .read-top { transform: translateY(-100%); }
-  #view-read.bars-hid .read-bar { transform: translateY(100%); }
+  .read-top { transition: transform .22s ease, opacity .22s ease; }
+  .read-bar { transition: transform .22s ease, opacity .22s ease; }
+  #view-read.bars-hid .read-top { transform: translateY(-100%); opacity: 0; }
+  #view-read.bars-hid .read-bar { transform: translateY(100%); opacity: 0; }
+  /* 隐藏态彻底不响应点击：防止视觉上已消失却仍拦截正文点击（唤不出工具栏的经典诱因） */
+  #view-read.bars-hid .read-top, #view-read.bars-hid .read-bar { pointer-events: none; }
 }
 
 /* 目录抽屉 */

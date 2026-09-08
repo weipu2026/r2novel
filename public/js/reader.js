@@ -225,12 +225,16 @@ async function renderChapter(idx, restoreRatio) {
   els.art.classList.add('fade-in');
   els.scroll.scrollTop = 0;
   if (restoreRatio && restoreRatio > 0) {
+    // 恢复滚动到目标比例后再存进度：若在此处（滚动位置仍是 0）就保存，
+    // 会把云端进度比例覆盖成 0（章节号对、比例丢——跨设备继续阅读会跳回章首）
     requestAnimationFrame(() => {
       const el = els.scroll;
       el.scrollTop = restoreRatio * (el.scrollHeight - el.clientHeight) || 0;
+      saveProgress();
     });
+  } else {
+    saveProgress(); // 翻章即同步云端（一章一次写，频率低）：保证「继续阅读/最近在读」跨设备准确
   }
-  saveProgress(); // 翻章即同步云端（一章一次写，频率低）：保证「继续阅读/最近在读」跨设备准确
   markCur();
   // 预取下一章（静默）
   if (idx + 1 < state.chapters.length) loadChapter(idx + 1).catch(() => {});

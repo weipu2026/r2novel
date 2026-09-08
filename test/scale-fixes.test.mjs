@@ -279,3 +279,31 @@ test('opds：150 本书 → p1 恰 100 条 + rel next；p2 剩余 50 条 + rel p
   assert.match(r1.text, /<title>书149</, 'p1 应含最新书');
   assert.match(r2.text, /<title>书0</, 'p2 应含最旧书');
 });
+
+/* ---------------- ⑤ 上传链路提速（2026-09-08） ---------------- */
+
+test('publish 响应回传发布后的 books 快照（前端免二次 GET /api/books）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const chapters = ['第一章 a', '第二章 b', '第三章 c'];
+  let r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '快照书', chapters, wordCount: 30 } }));
+  const id = r.data.id;
+  await call(store, req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body: { chapters: [{ key: '1', text: 'a' }, { key: '2', text: 'b' }, { key: '3', text: 'c' }] } }));
+
+  r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200);
+  assert.ok(Array.isArray(r.data.books), '响应应含 books 快照');
+  assert.equal(r.data.books.length, 1, '快照应含刚发布的书');
+  assert.equal(r.data.books[0].id, id);
+  assert.equal(r.data.books[0].chapterCount, 3);
+  assert.equal(r.data.books[0].wordCount, 30);
+  // 快照与 GET /api/books 结构一致（前端 loadShelf({books}) 等价于旧刷新路径）。
+  // updatedAt 归一后再比：两次请求落在不同毫秒属正常，不能作为差异
+  const norm = (arr) => JSON.parse(JSON.stringify(arr)).map((b) => ({ ...b, updatedAt: 0 }));
+  r = await call(store, req('/api/books', { cookie }));
+  const get1 = norm(r.data.books);
+  const pub2 = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.deepEqual(norm(pub2.data.books), get1, '快照应与书架 GET 一致');
+  // t 分阶段耗时存在（诊断字段）
+  assert.ok(pub2.data.t && typeof pub2.data.t.total === 'number', '应含分阶段耗时 t');
+});

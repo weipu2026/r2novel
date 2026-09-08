@@ -57,9 +57,6 @@ export const api = {
   createBook(payload) {
     return request('/api/books', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
   },
-  putChapter(id, key, text) {
-    return request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PUT', body: text });
-  },
   async putChapters(id, chapters) {
     // 批量上传（≤服务端单批上限）：连续上传时 meta 校验从每章一次收敛到每批一次
     const { body, gzip } = await maybeGzip(JSON.stringify({ chapters }));

@@ -1343,6 +1343,7 @@ async function importBatch(files) {
   importing = true;
   els.upProgWrap.classList.remove('hidden');
   els.upConfirm.disabled = true;
+  let lastBooks = null;
   try {
     for (let i = 0; i < n; i++) {
       const file = files[i];
@@ -1373,7 +1374,8 @@ async function importBatch(files) {
           continue;
         }
         createdId = created.id;
-        await uploadChapters(created.id, created.chapterKeys, keepRaw);
+        const pub = await uploadChapters(created.id, created.chapterKeys, keepRaw);
+        if (pub && pub.books) lastBooks = pub.books; // 每本 publish 后的 index 快照，最后一份即全量
         createdId = null;
         ok++;
       } catch (e) {
@@ -1395,7 +1397,8 @@ async function importBatch(files) {
   els.upFile.value = '';
   toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : ''].filter(Boolean).join(' · '), 3200);
   showView('shelf');
-  await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
+  if (lastBooks) await loadShelf({ books: lastBooks }).catch(() => {});
+  else await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
 }
 
 function onFileChosen() {
@@ -1663,8 +1666,9 @@ async function onConfirm() {
   els.upProgWrap.classList.remove('hidden');
 
   try {
+    let pub = null;
     if (pending.updating && pending.updating.id) {
-      await uploadToExisting(pending.updating.id, pending.updating.op, payload, keepRaw);
+      pub = await uploadToExisting(pending.updating.id, pending.updating.op, payload, keepRaw);
     } else {
       const dup = books.find((b) => normTitle(b.title) === normTitle(payload.title));
       if (dup) {
@@ -1674,17 +1678,19 @@ async function onConfirm() {
           els.upConfirm.disabled = false;
           return;
         }
-        if (mode === 'new') await createAndUpload(payload, keepRaw);
-        else await uploadToExisting(dup.id, mode, payload, keepRaw);
+        if (mode === 'new') pub = await createAndUpload(payload, keepRaw);
+        else pub = await uploadToExisting(dup.id, mode, payload, keepRaw);
       } else {
-        await createAndUpload(payload, keepRaw);
+        pub = await createAndUpload(payload, keepRaw);
       }
     }
     toast('《' + payload.title + '》已入库', 2200);
     pending = null;
     els.upFile.value = '';
     showView('shelf');
-    await loadShelf().catch(() => {}); // 刷新失败不吞入库结果（书已成功，稍后重进书架即见）
+    // publish 响应已带回发布后的 books 快照 → 直接渲染书架，省一次 GET /api/books（慢链路 ≈2s）
+    if (pub && pub.books) await loadShelf({ books: pub.books }).catch(() => {});
+    else await loadShelf().catch(() => {}); // 兜底：旧版 worker 无 books 字段时走原刷新路径
   } catch (e) {
     // 新建流程中途失败 → 书停在 creating 且从未进书架：看不见、回收站也清不掉。
     // 移入回收站，让用户能看见并彻底删除（或重试），不留孤儿数据。
@@ -1748,23 +1754,40 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   const n = payload.chapters.length; // 本次实际要传的正文数
   const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
-  await uploadMany(id, keys.slice(startKeyIdx), pending.preview.chapters);
-  await finalizeUpload(id, keepRaw);
+  await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
+  return finalizeUpload(id);
 }
 
-/** 收尾：原件留档（可选）+ 发布（创建/替换/追加/批量导入共用） */
-async function finalizeUpload(id, keepRaw) {
-  if (keepRaw && pending.bytes) {
-    setProg(1, '上传原件…');
-    await api.putRaw(id, pending.bytes);
+/** 章节正文与原件留档互不依赖 → 并行上传（原件藏在正文传输窗口里，不再独占一程 RTT，
+ *  慢链路下省掉 raw 请求的全部串行等待）；两者都落定后才发布，避免半成品发布。
+ *  bulk 失败时仍等原件落定再抛错，让清理（删书）在无在途写的情况下进行，不留竞态孤儿。 */
+async function uploadBulkAndRaw(id, keys, keepRaw) {
+  const rawP = keepRaw && pending.bytes ? api.putRaw(id, pending.bytes) : null;
+  let bulkErr = null;
+  try {
+    await uploadMany(id, keys, pending.preview.chapters);
+  } catch (e) {
+    bulkErr = e;
   }
+  if (rawP) {
+    try {
+      await rawP;
+    } catch (e) {
+      if (!bulkErr) throw e; // bulk 已失败时以 bulk 错误为准（清理路径相同）
+    }
+  }
+  if (bulkErr) throw bulkErr;
+}
+
+/** 收尾：发布（创建/替换/追加/批量导入共用）。返回 publish 响应（含新 books 快照，供免刷新书架）。 */
+async function finalizeUpload(id) {
   setProg(1, '发布中…');
-  await api.publish(id);
+  return api.publish(id);
 }
 
 async function uploadChapters(id, keys, keepRaw) {
-  await uploadMany(id, keys, pending.preview.chapters);
-  await finalizeUpload(id, keepRaw);
+  await uploadBulkAndRaw(id, keys, keepRaw);
+  return finalizeUpload(id);
 }
 
 /** 批量上传章节正文（bulk 接口，按批切 + 3 批在途流水线）：

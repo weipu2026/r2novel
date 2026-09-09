@@ -760,15 +760,9 @@ async function apiPublish(req, env, store, id) {
   meta.status = 'ready';
   meta.updatedAt = Date.now();
   if (Array.isArray(meta.orphans) && meta.orphans.length) await sweepOrphans(store, meta);
-  // 三个互不依赖的写并行：状态副档 ∥ meta ∥ index 备份（备份直接用上面读到的原文，省一次 R2 重读）。
-  // 任一写失败的后果与原「副档先行」分析同类：可读/409 短暂不一致，重试发布即愈合
-  const T2 = Date.now();
-  await Promise.all([
-    putStatus(store, id, 'ready'),
-    store.putText(KEY.book(id), JSON.stringify(meta)),
-    writeIndexBak(store, indexRaw),
-  ]);
-
+  // books 数组只依赖上面已解析的 index/meta/progress（纯内存计算），与四个写互不依赖——
+  // 提前算好，让 index 本体和状态副档 ∥ meta ∥ index 备份同一批并发落盘。
+  // 旧实现 writeIndex 单独排在并行写之后，多等一整轮 R2 往返（实测 ~0.9s/阶段）。
   const books = (index.books || []).filter((b) => b.id !== id);
   const old = (index.books || []).find((b) => b.id === id);
   // 书架角标镜像以 progress 文件当前值为准（rewash/replace 可能刚重置过进度）
@@ -782,7 +776,15 @@ async function apiPublish(req, env, store, id) {
     /* 读取失败沿用旧镜像 */
   }
   books.push(indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
-  await writeIndex(store, { books });
+  // 四个互不依赖的写并行：状态副档 ∥ meta ∥ index 备份 ∥ index 本体。
+  // 任一写失败的后果与原「副档先行」分析同类：可读/409 短暂不一致，重试发布即愈合
+  const T2 = Date.now();
+  await Promise.all([
+    putStatus(store, id, 'ready'),
+    store.putText(KEY.book(id), JSON.stringify(meta)),
+    writeIndexBak(store, indexRaw),
+    writeIndex(store, { books }),
+  ]);
   const tWrite = Date.now() - T2;
   // books 快照随响应回传：前端入库后直接用这份新列表渲染书架，省一次 GET /api/books 往返；
   // t 为服务端分阶段耗时（meta 读 / 校验+读 / 写），供慢链路诊断

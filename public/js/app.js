@@ -1340,6 +1340,7 @@ async function importBatch(files) {
   let ok = 0;
   let skip = 0;
   let fail = 0;
+  let rawFail = 0; // 原件上传失败本数（书仍入库，重洗不可用）
   importing = true;
   els.upProgWrap.classList.remove('hidden');
   els.upConfirm.disabled = true;
@@ -1378,6 +1379,7 @@ async function importBatch(files) {
         if (pub && pub.books) lastBooks = pub.books; // 每本 publish 后的 index 快照，最后一份即全量
         createdId = null;
         ok++;
+        if (pub && pub.rawFailed) rawFail++; // raw 失败不算失败：书已入库，仅重洗不可用
       } catch (e) {
         fail++;
         if (createdId) {
@@ -1395,7 +1397,7 @@ async function importBatch(files) {
   }
   pending = null;
   els.upFile.value = '';
-  toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : ''].filter(Boolean).join(' · '), 3200);
+  toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : '', rawFail ? `原件缺失 ${rawFail} 本（重洗不可用）` : ''].filter(Boolean).join(' · '), 3200);
   showView('shelf');
   if (lastBooks) await loadShelf({ books: lastBooks }).catch(() => {});
   else await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
@@ -1684,7 +1686,7 @@ async function onConfirm() {
         pub = await createAndUpload(payload, keepRaw);
       }
     }
-    toast('《' + payload.title + '》已入库', 2200);
+    toast(pub && pub.rawFailed ? '《' + payload.title + '》已入库，但原件上传失败，重洗不可用' : '《' + payload.title + '》已入库', 2200);
     pending = null;
     els.upFile.value = '';
     showView('shelf');
@@ -1754,40 +1756,57 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   const n = payload.chapters.length; // 本次实际要传的正文数
   const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
-  await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
-  return finalizeUpload(id);
+  const r = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
+  await finalizeUpload(id);
+  return r; // { rawFailed } 透传给调用方提示
 }
 
 /** 章节正文与原件留档互不依赖 → 并行上传（原件藏在正文传输窗口里，不再独占一程 RTT，
  *  慢链路下省掉 raw 请求的全部串行等待）；两者都落定后才发布，避免半成品发布。
- *  bulk 失败时仍等原件落定再抛错，让清理（删书）在无在途写的情况下进行，不留竞态孤儿。 */
+ *  bulk 失败时仍等原件落定再抛错，让清理（删书）在无在途写的情况下进行，不留竞态孤儿。
+ *  raw 是可选附件（不勾「保留原件」就没有，书照样合法）→ 失败不算上传失败：
+ *  返回 { rawFailed:true }，由调用方决定提示文案；书照常发布，仅重洗不可用。
+ *  （旧实现 raw 失败 throw → onConfirm 兜底 deleteBook，会因非必需附件失败删掉整本正文。） */
 async function uploadBulkAndRaw(id, keys, keepRaw) {
   const rawP = keepRaw && pending.bytes ? api.putRaw(id, pending.bytes) : null;
+  // raw 在后台并行传输：bulk 进度文字里捎带原件状态，慢链路下 20s 黑箱不再像卡死
+  rawInflightReq = rawP;
+  if (rawP) setProg(0, `上传章节 0/${keys.length}（原件传输中…）`);
   let bulkErr = null;
   try {
     await uploadMany(id, keys, pending.preview.chapters);
   } catch (e) {
     bulkErr = e;
   }
+  let rawFailed = false;
   if (rawP) {
     try {
       await rawP;
-    } catch (e) {
-      if (!bulkErr) throw e; // bulk 已失败时以 bulk 错误为准（清理路径相同）
+    } catch {
+      rawFailed = true; // raw 失败降级为警告，不再向上抛
     }
   }
+  rawInflightReq = null;
   if (bulkErr) throw bulkErr;
+  return { rawFailed };
 }
 
-/** 收尾：发布（创建/替换/追加/批量导入共用）。返回 publish 响应（含新 books 快照，供免刷新书架）。 */
-async function finalizeUpload(id) {
+/** raw 请求是否仍在途（仅用于进度文案；uploadBulkAndRaw 之外读不到 rawP，挂到模块级） */
+let rawInflightReq = null;
+function rawInFlight() {
+  return rawInflightReq != null;
+}
+
+/** 收尾：发布（创建/替换/追加/批量导入共用）。返回 publish 响应与 rawFailed 合并结果。 */
+async function finalizeUpload(id, rawRes) {
   setProg(1, '发布中…');
-  return api.publish(id);
+  const pub = await api.publish(id);
+  return { ...rawRes, ...pub }; // rawFailed + books/wordCount 等发布结果
 }
 
 async function uploadChapters(id, keys, keepRaw) {
-  await uploadBulkAndRaw(id, keys, keepRaw);
-  return finalizeUpload(id);
+  const rawRes = await uploadBulkAndRaw(id, keys, keepRaw);
+  return finalizeUpload(id, rawRes);
 }
 
 /** 批量上传章节正文（bulk 接口，按批切 + 3 批在途流水线）：
@@ -1837,7 +1856,7 @@ async function uploadMany(id, keys, chapters) {
       }
       const r = await api.putChapters(id, items);
       done += (r && r.count) || 0;
-      setProg(done / n, `上传章节 ${done}/${n}`);
+      setProg(done / n, `上传章节 ${done}/${n}${rawInFlight() ? '（原件传输中…）' : ''}`);
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONC, bounds.length) }, worker));

@@ -8,7 +8,7 @@
  *
  * 离线能用的真正保障来自离线整本下载（IndexedDB），SW 只是「静态壳可缓存」。
  */
-const CACHE = 'r2novel-shell-v12';
+const CACHE = 'r2novel-shell-v13';
 const SHELL = [
   '/',
   '/index.html',
@@ -70,7 +70,10 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     caches.open(CACHE).then(async (cache) => {
       const cached = await cache.match(req);
-      const network = fetch(req)
+      // cache:'no-cache' = 每次强制条件校验（ETag/304）：部署后首个导航就能拿到新 JS，
+      // 不再受浏览器 HTTP 缓存 max-age 窗口（5 分钟）影响——此前 SWR 走默认缓存，
+      // 部署后用户可能连跑几十分钟旧代码，且「一直开着的 tab」永远不会重载 app.js
+      const network = fetch(req, { cache: 'no-cache' })
         .then((res) => {
           if (res && res.status === 200) cache.put(req, res.clone()).catch(() => {});
           return res;

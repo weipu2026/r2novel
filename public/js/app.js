@@ -781,7 +781,7 @@ function syncBatchBar() {
   for (const b of [els.bbTags, els.bbDone, els.bbOngoing, els.bbDelete]) b.disabled = dis;
 }
 
-/** 批量执行：分批调用批量 API（每批 20），busy 进度反馈；完成后刷新书架 */
+/** 批量执行：分批调用批量 API（每批 BATCH_PAGE 本 = BATCH_BOOKS_MAX），busy 进度反馈；完成后刷新书架 */
 async function batchRun(action, payload, confirmText) {
   if (!selected.size) return;
   const ids = Array.from(selected);
@@ -959,7 +959,9 @@ const diagShort = (key) => {
 };
 
 /** 全库扫描（含大库 text/ 分窗续扫）：循环带上服务端回传的 textCursor，直到 null 扫完。
- * 期间把 residue/chapterOrphans 增量合并（orphanBooks/summary 只在首页有意义），onPage 回调做进度展示。 */
+ * 期间把 residue/chapterOrphans 增量合并（orphanBooks/summary 只在首页有意义），onPage 回调做进度展示。
+ * onPage 返回 false 表示中止（用户在扫描途中关闭弹层）→ 立刻停止后续请求，
+ * 不再白烧服务端请求配额，并置 incomplete 标记本次结果不完整。 */
 async function diagScanAll(onPage) {
   let merged = null;
   let cursor = '';
@@ -977,7 +979,10 @@ async function diagScanAll(onPage) {
     incomplete = incomplete || !!d.incomplete;
     cursor = d.textCursor || '';
     if (!cursor) break;
-    if (onPage) onPage(merged);
+    if (onPage && onPage(merged) === false) {
+      incomplete = true; // 用户中止：结果不完整，不再继续翻页
+      break;
+    }
   }
   merged.incomplete = incomplete;
   return merged;
@@ -987,9 +992,10 @@ async function openDiag() {
   openModal('<h3>残留检查</h3><p class="modal-sub">正在扫描全库对象…</p>');
   try {
     diagData = await diagScanAll((m) => {
-      if (els.modalMask.classList.contains('hidden')) return;
+      if (els.modalMask.classList.contains('hidden')) return false; // 已关闭 → 中止后续扫描
       const el = $('.modal-sub', els.modalBox);
       if (el) el.textContent = `正在扫描全库对象… 已扫 ${m.scannedPages || 0} 页，暂发现 ${(m.residue || []).length + (m.chapterOrphans || []).length} 项残留`;
+      return true;
     });
     if (els.modalMask.classList.contains('hidden')) return; // 扫描期间用户已关闭
     renderDiag();
@@ -1104,7 +1110,8 @@ async function onDiagBoxClick(e) {
   } else if (act === 'move-book') {
     const id = btn.dataset.id;
     const title = btn.dataset.title;
-    if (!(await confirmModal(`把未入架的书《${esc(title || '未命名')}》移入回收站？可在回收站恢复或彻底删除。`, '移入回收站'))) return;
+    // 不套 esc()：confirmModal 内部已统一转义，再 esc 一次会把 & 显示成 &amp;
+    if (!(await confirmModal(`把未入架的书《${title || '未命名'}》移入回收站？可在回收站恢复或彻底删除。`, '移入回收站'))) return;
     try {
       await api.deleteBook(id); // 服务端 softDelete 已支持无主书
       toast('已移入回收站', 1600);
@@ -1230,11 +1237,13 @@ async function clearTrashFlow() {
   try {
     busy(0.1, '正在清空…');
     let remaining = 1;
+    let total = 0; // 首次返回的剩余量即总数：此前 hardcode /10，书多时进度条全程卡在 5%
     let guard = 0;
     while (remaining > 0 && guard++ < 1000) {
       const r = await api.clearTrash();
       remaining = r.remaining || 0;
-      busy(Math.max(0.05, 1 - remaining / 10), remaining ? `清空中…剩余 ${remaining} 本` : '完成');
+      if (!total) total = Math.max(remaining, 1);
+      busy(Math.min(0.99, Math.max(0.05, 1 - remaining / total)), remaining ? `清空中…剩余 ${remaining} 本` : '完成');
     }
     toast(remaining ? '清空未完成，请重试' : '回收站已清空', 1500);
     await loadTrash();
@@ -1275,6 +1284,8 @@ function openUpload(opts = {}) {
     // 重新清洗入口
     pending = {
       updating: { id: opts.book.id, op: 'replace', book: opts.book },
+      // title 必须带上：runPreview 用它做 fallbackTitle，缺失时 cleaners 检测不到书名会退成 "undefined"
+      title: opts.book.title || '',
       bytes: null,
       keepRaw: true,
     };

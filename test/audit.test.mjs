@@ -38,6 +38,11 @@ function memStore() {
     async delete(k) {
       m.delete(k);
     },
+    // 前缀列举（供彻底删除 meta 丢失时按前缀回收正文）
+    async list(prefix = '', maxPages = 0) {
+      const keys = [...m.keys()].filter((k) => k.startsWith(prefix)).sort();
+      return { objects: keys.map((k) => ({ key: k, size: 0 })), truncated: false, pages: 1, cursor: null };
+    },
     _map: m,
   };
 }
@@ -137,6 +142,19 @@ test('审计：sweep —— 已进入 purge 分段的过期书会被继续清理
   assert.ok(!store._map.has(`text/${id}/41.txt`), 'sweep 应继续删除 purge 中剩余的章');
   assert.ok(!store._map.has(`meta/${id}.json`), '清完后 meta 应被删除');
   assert.ok(!store._map.has('meta/trash.json') || JSON.parse(store._map.get('meta/trash.json')).books.length === 0, 'trash 应已移除该书');
+});
+
+test('审计：彻底删除时 meta 丢失 —— 按前缀回收正文，不留残留', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeBook(store, cookie, '丢meta书', 2);
+  await call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie })); // 软删
+  store._map.delete(`meta/${id}.json`); // 模拟 meta 丢失/损坏（旧实现：章表为空 → 正文永久残留）
+  const r = await call(store, req(`/api/trash/${id}`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200);
+  assert.ok(!store._map.has(`text/${id}/1.txt`), 'meta 丢失也应删掉第 1 章正文');
+  assert.ok(!store._map.has(`text/${id}/2.txt`), 'meta 丢失也应删掉第 2 章正文');
+  assert.equal(r.data.done, true, '应一次清完');
 });
 
 test('审计：replace 重洗 —— 进度越界旧值不覆盖；同名迁移保持 ratio', async () => {

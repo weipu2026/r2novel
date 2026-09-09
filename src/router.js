@@ -400,10 +400,16 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
   let keys = Array.isArray(entry.purge) && entry.purge.length ? entry.purge : null;
   if (!keys) {
     const meta = await readBook(store, id);
-    // 彻底删除要覆盖正文章节 + replace 遗留的孤儿章节，避免 R2 残留
-    keys = meta
-      ? (meta.chapters || []).map((c) => c.key).concat(Array.isArray(meta.orphans) ? meta.orphans : [])
-      : [];
+    if (meta) {
+      // 彻底删除要覆盖正文章节 + replace 遗留的孤儿章节，避免 R2 残留
+      keys = (meta.chapters || []).map((c) => c.key).concat(Array.isArray(meta.orphans) ? meta.orphans : []);
+    } else {
+      // meta 已丢失（手工删除/损坏）：不能空手交差——否则 text/<id>/ 下所有正文永久残留，
+      // 而回收站条目却已被摘除，只能靠 diag 兜底。按前缀列全量回收（上限 50 页≈5 万章）
+      const prefix = `text/${id}/`;
+      const listed = await store.list(prefix, 50).catch(() => ({ objects: [] }));
+      keys = (listed.objects || []).map((o) => o.key.slice(prefix.length).replace(/\.txt$/, ''));
+    }
   }
   const batch = keys.slice(0, maxDel);
   // 并发删除：子请求数不变，耗时从串行 N 次往返降为一批并发

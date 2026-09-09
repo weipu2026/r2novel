@@ -574,6 +574,7 @@ async function apiPutChapter(req, env, store, id, key) {
  * 单章 PUT 保留兼容。规则与单章一致：只放行 creating、只收章表内 key、每章 ≤ MAX_CHAPTER。
  * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + BULK_CHAPTER_BATCH 并发写。 */
 async function apiPutChapters(req, env, store, id) {
+  const T0 = Date.now();
   const maxTotal = 16 * 1024 * 1024; // 单批正文字节护栏（body/内存）
   // 解压护栏 24MB：正文 ≤16MB + JSON 转义/键名开销余量（换行转义 \n 最坏翻倍也已覆盖），
   // 挡住 gzip 炸弹同时绝不误伤合法批次
@@ -588,6 +589,7 @@ async function apiPutChapters(req, env, store, id) {
   if (!list.length) return json({ error: '没有章节' }, 400);
   if (list.length > BULK_CHAPTER_BATCH) return json({ error: `单批最多 ${BULK_CHAPTER_BATCH} 章` }, 413);
   const meta = await readBook(store, id);
+  const tMeta = Date.now() - T0;
   if (!meta) return json({ error: '书不存在' }, 404);
   if (meta.status === 'ready') return json({ error: '书已发布，请改用章节编辑接口' }, 409);
   const table = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
@@ -604,11 +606,15 @@ async function apiPutChapters(req, env, store, id) {
     items.push({ key, text });
   }
   // 批内并发写：子请求数不变（仍 ≤BULK_CHAPTER_BATCH），耗时从串行 N×RTT 降为一次并发
+  const T1 = Date.now();
   await Promise.all(items.map((it) => store.putText(KEY.text(id, it.key), it.text)));
+  const tPut = Date.now() - T1;
   // 响应不带逐章 words：前端只用 count，而对 ≤12MB 批正文逐章跑正则统计是纯 CPU 浪费
   // （规模化后每本书几十批，累计可省数秒 CPU——Free 计划 10ms CPU/请求的贴边场景）。
   // 字数入库时信任客户端 cleaner 统计，与 publish 同一策略。
-  return json({ ok: true, count: items.length });
+  // t 为服务端分阶段耗时（meta 读 / 批内并发写正文），与 publish 的 t 字段同用途：慢链路诊断。
+  // put 的耗时形态可区分「并发写被分波排队」（减批有救）vs「单次 R2 写本身慢」（减批反亏）。
+  return json({ ok: true, count: items.length, t: { meta: tMeta, put: tPut, total: Date.now() - T0 } });
 }
 
 /** 上传原件（原始字节留档，重洗/恢复依据）。前端大文件 gzip 传输（x-content-gzip 标记）：

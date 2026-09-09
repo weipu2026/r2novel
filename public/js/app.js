@@ -1826,15 +1826,20 @@ async function uploadChapters(id, keys, keepRaw) {
  * 连续上传大幅减负（Free 计划请求数/天是硬配额）。
  * 并发：慢链路（CF 边缘 RTT 200ms+）下纯串行会在等服务端响应时闲置上行，
  * 3 批在途把上行带宽喂满；批与批的 key 互不相同、服务端只是并发写独立对象，乱序到达无影响。
+ * 批大小自适应（2026-09-09 实测驱动）：同一请求内服务端 R2 并发写被压到 ~3 个，
+ * 小书（≤40 章）只有 1 批时 9 章写 3.4s（t.put=3386ms）全挤在一个请求里排队。
+ * 批大小 = min(40, max(2, ceil(n/3)))：小书拆成 3 个并发请求各写 ~1 波，
+ * 写阶段大幅提前；大书（千章级）仍 40 章/批，避免每批 0.7s meta 读拖累总量。
  * 分批双护栏：章数 ≤ BULK_CHAPTER_BATCH（与后端共享常量对齐，防 413 拒收），
  * 且批字节 ≤ 12MB——后端 bulk 单批还有 16MB 总字节护栏，40 章×1.9MB 最坏 76MB 会撞上；
  * 按字节再切批，保证任何大书都能上传而不被单批上限误伤。 */
 async function uploadMany(id, keys, chapters) {
   const n = keys.length;
   if (!n) return;
-  const BATCH = BULK_CHAPTER_BATCH; // 与后端共享常量对齐（shared-const.js）
-  const BATCH_BYTES = 12 * 1024 * 1024; // 批字节护栏（< 后端 16MB maxTotal，留 JSON 转义余量）
   const CONC = 3; // 在途批数：再高对单用户上行收益递减，且抬高手机端内存峰值
+  // 自适应批大小（见上注释）；min 保证大书不退化，max(2,·) 保证小书也能拆出 ≥2 个并发请求
+  const BATCH = Math.min(BULK_CHAPTER_BATCH, Math.max(2, Math.ceil(n / CONC)));
+  const BATCH_BYTES = 12 * 1024 * 1024; // 批字节护栏（< 后端 16MB maxTotal，留 JSON 转义余量）
   const enc = new TextEncoder();
 
   // 第一步：按护栏把批次边界全部算好（[start,end) 区间，纯本地零网络）

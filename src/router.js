@@ -612,7 +612,7 @@ async function apiPutChapters(req, env, store, id) {
   // 响应不带逐章 words：前端只用 count，而对 ≤12MB 批正文逐章跑正则统计是纯 CPU 浪费
   // （规模化后每本书几十批，累计可省数秒 CPU——Free 计划 10ms CPU/请求的贴边场景）。
   // 字数入库时信任客户端 cleaner 统计，与 publish 同一策略。
-  // t 为服务端分阶段耗时（meta 读 / 批内并发写正文），与 publish 的 t 字段同用途：慢链路诊断。
+  // t 为服务端分阶段耗时（meta 读一段含 body 解压/解析；批内并发写正文），与 publish 的 t 字段同用途：慢链路诊断。
   // put 的耗时形态可区分「并发写被分波排队」（减批有救）vs「单次 R2 写本身慢」（减批反亏）。
   return json({ ok: true, count: items.length, t: { meta: tMeta, put: tPut, total: Date.now() - T0 } });
 }

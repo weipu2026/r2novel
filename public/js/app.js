@@ -1756,9 +1756,10 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   const n = payload.chapters.length; // 本次实际要传的正文数
   const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
-  const r = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
-  await finalizeUpload(id);
-  return r; // { rawFailed } 透传给调用方提示
+  // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：替换/追加/重洗流程依赖响应里的
+  // books 快照免刷新书架，漏掉会静默退化成一次全量 GET /api/books（慢链路 ~2s）
+  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
+  return finalizeUpload(id, rawRes);
 }
 
 /** 章节正文与原件留档互不依赖 → 并行上传（原件藏在正文传输窗口里，不再独占一程 RTT，

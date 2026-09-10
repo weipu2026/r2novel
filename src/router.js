@@ -69,12 +69,11 @@ async function dropBody(req) {
  * 错误语义（调用方按 message 映射状态码）：
  *   解压后超过上限 / 请求体超过上限 → 413；请求体解压失败 → 400。 */
 async function readBodyBytes(req, maxBytes) {
-  // 声明值快速拒绝：省一次完整流读取（合法客户端都会带 Content-Length）
+  // 声明值快速拒绝：省一次完整流读取（合法客户端都会带 Content-Length）。
+  // 注意此处**不能** dropBody——排空即 req.arrayBuffer() 整体读入，等于把超大体吃进内存，
+  // 与护栏目的相悖；直接回 413 由运行时处置未消费的请求体即可。
   const declared = Number(req.headers.get('content-length') || 0);
-  if (declared > maxBytes) {
-    await dropBody(req);
-    throw new Error('请求体超过上限');
-  }
+  if (declared > maxBytes) throw new Error('请求体超过上限');
   if (!req.body) return new Uint8Array(0);
   const gz = req.headers.get('x-content-gzip') === '1';
   let over = false;
@@ -644,11 +643,8 @@ async function apiPutChapters(req, env, store, id) {
  * 存储格式不变（重洗读原件零改动，旧数据天然兼容）。 */
 async function apiPutRaw(req, env, store, id) {
   const max = Number(env.MAX_UPLOAD || MAX_UPLOAD_BYTES);
-  const declared = Number(req.headers.get('content-length') || 0);
-  if (declared > max) {
-    await dropBody(req);
-    return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
-  }
+  // 声明值/流式超限都在 readBodyBytes 内处理（含 413 映射），此处不再自行 dropBody 排空——
+  // 排空超大体等于把它读进内存，反而制造 OOM 面
   let buf;
   try {
     buf = await readBodyBytes(req, max);
@@ -658,7 +654,6 @@ async function apiPutRaw(req, env, store, id) {
     return json({ error: '原件读取失败' }, 400);
   }
   if (!buf.byteLength) return json({ error: '空文件' }, 400);
-  if (buf.byteLength > max) return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
   await store.putBytes(KEY.raw(id), new Uint8Array(buf));
   return json({ ok: true, size: buf.byteLength });
 }

@@ -2,83 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
+import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
 
-const BASE = 'http://r2novel.test';
-const ENV = {
-  ADMIN_PASSWORD: 'test-pass',
-  SESSION_SECRET: 'test-secret-0123456789abcdef',
-  SESSION_DAYS: '30',
-  MAX_UPLOAD: '52428800',
-  MAX_CHAPTER: '2097152',
-  BRUTE_LIMIT: '100',
-  BRUTE_LOCK_MS: '1000',
-  TRASH_DAYS: '15',
-  serveStatic: async () => null,
-};
-
-function memStore() {
-  const m = new Map();
-  return {
-    async getText(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return typeof v === 'string' ? v : new TextDecoder().decode(v);
-    },
-    async getBytes(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return v instanceof Uint8Array ? v : new TextEncoder().encode(String(v));
-    },
-    async putText(k, s) {
-      m.set(k, s);
-    },
-    async putBytes(k, b) {
-      m.set(k, b);
-    },
-    async delete(k) {
-      m.delete(k);
-    },
-    // 前缀列举（供彻底删除 meta 丢失时按前缀回收正文）
-    async list(prefix = '', maxPages = 0) {
-      const keys = [...m.keys()].filter((k) => k.startsWith(prefix)).sort();
-      return { objects: keys.map((k) => ({ key: k, size: 0 })), truncated: false, pages: 1, cursor: null };
-    },
-    _map: m,
-  };
-}
-
-function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
-  const h = new Headers(headers);
-  if (cookie) h.set('Cookie', cookie);
-  let opts = { method, headers: h };
-  if (body !== undefined) {
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    if (!h.has('content-type') && typeof body !== 'string') h.set('content-type', 'application/json');
-  }
-  return new Request(BASE + path, opts);
-}
-
-const call = async (store, r) => {
-  const res = await handleRequest(r, ENV, store);
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = text;
-  }
-  return { status: res.status, data, headers: res.headers, text };
-};
-
-async function login(store) {
-  const r = await call(store, req('/api/login', { method: 'POST', body: { password: 'test-pass' } }));
-  const sc = r.headers.get('set-cookie') || '';
-  const m = /rn_session=([^;]+)/.exec(sc);
-  assert.ok(m, '应下发 rn_session cookie');
-  return 'rn_session=' + m[1];
-}
-
-/** 建一本 ready 书（N 章 + 发布） */
 async function makeBook(store, cookie, title, n, chapters) {
   const chs = chapters || Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));
   let r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title, author: '作者', chapters: chs, wordCount: n * 10, cleanVer: 1 } }));
@@ -210,6 +135,21 @@ test('审计：append 追章 —— 全书字数 = 旧字数 + 新增字数（�
   const shelf = await call(store, req('/api/books', { cookie }));
   const b = shelf.data.books.find((x) => x.id === id);
   assert.equal(b.wordCount, 50, '书架镜像应一致');
+});
+
+test('审计：append 传负数 wordCount —— 总字数夹到 ≥0，不写负值', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeBook(store, cookie, '负数字数书', 3); // wordCount = 30
+  // 恶意/异常客户端：append 上报 -1000（旧实现会算成 30 - 1000 = -970 写进 meta/index）
+  const r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'append', chapters: ['第4章'], wordCount: -1000 } }));
+  assert.equal(r.status, 200);
+  const meta = JSON.parse(store._map.get(`meta/${id}.json`));
+  assert.ok(meta.wordCount >= 0, `总字数不应为负，实际 ${meta.wordCount}`);
+  // 再补一次正常追加以确认累加仍正确（不因夹取而丢增量）
+  await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'append', chapters: ['第5章'], wordCount: 10 } }));
+  const meta2 = JSON.parse(store._map.get(`meta/${id}.json`));
+  assert.equal(meta2.wordCount, Math.max(0, meta.wordCount) + 10, '夹取后增量累加仍准确');
 });
 
 test('审计：replace 章节数变少 —— 孤儿正文先清一批、publish 清完、meta 不残留', async () => {

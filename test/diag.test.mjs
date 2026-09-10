@@ -5,84 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
+import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
 
-const BASE = 'http://r2novel.test';
-const ENV = {
-  ADMIN_PASSWORD: 'test-pass',
-  SESSION_SECRET: 'test-secret-0123456789abcdef',
-  SESSION_DAYS: '30',
-  MAX_UPLOAD: '52428800',
-  MAX_CHAPTER: '2097152',
-  BRUTE_LIMIT: '100',
-  BRUTE_LOCK_MS: '1000',
-  TRASH_DAYS: '15',
-  serveStatic: async () => null,
-};
-
-function memStore() {
-  const m = new Map();
-  return {
-    async getText(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return typeof v === 'string' ? v : new TextDecoder().decode(v);
-    },
-    async getBytes(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return v instanceof Uint8Array ? v : new TextEncoder().encode(String(v));
-    },
-    async putText(k, s) {
-      m.set(k, s);
-    },
-    async putBytes(k, b) {
-      m.set(k, b);
-    },
-    async delete(k) {
-      m.delete(k);
-    },
-    async list(prefix = '') {
-      const out = [];
-      for (const [k, v] of m) {
-        if (k.startsWith(prefix)) out.push({ key: k, size: typeof v === 'string' ? v.length : v.byteLength });
-      }
-      return { objects: out, truncated: false, pages: 1 };
-    },
-    _map: m,
-  };
-}
-
-function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
-  const h = new Headers(headers);
-  if (cookie) h.set('Cookie', cookie);
-  const opts = { method, headers: h };
-  if (body !== undefined) {
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    if (!h.has('content-type') && typeof body !== 'string') h.set('content-type', 'application/json');
-  }
-  return new Request(BASE + path, opts);
-}
-
-const call = async (store, r) => {
-  const res = await handleRequest(r, ENV, store);
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = text;
-  }
-  return { status: res.status, data, headers: res.headers, text };
-};
-
-async function login(store) {
-  const r = await call(store, req('/api/login', { method: 'POST', body: { password: 'test-pass' } }));
-  assert.equal(r.status, 200);
-  const m = /rn_session=([^;]+)/.exec(r.headers.get('set-cookie') || '');
-  return 'rn_session=' + m[1];
-}
-
-/** 快捷建一本 ready 书（传 N 章 + 发布），返回 id */
 async function makeReadyBook(store, cookie, title, n) {
   const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));
   let r = await call(
@@ -229,6 +153,36 @@ test('diag：活书当前章节正文 / raw / progress 经 DELETE 一律拒删',
   // 扫描依旧干净（无残留可清理）
   const d = await diag(store, cookie);
   assert.equal(d.summary.residue, 0);
+});
+
+test('diag：回验吃满预算时删除阶段不被饿死（回验/删除预算分离）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  // 50 本活书：每本的章表外 key 都要 readBook 回验一次——旧实现（回验/删除共用预算）
+  // 会把 used 顶满 45 → 删除阶段 deleted=0；新实现回验上限 30，余下留给删除
+  const ids = [];
+  for (let i = 0; i < 50; i++) {
+    const r = await makeReadyBook(store, cookie, '宿主' + i, 1);
+    ids.push(r.id);
+  }
+  // 16 个非活书残留：排在最前，无需回验即进待删队列
+  const residue = [];
+  for (let i = 0; i < 16; i++) {
+    const k = `text/n_res00${i}/k.txt`;
+    store._map.set(k, '残留');
+    residue.push(k);
+  }
+  // 其后跟 50 个活书章表外 key，把回验预算吃满
+  const liveGhosts = ids.map((id) => `text/${id}/zz_ghost.txt`);
+  const del = await call(
+    store,
+    req('/api/diag/orphans', { method: 'DELETE', cookie, body: { objects: [...residue, ...liveGhosts] } })
+  );
+  assert.equal(del.status, 200);
+  // 旧实现：回验与删除共用计数器 → 回验把 used 顶满 → deleted=0，残留一条都清不掉
+  assert.ok(del.data.deleted > 0, `删除阶段不应被回验饿死，实际 deleted=${del.data.deleted}`);
+  const alive = residue.filter((k) => store._map.has(k));
+  assert.equal(alive.length, residue.length - del.data.deleted, '删除计数应与实际移除的对象数一致');
 });
 
 test('diag：书多导致预算耗尽时返回 incomplete 而非报错', async () => {

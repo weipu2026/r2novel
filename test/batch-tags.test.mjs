@@ -6,84 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
+import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
 
-const BASE = 'http://r2novel.test';
-const ENV = {
-  ADMIN_PASSWORD: 'test-pass',
-  SESSION_SECRET: 'test-secret-0123456789abcdef',
-  SESSION_DAYS: '30',
-  MAX_UPLOAD: '52428800',
-  MAX_CHAPTER: '2097152',
-  BRUTE_LIMIT: '100',
-  BRUTE_LOCK_MS: '1000',
-  TRASH_DAYS: '15',
-  serveStatic: async () => null,
-};
-
-function memStore() {
-  const m = new Map();
-  return {
-    async getText(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return typeof v === 'string' ? v : new TextDecoder().decode(v);
-    },
-    async getBytes(k) {
-      const v = m.get(k);
-      if (v === undefined) return null;
-      return v instanceof Uint8Array ? v : new TextEncoder().encode(String(v));
-    },
-    async putText(k, s) {
-      m.set(k, s);
-    },
-    async putBytes(k, b) {
-      m.set(k, b);
-    },
-    async delete(k) {
-      m.delete(k);
-    },
-    async list(prefix = '') {
-      const out = [];
-      for (const [k, v] of m) {
-        if (k.startsWith(prefix)) out.push({ key: k, size: typeof v === 'string' ? v.length : v.byteLength });
-      }
-      return { objects: out, truncated: false, pages: 1 };
-    },
-    _map: m,
-  };
-}
-
-function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
-  const h = new Headers(headers);
-  if (cookie) h.set('Cookie', cookie);
-  const opts = { method, headers: h };
-  if (body !== undefined) {
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    if (!h.has('content-type') && typeof body !== 'string') h.set('content-type', 'application/json');
-  }
-  return new Request(BASE + path, opts);
-}
-
-const call = async (store, r) => {
-  const res = await handleRequest(r, ENV, store);
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = text;
-  }
-  return { status: res.status, data, headers: res.headers, text };
-};
-
-async function login(store) {
-  const r = await call(store, req('/api/login', { method: 'POST', body: { password: 'test-pass' } }));
-  assert.equal(r.status, 200);
-  const m = /rn_session=([^;]+)/.exec(r.headers.get('set-cookie') || '');
-  return 'rn_session=' + m[1];
-}
-
-/** 快捷建一本 ready 书（传 2 章 + 发布），返回 id */
 async function makeReadyBook(store, cookie, title, tags = []) {
   const chapters = ['第1章 甲', '第2章 乙'];
   let r = await call(

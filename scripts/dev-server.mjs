@@ -155,6 +155,9 @@ function serveStatic(req, url) {
 }
 
 /* ---- 启动 ---- */
+if (!process.env.SESSION_SECRET) {
+  console.warn('· 未设置 SESSION_SECRET：本地开发暂用 ADMIN_PASSWORD 作 Cookie 签名密钥（生产必须单独设，见 .dev.vars.example）');
+}
 fs.mkdirSync(DATA, { recursive: true });
 const env = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,

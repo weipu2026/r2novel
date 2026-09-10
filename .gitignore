@@ -2,6 +2,7 @@ node_modules/
 .dev.vars
 data-dev/
 wrangler.local.toml
+.wrangler/
 *.log
 .ui-tests/
 shots/

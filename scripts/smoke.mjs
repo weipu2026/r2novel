@@ -5,13 +5,30 @@
  * SMOKE_CLEANUP=1：结束后自动彻底删除本次创建的测试书（CI 生产冒烟用，不留垃圾）；
  *                  遇到同名遗留测试书也会先清掉再重建，保证可重复执行。
  */
-const BASE = process.env.SMOKE_BASE || 'http://localhost:8088';
-const PASS = process.env.SMOKE_PASSWORD || requireEnv('ADMIN_PASSWORD') || '';
-const CLEANUP = process.env.SMOKE_CLEANUP === '1';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-function requireEnv(n) {
-  return process.env[n] || '';
+/* 与 dev-server 同款：本地跑冒烟时自动读仓库根的 .dev.vars，省去手动 export。
+ * 否则按文档「另开终端跑 node scripts/smoke.mjs」时 ADMIN_PASSWORD 为空 → 全部 401 假失败。
+ * 已存在的环境变量优先（CI 用 SMOKE_PASSWORD/ADMIN_PASSWORD 注入，不受影响）。 */
+function loadDevVars() {
+  try {
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const t = fs.readFileSync(path.join(root, '.dev.vars'), 'utf8');
+    for (const line of t.split('\n')) {
+      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+      if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
+    }
+  } catch {
+    /* 没有 .dev.vars 也能跑（用环境变量） */
+  }
 }
+loadDevVars();
+
+const BASE = process.env.SMOKE_BASE || 'http://localhost:8088';
+const PASS = process.env.SMOKE_PASSWORD || process.env.ADMIN_PASSWORD || '';
+const CLEANUP = process.env.SMOKE_CLEANUP === '1';
 
 let cookie = '';
 const failures = [];

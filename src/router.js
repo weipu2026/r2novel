@@ -62,36 +62,48 @@ async function dropBody(req) {
 }
 
 /** 读取请求体字节；带 x-content-gzip 标记时解压（产物超过 maxBytes 即中断流）。
- * 护栏动机：gzip 炸弹（KB 级压缩体解压成 GB）会把 Worker 内存（128MB）打爆——
- * 计数 TransformStream 在超限瞬间 error 掉管道，上游解压随之取消，内存有界。
- * 超限抛 Error('解压后超过上限')，解压损坏抛 Error('请求体解压失败')，由调用方映射状态码。 */
+ * 护栏动机：①gzip 炸弹（KB 级压缩体解压成 GB）②明文超大请求（客户端可不发 Content-Length，
+ * chunked 绕过声明值检查）——两者都会把 Worker 内存（128MB）打爆。
+ * 实现：全程流式 + 计数 TransformStream，超限瞬间 error 掉管道，上游读取/解压随之取消，
+ * 内存占用恒有界（旧实现先 req.arrayBuffer() 整体读入再判大小，护栏作用在事后，挡不住 OOM）。
+ * 错误语义（调用方按 message 映射状态码）：
+ *   解压后超过上限 / 请求体超过上限 → 413；请求体解压失败 → 400。 */
 async function readBodyBytes(req, maxBytes) {
-  const buf = await req.arrayBuffer();
-  // 明文路径同样受 maxBytes 约束：客户端可不发 Content-Length（chunked）绕过声明值检查，
-  // 不设此护栏的话超大明文体会被整个读进内存（Worker 128MB 上限）才在后续解析处失败。
-  if (buf.byteLength > maxBytes) throw new Error('请求体超过上限');
-  if (req.headers.get('x-content-gzip') !== '1' || !buf.byteLength) return buf;
+  // 声明值快速拒绝：省一次完整流读取（合法客户端都会带 Content-Length）
+  const declared = Number(req.headers.get('content-length') || 0);
+  if (declared > maxBytes) {
+    await dropBody(req);
+    throw new Error('请求体超过上限');
+  }
+  if (!req.body) return new Uint8Array(0);
+  const gz = req.headers.get('x-content-gzip') === '1';
   let over = false;
   let n = 0;
-  const stream = new Response(buf).body
-    .pipeThrough(new DecompressionStream('gzip'))
-    .pipeThrough(
-      new TransformStream({
-        transform(chunk, ctrl) {
-          n += chunk.byteLength;
-          if (n > maxBytes) {
-            over = true;
-            throw new Error('gunzip-over-limit');
-          }
-          ctrl.enqueue(chunk);
-        },
-      })
-    );
+  let src = req.body;
+  if (gz) {
+    try {
+      src = src.pipeThrough(new DecompressionStream('gzip'));
+    } catch {
+      throw new Error('请求体解压失败');
+    }
+  }
+  const counted = src.pipeThrough(
+    new TransformStream({
+      transform(chunk, ctrl) {
+        n += chunk.byteLength;
+        if (n > maxBytes) {
+          over = true;
+          throw new Error('body-over-limit');
+        }
+        ctrl.enqueue(chunk);
+      },
+    })
+  );
   try {
-    return await new Response(stream).arrayBuffer();
-  } catch (e) {
-    if (over) throw new Error('解压后超过上限');
-    throw new Error('请求体解压失败');
+    return await new Response(counted).arrayBuffer();
+  } catch {
+    if (over) throw new Error(gz ? '解压后超过上限' : '请求体超过上限');
+    throw new Error(gz ? '请求体解压失败' : '请求体读取失败');
   }
 }
 
@@ -358,13 +370,16 @@ async function apiLogin(req, env, store) {
       'Retry-After': String(Math.ceil(st.retryAfterMs / 1000)),
     });
   }
-  // 公开端点加固：合法登录体不足 100 字节，声明超大的请求直接拒收（不给恶意大 JSON 读进内存的机会）
-  const cl = Number(req.headers.get('content-length') || 0);
-  if (cl > 65536) {
-    await dropBody(req);
-    return json({ error: '请求体过大' }, 413);
+  // 公开端点加固：合法登录体不足 100 字节。走有界流式读取——即使客户端用 chunked
+  // 不声明 Content-Length，超大请求也会在 64KB 处被中断，不会读满内存。
+  // （本端点是唯一免鉴权入口，OOM 防护优先级最高；旧实现只看 content-length，可被绕过。）
+  let body;
+  try {
+    body = JSON.parse(await readBodyText(req, 65536));
+  } catch (e) {
+    if (e && (e.message === '请求体超过上限' || e.message === '解压后超过上限')) return json({ error: '请求体过大' }, 413);
+    body = {}; // 非法 JSON / 读取解压失败 → 统一走「口令错误」，不泄露内部细节
   }
-  const body = await req.json().catch(() => ({}));
   const pass = String(body.password || '');
   const admin = env.ADMIN_PASSWORD;
   if (!admin || !safeEqual(pass, admin)) {
@@ -562,13 +577,14 @@ async function apiPutChapter(req, env, store, id, key) {
     return json({ error: '章节不在章表中' }, 404);
   }
   const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
-  const declared = Number(req.headers.get('content-length') || 0);
-  if (declared > max) {
-    await dropBody(req);
-    return json({ error: '章节超过上限' }, 413);
+  // 有界读取（含声明值快速拒绝）：旧实现先 req.arrayBuffer() 整体读入再判大小，超限时内存已吃满
+  let buf;
+  try {
+    buf = await readBodyBytes(req, max);
+  } catch (e) {
+    if (e && (e.message === '请求体超过上限' || e.message === '解压后超过上限')) return json({ error: '章节超过上限' }, 413);
+    return json({ error: '章节内容读取失败' }, 400);
   }
-  const buf = await req.arrayBuffer();
-  if (buf.byteLength > max) return json({ error: '章节超过上限' }, 413);
   const text = new TextDecoder().decode(buf);
   const words = wordsOf(text);
   await store.putText(KEY.text(id, key), text);
@@ -638,7 +654,8 @@ async function apiPutRaw(req, env, store, id) {
     buf = await readBodyBytes(req, max);
   } catch (e) {
     if (e && (e.message === '解压后超过上限' || e.message === '请求体超过上限')) return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
-    return json({ error: '原件解压失败' }, 400);
+    if (e && e.message === '请求体解压失败') return json({ error: '原件解压失败' }, 400);
+    return json({ error: '原件读取失败' }, 400);
   }
   if (!buf.byteLength) return json({ error: '空文件' }, 400);
   if (buf.byteLength > max) return json({ error: `原件超过上限 ${(max / 1048576) | 0}MB` }, 413);
@@ -725,11 +742,11 @@ async function apiUpdateChapters(req, env, store, id) {
   }
   if (body.wordCount !== undefined) {
     // append 只传新增部分的字数 → 在旧字数上累加；replace 传的是整本字数 → 直接采用
-    // 负字数（异常客户端）在 replace 采用时即压回 0，不必等 publish 才修正
-    meta.wordCount =
-      op === 'append'
-        ? (Number(meta.wordCount) || 0) + (Number(body.wordCount) || 0)
-        : Math.max(0, Number(body.wordCount) || 0);
+    // 两条分支都要夹到 ≥0：异常/恶意客户端传负数会把总字数写成负值（replace 原本就夹了，append 漏了）
+    meta.wordCount = Math.max(
+      0,
+      op === 'append' ? (Number(meta.wordCount) || 0) + (Number(body.wordCount) || 0) : Number(body.wordCount) || 0
+    );
   }
   meta.cleanVer = (Number(meta.cleanVer) || 0) + 1;
   meta.updatedAt = now;
@@ -1374,6 +1391,10 @@ const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
 const DIAG_META_PAGE_BUDGET = 3; // meta/raw/progress 各自翻页上限（每页 ≤1000 对象 → 覆盖约 3000 本）
 const DIAG_TEXT_PAGE_BUDGET = 12; // text/ 单请求翻页上限（每页 ≤1000 对象）；超预算回传 textCursor 由前端续扫
 const DIAG_SUB_BUDGET = 45; // 扫描/删除单请求子请求软预算
+// 回验预算比总预算更紧：旧实现回验与删除共用同一计数器，待删清单里活书 key 一多，
+// 回验就把预算吃满 → 删除阶段 `deleted=0`，本可零成本删除的非活书残留被白白跳过（清理变慢）。
+// 给回验单独设上限，余下预算留给删除。
+const DIAG_VALIDATE_BUDGET = 30;
 
 async function apiDiagOrphans(url, store) {
   try {
@@ -1564,7 +1585,7 @@ async function apiPurgeOrphans(req, store) {
     if (metaCache.has(id)) {
       // 命中缓存
     } else {
-      if (used >= DIAG_SUB_BUDGET) break; // 预算尽：不回验也不删（宁漏勿错）
+      if (used >= DIAG_VALIDATE_BUDGET) break; // 回验预算尽：不回验也不删（宁漏勿错），余下预算留给删除
       used++;
       meta = await readBook(store, id);
       metaCache.set(id, meta);
@@ -1576,7 +1597,7 @@ async function apiPurgeOrphans(req, store) {
   }
   let deleted = 0;
   for (const k of toDelete) {
-    if (used >= DIAG_SUB_BUDGET) break; // 预算含删除本身，防超 50
+    if (used >= DIAG_SUB_BUDGET) break; // 总预算含删除本身，防超 50 子请求红线
     used++;
     await store.delete(k);
     deleted++;
@@ -1728,7 +1749,10 @@ async function opdsCatalog(req, env, store) {
   const hasNext = page * OPDS_PAGE < books.length;
   // feed 级 updated 用内容的最新时间（而非当前时间）：固定值让阅读器按条件请求判断
   // 「feed 没变化」，避免每次拉取都被误判有更新而反复全量重拉
-  const feedUpdated = books.length ? Math.max(...books.map((b) => b.updatedAt || b.createdAt || 0)) : Date.now();
+  // 用 reduce 而非 Math.max(...spread)：超大库（十万级）spread 会抛 RangeError（调用栈溢出）
+  const feedUpdated = books.length
+    ? books.reduce((mx, b) => Math.max(mx, b.updatedAt || b.createdAt || 0), 0)
+    : Date.now();
   const entry = (b) => {
     const ts = b.updatedAt || b.createdAt || Date.now();
     const author = b.author ? `      <author><name>${escXml(b.author)}</name></author>\n` : '';

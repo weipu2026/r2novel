@@ -9,14 +9,21 @@ export function bindBusy({ bar, text, mask }) {
   ui.mask = mask;
 }
 
+/** pct：0~1 的比例；传 null/非有限值表示「进度不可知」——只更新文案，不动进度条。
+ * 夹到 0~1 并防 NaN（曾经把文案串当 pct 传 → width:'NaN%' 进度条失效）。 */
 export function busy(pct, text) {
-  if (ui.bar) ui.bar.style.width = Math.round((pct || 0) * 100) + '%';
+  if (ui.bar && Number.isFinite(pct)) {
+    const p = Math.min(1, Math.max(0, Number(pct)));
+    ui.bar.style.width = Math.round(p * 100) + '%';
+  }
   if (ui.text) ui.text.textContent = text || '处理中…';
   if (ui.mask) ui.mask.classList.remove('hidden');
 }
 
 export function busyDone() {
   if (ui.mask) ui.mask.classList.add('hidden');
+  // 复位进度条：否则下次打开忙碌层会先显示上一次的残留宽度，直到首次 busy 更新
+  if (ui.bar) ui.bar.style.width = '0%';
 }
 
 /** 触发浏览器下载一个 Blob（整本导出走它，避免把大文本整份读进 JS 字符串） */

@@ -80,7 +80,10 @@ export function bindReader(root, navCb) {
     else if (act === 'next') goto(state.cur + 1);
     else if (act === 'toc') (mqDesktop() ? toggleSide : openToc)();
     else if (act === 'tocClose') closeToc();
-    else if (act === 'back') closeToc(), onNav && onNav();
+    else if (act === 'back') {
+      closeToc();
+      if (onNav) onNav();
+    }
     else if (act === 'pref') togglePref();
     else if (act === 'prefClose') closePref();
     else if (act === 'fontUp') setFont(1);

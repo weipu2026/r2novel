@@ -18,6 +18,8 @@ const PAGE = 60; // 书库分页
  * 继续手动输入；打新标签/标签治理后 chips 自动跟随。快照存 localStorage（打开即显）。 */
 const PRESET_SRC = 20;
 let presetTags = [];
+let presetTagsAt = 0; // 上次云端刷新时间（导航切换时去重，避免同一波操作连发多次 GET /api/tags）
+let presetTagsInflight = null;
 
 const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
@@ -468,16 +470,26 @@ function renderPresetChips() {
   syncPresetChips();
 }
 
-/** 云端刷新预设标签：取使用频次 top N，写快照并重渲染；未登录/网络失败静默保留快照 */
-async function refreshPresetTags() {
-  try {
-    const data = await api.tags();
-    presetTags = (data.tags || []).slice(0, PRESET_SRC).map((t) => t.tag);
-    local.setPresetTags(presetTags);
-    renderPresetChips();
-  } catch {
-    /* 保留本地快照（可能为空 → 不显示 chips） */
-  }
+/** 云端刷新预设标签：取使用频次 top N，写快照并重渲染；未登录/网络失败静默保留快照。
+ * 去重：3 秒内重复调用（boot 后立即进上传页/编辑弹层等）不再发请求；并发调用复用同一 Promise。
+ * 传 force=true 可绕过（标签治理等需立即反映结果的场景）。 */
+async function refreshPresetTags(force = false) {
+  if (!force && presetTagsInflight) return presetTagsInflight;
+  if (!force && Date.now() - presetTagsAt < 3000) return;
+  presetTagsAt = Date.now();
+  presetTagsInflight = (async () => {
+    try {
+      const data = await api.tags();
+      presetTags = (data.tags || []).slice(0, PRESET_SRC).map((t) => t.tag);
+      local.setPresetTags(presetTags);
+      renderPresetChips();
+    } catch {
+      /* 保留本地快照（可能为空 → 不显示 chips） */
+    } finally {
+      presetTagsInflight = null;
+    }
+  })();
+  return presetTagsInflight;
 }
 
 function progBadgeText(b) {
@@ -786,7 +798,7 @@ async function batchRun(action, payload, confirmText) {
   if (!selected.size) return;
   const ids = Array.from(selected);
   if (!(await confirmModal(confirmText, '执行'))) return;
-  busy(`批量操作中… 0/${ids.length}`);
+  busy(0, `批量操作中… 0/${ids.length}`);
   let ok = 0;
   let fail = 0;
   try {
@@ -799,12 +811,13 @@ async function batchRun(action, payload, confirmText) {
       } catch {
         fail += batch.length;
       }
-      busy(`批量操作中… ${Math.min(i + BATCH_PAGE, ids.length)}/${ids.length}`);
+      busy(Math.min(i + BATCH_PAGE, ids.length) / ids.length, `批量操作中… ${Math.min(i + BATCH_PAGE, ids.length)}/${ids.length}`);
     }
   } finally {
     busyDone();
   }
   exitBatchMode();
+  refreshPresetTags(true); // 标签可能变了：强制刷新 chips（不阻塞后面的书架刷新）
   await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
   toast(fail ? `完成 ${ok} 本，${fail} 本失败（可能是半成品书）` : `已更新 ${ok} 本`, 2600);
 }
@@ -922,7 +935,7 @@ function renderTagMgr(data) {
 /** 标签合并执行：remaining>0 时自动续调直到清完（每批 18 本受子请求预算约束）；
  * guard 用尽仍有剩余 → 明确提示续跑，不再静默截断 */
 async function tagMergeRun(from, to) {
-  busy('更新书籍标签…');
+  busy(0, '更新书籍标签…');
   let updated = 0;
   let left = 0;
   try {
@@ -930,6 +943,9 @@ async function tagMergeRun(from, to) {
       const r = await api.tagsMerge(from, to);
       updated += r.updated || 0;
       left = r.remaining || 0;
+      // 总量需首轮响应后才能得知（updated + remaining）；无总量时只更新文案、不推进度条
+      const total = updated + left;
+      busy(total ? updated / total : 1, total ? `更新书籍标签… ${updated}/${total}` : '更新书籍标签…');
       if (!left) break;
     }
   } catch (e) {
@@ -938,6 +954,7 @@ async function tagMergeRun(from, to) {
     return;
   }
   busyDone();
+  refreshPresetTags(true); // 治理后 chips 必须立即跟进（绕过 3 秒去重）
   await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
   toast(left ? `已更新 ${updated} 本，仍有 ${left} 本未处理——请重试一次` : to ? `已更新 ${updated} 本` : `已从 ${updated} 本书上移除`, 2600);
   // 确认弹层（confirmModal 共用 modalBox）已把标签管理弹层顶掉并关闭：
@@ -1515,6 +1532,12 @@ function runPreview() {
         : `按 ${cur} 编码解析失败，请换一种或改回自动检测`)
     : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected || '未识别（整本一章）'} · 处理 ${ms}ms`;
 
+  if (importing) {
+    // 批量导入：预览面板整段不可见（反馈走上传进度条），这里只需 pending.preview 数据。
+    // 跳过 renderPreviewChapters 的 ≤500 行 DOM 重建（每本一次，纯无效开销，大库批量导入会明显卡顿）
+    els.upPrev.classList.add('hidden');
+    return;
+  }
   els.upPrev.classList.remove('hidden');
   // 统计与列表交给 renderPreviewChapters 实时维护（预览可编辑后章数/字数会变）
   renderPreviewChapters();

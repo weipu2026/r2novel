@@ -137,6 +137,11 @@ const LS = {
   shelf: 'rn_shelf_cache',
   presetTags: 'rn_preset_tags',
 };
+// localStorage 一般 5MB/源（部分浏览器按 UTF-16 计只给 ~2.5M 字符）。书架快照超此上限即跳过写入，
+// 并提示一次——旧实现直接 setItem，超限抛 QuotaExceededError 被 catch 静默吞掉，
+// 大库「秒开快照」会无声失效（看起来有快照其实没有）。
+const SHELF_CACHE_MAX_CHARS = 1000000;
+let shelfCacheWarned = false;
 export const local = {
   getProg(id) {
     try {
@@ -177,9 +182,19 @@ export const local = {
   },
   setShelfCache(books) {
     try {
-      localStorage.setItem(LS.shelf, JSON.stringify({ books, at: Date.now() }));
+      const payload = JSON.stringify({ books, at: Date.now() });
+      if (payload.length > SHELF_CACHE_MAX_CHARS) {
+        if (!shelfCacheWarned) {
+          shelfCacheWarned = true;
+          console.warn(`书架快照过大（${payload.length} 字符 > ${SHELF_CACHE_MAX_CHARS}），已跳过本地缓存，本次及后续将走网络加载`);
+        }
+        return false;
+      }
+      localStorage.setItem(LS.shelf, payload);
+      return true;
     } catch {
-      /* 容量满则忽略（快照只是提速，非关键数据） */
+      /* 容量满 / 隐私模式禁用存储：快照只是提速，非关键数据 */
+      return false;
     }
   },
   /** 预设标签快照（上传页 chips：库里实际标签 top N，云端刷新后覆盖） */

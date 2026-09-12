@@ -61,26 +61,40 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  // only-if-cached 只允许 same-origin：其它组合交给浏览器默认处理，
+  // 否则下面的 fetch 会抛 TypeError（被 catch 吞成 503，掩盖真实原因）
+  if (req.cache === 'only-if-cached' && req.mode !== 'same-origin') return;
   // 动态/鉴权内容一律网络直走，绝不缓存（API、OPDS feed、整本导出——响应均 no-store）
   if (url.pathname.startsWith('/api/') || url.pathname === '/opds' || url.pathname.startsWith('/export/')) {
     event.respondWith(fetch(req).catch(() => new Response('', { status: 503 })));
     return;
   }
   // 静态：stale-while-revalidate
+  //
+  // 后台刷新的 Promise 必须挂进 event.waitUntil：命中缓存时我们立刻 return cached，
+  // respondWith 随之结束、事件生命周期结束，浏览器可以马上终止这个 SW —— 游离的
+  // 后台 fetch / cache.put 会被直接丢弃。原先只把它挂在 respondWith 链上，等于把
+  // 「部署后首个导航就拿到新 JS」做成了时灵时不灵（命中缓存时 cache.put 常常没落盘，
+  // 用户继续跑旧代码，且一直开着的 tab 永远不会重载 app.js）。
+  const cacheP = caches.open(CACHE);
+  const networkP = fetch(req, { cache: 'no-cache' }).then((res) => {
+    // cache:'no-cache' = 每次强制条件校验（ETag/304），绕开浏览器 HTTP 缓存的
+    // max-age 窗口（5 分钟），否则部署后首个导航仍可能拿到旧 JS/CSS
+    if (res && res.status === 200) cacheP.then((c) => c.put(req, res.clone())).catch(() => {});
+    return res;
+  });
+  event.waitUntil(networkP.then(() => {}, () => {}));
   event.respondWith(
-    caches.open(CACHE).then(async (cache) => {
+    cacheP.then(async (cache) => {
       const cached = await cache.match(req);
-      // cache:'no-cache' = 每次强制条件校验（ETag/304）：部署后首个导航就能拿到新 JS，
-      // 不再受浏览器 HTTP 缓存 max-age 窗口（5 分钟）影响——此前 SWR 走默认缓存，
-      // 部署后用户可能连跑几十分钟旧代码，且「一直开着的 tab」永远不会重载 app.js
-      const network = fetch(req, { cache: 'no-cache' })
-        .then((res) => {
-          if (res && res.status === 200) cache.put(req, res.clone()).catch(() => {});
-          return res;
-        })
-        // 离线且从未缓存过 → 兜底 503，避免 respondWith 解析出 undefined 抛错
-        .catch(() => cached || new Response('', { status: 503 }));
-      return cached || network;
+      if (cached) return cached;
+      // 未缓存过（首次访问/缓存被清理）→ 沿用同一个在途请求；离线时兜底 503，
+      // 避免 respondWith 解析出 undefined 抛错
+      try {
+        return await networkP;
+      } catch {
+        return new Response('', { status: 503 });
+      }
     })
   );
 });

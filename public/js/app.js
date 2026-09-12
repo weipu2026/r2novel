@@ -519,7 +519,7 @@ async function refreshPresetTags(force = false) {
   if (!force && presetTagsInflight) return presetTagsInflight;
   if (!force && Date.now() - presetTagsAt < 3000) return;
   presetTagsAt = Date.now();
-  presetTagsInflight = (async () => {
+  const task = (async () => {
     try {
       const data = await api.tags();
       presetTags = (data.tags || []).slice(0, PRESET_SRC).map((t) => t.tag);
@@ -528,10 +528,13 @@ async function refreshPresetTags(force = false) {
     } catch {
       /* 保留本地快照（可能为空 → 不显示 chips） */
     } finally {
-      presetTagsInflight = null;
+      // 只清理「仍然是自己」的引用：force 刷新会覆盖 presetTagsInflight，
+      // 无条件置 null 会把后来者的引用一并抹掉，使并发复用/去重失效
+      if (presetTagsInflight === task) presetTagsInflight = null;
     }
   })();
-  return presetTagsInflight;
+  presetTagsInflight = task;
+  return task;
 }
 
 /** 阅读状态：'unread' 未读 / 'reading' 在读 / 'done' 已读完。
@@ -560,7 +563,10 @@ function progBadgeText(b) {
   if (st === 'done') return '✓ 已读完';
   const cc = b.chapterCount || 0;
   if (cc <= 0) return '在读';
-  return `读到 ${Math.max(1, Math.min(b.prog.ch || 0, cc))}/${cc} 章`;
+  const first = Math.min(b.prog.ch || 0, cc);
+  // 章号为 0/负（脏数据，或只标了「在读」还没真正翻过章）时不编造「读到 1/N 章」
+  if (first <= 0) return '在读';
+  return `读到 ${first}/${cc} 章`;
 }
 
 function makeCard(b, big) {
@@ -1036,6 +1042,9 @@ async function tagMergeRun(from, to) {
   } catch (e) {
     busyDone();
     toast('失败：' + (e.message || e), 2600);
+    // 确认弹层已把标签管理弹层顶掉并关闭：失败时若不重建，用户会被留在
+    // 「没有任何弹层」的书架上，看不到标签、也不知从哪重试
+    await openTagMgr();
     return;
   }
   busyDone();

@@ -25,7 +25,7 @@
  *     剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
  */
 
-import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS } from '../public/js/shared-const.js';
+import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS, READ_DONE_RATIO } from '../public/js/shared-const.js';
 
 const SESSION_COOKIE = 'rn_session';
 
@@ -1119,7 +1119,15 @@ async function apiProgressPut(req, store, id) {
     const cap = Number(book.chapterCount) || 0;
     const mch = cap > 0 && ch > cap ? cap : ch;
     const cur = book.prog;
-    if (!cur || cur.ch !== mch) {
+    // 刷新条件＝「换章」或「读完状态翻转」。
+    // 原实现只有前者：而读完一本书的典型动作是停在末章继续往下滚到底——章号不变、
+    // 只有 ratio 变，原条件永远不成立 → 书架镜像的 ratio 停在旧值，角标「已读完」
+    // 在实践中几乎永远点不亮。补上状态翻转后：跨过阈值那一刻多写恰 1 次 index，
+    // 已读完后继续滚动不再写，仍然不产生写放大（这正是当初只在换章时写的动机）。
+    const isDone = cap > 0 && mch >= cap && ratio >= READ_DONE_RATIO;
+    const curDone =
+      !!cur && cap > 0 && Math.min(Number(cur.ch) || 0, cap) >= cap && (Number(cur.ratio) || 0) >= READ_DONE_RATIO;
+    if (!cur || cur.ch !== mch || curDone !== isDone) {
       const books = (index.books || []).map((b) => (b.id === id ? { ...b, prog: { ch: mch, ratio, updatedAt: data.updatedAt } } : b));
       await writeIndex(store, { books });
     }

@@ -29,3 +29,9 @@ export const EXPORT_MAX_CHAPTERS = 40;
 
 /** 回收站保留天数（超期由业务请求时机惰性清除；env.TRASH_DAYS 可覆盖此默认值） */
 export const TRASH_DAYS = 15;
+
+/** 「已读完」判定阈值：停在末章且本章滚动比例 ≥ 此值即视为读完。
+ * 前后端必须一致——前端书架角标（app.js readState）与后端进度镜像刷新
+ * （router.js apiProgressPut）各判一次，阈值漂移会出现「角标说读完了但镜像不刷新」的错位。
+ * 取 0.9 而非 1：手机端末章末尾常带留白/padding，滚到底未必精确到 1，太严会导致读完也点不亮。 */
+export const READ_DONE_RATIO = 0.9;

@@ -1,6 +1,6 @@
 /* app.js — 登录 / 书架（M2 管理）/ 上传 / 回收站 / 阅读入口（电脑上传为主，手机阅读为主） */
 import { api, local, fmtWords, ApiError } from './store.js';
-import { BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, CHAPTER_MAX, TRASH_DAYS } from './shared-const.js';
+import { BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, CHAPTER_MAX, TRASH_DAYS, READ_DONE_RATIO } from './shared-const.js';
 import * as cleaner from './cleaner.js';
 import * as reader from './reader.js';
 import { bindBusy, busy, busyDone } from './ui.js';
@@ -314,9 +314,10 @@ function sortedBooks(list) {
 function renderShelf() {
   els.shelfCount.textContent = books.length ? `共 ${books.length} 本 · ${fmtWords(books.reduce((s, b) => s + (b.wordCount || 0), 0))}` : '';
 
-  // 继续阅读：所有有进度的书按「云端最后阅读时间」倒序取前 3（prog 镜像，电脑/手机一致）
+  // 继续阅读：有进度且**还没读完**的书，按云端最后阅读时间倒序取前 3（prog 镜像，电脑/手机一致）。
+  // 读完的书不再占「继续阅读」位——读完了就该从待读队列退出去（手动标记读完后同样退出）。
   const reading = books
-    .filter((b) => b.prog && b.prog.updatedAt > 0)
+    .filter((b) => b.prog && b.prog.updatedAt > 0 && readState(b) !== 'done')
     .sort((a, b) => (b.prog.updatedAt || 0) - (a.prog.updatedAt || 0))
     .slice(0, 3);
   els.continueWrap.classList.toggle('hidden', !reading.length);
@@ -492,24 +493,43 @@ async function refreshPresetTags(force = false) {
   return presetTagsInflight;
 }
 
-function progBadgeText(b) {
+/** 阅读状态：'unread' 未读 / 'reading' 在读 / 'done' 已读完。
+ * 已读完＝手动标记（b.readDone，来自 PATCH /api/books/:id，已镜像进 index）优先；
+ * 否则按「停在末章 && 本章滚动比例 ≥ READ_DONE_RATIO」自动判定。
+ * 阈值放宽到 0.9（原 0.96）：手机末章末尾常有留白，原阈值下「读完」几乎点不亮。
+ * 注意：书架上的 b.prog 是 index 进度镜像，章内滚动不实时刷新（为消除写放大做的取舍），
+ * 所以角标只报章号、不再报百分比——章号是准的（仅换章时变），百分比注定滞后。 */
+function readState(b) {
+  if (b.readDone === true) return 'done';
   const p = b.prog;
-  if (!p || !p.updatedAt) return '';
+  if (!p || !p.updatedAt) return 'unread';
   const cc = b.chapterCount || 0;
-  if (p.ch <= 0 || cc <= 0) return '';
+  if (p.ch <= 0 || cc <= 0) return 'reading';
   // 就地删章后 progress 章号可能略超当前章数（服务端会压回，历史脏数据/竞态窗口仍可能越界）：
   // 展示层 clamp，避免角标出现「读到 5/4 章」这类自相矛盾的数字
   const ch = Math.min(p.ch, cc);
-  const done = ch >= cc && p.ratio > 0.96;
-  if (done) return '已读完';
-  const pct = ch >= cc ? Math.round((p.ratio || 0) * 100) : Math.round(((ch - 1 + (p.ratio || 0)) / cc) * 100);
-  return `读到 ${ch}/${cc} 章 · ${Math.max(1, Math.min(99, pct))}%`;
+  return ch >= cc && (p.ratio || 0) >= READ_DONE_RATIO ? 'done' : 'reading';
+}
+
+function progBadgeText(b) {
+  const st = readState(b);
+  if (st === 'unread') return '';
+  if (st === 'done') return '✓ 已读完';
+  const cc = b.chapterCount || 0;
+  if (cc <= 0) return '在读';
+  return `读到 ${Math.max(1, Math.min(b.prog.ch || 0, cc))}/${cc} 章`;
 }
 
 function makeCard(b, big) {
   const c = document.createElement('button');
   c.type = 'button';
-  c.className = 'card' + (big ? ' big' : '') + (b.pinned ? ' pinned' : '') + (batchMode ? ' picking' : '') + (selected.has(b.id) ? ' picked' : '');
+  c.className =
+    'card' +
+    (big ? ' big' : '') +
+    (b.pinned ? ' pinned' : '') +
+    (readState(b) === 'done' ? ' read-done' : '') +
+    (batchMode ? ' picking' : '') +
+    (selected.has(b.id) ? ' picked' : '');
   const block = document.createElement('span');
   block.className = 'card-block';
   block.style.background = colorOf(b.title);
@@ -548,7 +568,7 @@ function makeCard(b, big) {
     const badge = progBadgeText(b);
     if (badge) {
       const p = document.createElement('span');
-      p.className = 'prog-badge' + (badge === '已读完' ? ' done' : '');
+      p.className = 'prog-badge' + (readState(b) === 'done' ? ' done' : '');
       p.textContent = badge;
       c.appendChild(p);
     }

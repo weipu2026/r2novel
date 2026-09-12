@@ -12,6 +12,9 @@ html { color-scheme: only light; } /* only light：比 light 更强的声明，�
   --muted: #8a8a82;
   --accent: #b3692e;
   --accent-weak: #f3e2d3;
+  /* 我的标记色：星标 ★ 与置顶金条共用（两者同属「我的组织动作」）。
+     原先 #d9a01f 在卡片标记相关规则里重复 5 次，收敛到这里。 */
+  --mark: #d9a01f;
   --chrome: #20242c;
   --chrome-fg: #e8e6e0;
   --danger: #c0392b;
@@ -134,17 +137,11 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
   display: flex; flex-direction: column; align-items: stretch; text-align: left;
   box-shadow: 0 1px 2px rgba(0,0,0,.04); cursor: pointer; color: var(--fg);
 }
-.card.big {
-  flex-direction: row; align-items: center; gap: 12px;
-  background: #fff8f0; border: 1px solid var(--accent-weak);
-}
 .card-block {
   width: 44px; height: 58px; border-radius: 8px; color: #fff; flex: none;
   display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 600;
 }
-.card.big .card-block { width: 52px; height: 68px; font-size: 24px; }
 .card-info { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.card.big .card-info { margin-top: 0; }
 .card-info em {
   font-style: normal; font-weight: 600; font-size: 14.5px; overflow: hidden;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; /* 书名最多两行，多余截断 */
@@ -495,24 +492,38 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 .tag-chips button:hover { border-color: var(--accent); color: var(--accent); }
 .tag-chips button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-/* 「完结」＝这本书本身写完了（书属性，用户手标）；「已读完」＝我的阅读状态（实心主题色印章）。
-   两者刻意用不同形制区分：完结走青绿描边、已读完走实心主题色，书一多也不会看混。 */
-.card .finish-pill {
-  display: inline-block; align-self: flex-start; margin-top: 4px;
-  background: transparent; color: #2f9e8f; border: 1px solid #2f9e8f;
-  border-radius: 999px; padding: 0 7px; font-size: 11px;
+/* 卡面标记分三类语义、各一种形制（不再混用）：
+   · 我的阅读状态（在读 / 已读完）→ 右上角 .prog-badge 角标，未读不画
+   · 我的组织动作（星标 / 置顶）→ 统一金色 #d9a01f：★ 浮层 + 整卡左边缘金条
+   · 书本身的属性（完结）→ 不在卡面显示，靠筛选行按需查看
+   「完结」胶囊已移除：它固定占 34px + 4px 间距 = 元信息行宽的 27%，一出现就把末尾的
+   「3.2 万」挤掉（实测桌面行宽 143px，`完结 · 仙侠 · 12 章 · 3.2 万字` 需 148px）。
+   完结信息仍在三处可达：筛选行「完结 / 连载中」频道、编辑弹窗勾选框、批量标记。 */
+/* 星标：金色 ★ 浮层。绝对定位、不进文档流 → 不再撑高卡片（原胶囊版会把卡片撑高 26px）。
+   与置顶金条同色——两者同属「我的组织动作」，同色是对的，形制不同是因为落点不同。
+   白描边保证压在深色书脊上时仍看得清。 */
+.card .card-star {
+  position: absolute; z-index: 2; pointer-events: none;
+  font-size: 13px; line-height: 1; color: var(--mark);
+  text-shadow: 0 0 1.5px #fff, 0 0 1.5px #fff, 0 1px 2px rgba(0,0,0,.22);
 }
-/* 「完结」+「星标」同处一行：两个标记可以同时存在，各占一行会白留一行高度。
-   行本身承担原来的 margin-top: 4px，行内胶囊归零 —— 单标记时渲染与合并前完全一致。 */
-.card .card-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-.card .card-flags .finish-pill,
-.card .card-flags .star-pill { margin-top: 0; }
-/* 星标：与「完结」同形制的小胶囊，只换配色——完结＝这本书本身写完了（青绿描边），
-   星标＝我的私人收藏（暖金填充）。同形制是为了书一多也不会把两种标记看混。 */
-.card .star-pill {
-  display: inline-block; align-self: flex-start;
-  background: #fdf6e6; color: #a97c1a; border: 1px solid #f0dca6;
-  border-radius: 999px; padding: 0 7px; font-size: 11px;
+@media (min-width: 481px) {
+  .card .card-star { right: 8px; top: 8px; }
+  /* 角标本身在 right:8 / top:8 且高 21px → 有角标时 ★ 下移到角标正下方，避免叠字。
+     ⚠️ 这条相邻选择器依赖 .prog-badge 是 .card 直接子元素、且紧邻 .card-star ——
+     改动 makeCard 里的 append 顺序会静默错位（★ 会重新盖住角标）。 */
+  .card .prog-badge + .card-star { top: 32px; }
+}
+@media (max-width: 480px) {
+  /* 手机列表卡是横排：色点在左（top 24 起）、书名从 x=32 起，只有色点上方
+     这条 x∈[12,32] 的窄带恒空（★ 实测宽 10.6px，刚好容一枚，两枚就会压书名）。
+     所以置顶不走图标而走左金条——形制不同，色系相同。 */
+  .card .card-star { left: 12px; top: 6px; }
+  /* 防御性规则（当前永不生效）：makeCard 里 ★ 只在与 batchMode 互斥的 else 分支创建，
+     而 .picking 只在 batchMode 时加 → 两者本不同框。留着是因为勾选圈 .pick-tick 占
+     x∈[8,30] / y∈[8,30]，与 ★ 手机端落点（x∈[12,23] / y∈[6,19]）确实重叠——
+     万一将来 ★ 挪出 else 分支，这条能挡住叠字。 */
+  .card.picking .card-star { display: none; }
 }
 .modal-box .m-field label.finish-row {
   display: flex; align-items: center; justify-content: space-between; cursor: pointer;
@@ -534,7 +545,14 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
    只弱化「色点」与书名色，让读完的卡片在列表里一眼退到背景层。 */
 .card.read-done .card-block { filter: grayscale(.85); opacity: .5; }
 .card.read-done .card-info em { color: var(--muted); }
-.card.pinned .card-block { box-shadow: 0 0 0 2px #e0b23c; }
+/* 置顶＝我的组织动作，与星标同色 #d9a01f。必须挂在 .card 自己身上而不是 .card-block：
+   色块带 `.read-done` 的 `filter: grayscale(.85); opacity: .5`，实测会把色块上的金环
+   #E0B23C 洗成 #FFFFFF —— 与卡片底色完全相同，「置顶 + 已读完」的书上金环会彻底消失。
+   改走整卡左边缘 3px 金条（手机端本来就是这个形制），两端一致，语义也贴切（置顶改的是位置）。 */
+.card.pinned { box-shadow: inset 3px 0 0 var(--mark), 0 1px 2px rgba(0,0,0,.04); }
+/* 勾选光环与置顶金条同为 box-shadow，后写的会整体覆盖前者 —— 必须显式合并两者，
+   否则「批量选中 + 已置顶」的卡片上会丢掉其中一个标记（特异性 3 类 > 2 类，位置无关）。 */
+.card.picked.pinned { box-shadow: inset 3px 0 0 var(--mark), 0 0 0 2px var(--accent-weak); }
 .card .card-more {
   position: absolute; right: 4px; bottom: 4px; background: none; border: 0; color: var(--muted);
   font-size: 15px; padding: 4px 8px; cursor: pointer; z-index: 3; line-height: 1;
@@ -645,7 +663,6 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
   .card-info { margin-top: 10px; gap: 5px; }
   .card-info em { font-size: 15.5px; }
   .card-info small { font-size: 12.5px; }
-  .card.big .card-block { width: 60px; height: 78px; font-size: 26px; }
   /* 卡片标题允许两行（不会被强行截） */
   .card-info em {
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
@@ -769,6 +786,22 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
     transform: translateY(-2px);
   }
   .grid .card { transition: box-shadow .16s ease, transform .16s ease; }
+  /* ⚠️ 上面那条 hover 规则特异性 0,4,0（.grid + .card + :not(.big) + :hover），
+     会把挂在 .card 上的标记阴影整体覆盖掉（.card.pinned 0,2,0 / .card.picked.pinned 0,3,0
+     全都输给它）→ 桌面鼠标悬停置顶卡时金条直接消失，又因 .grid .card 带 .16s 过渡，
+     表现为金条淡出再淡入。置顶原先挂子元素 .card-block（与作用于 .card 的 hover 不相干），
+     搬到 .card 上才暴露，所以这里按「标记 × hover」逐个把阴影合并回来。
+     特异性 0,5,0 稳压上面那条；位置也放在其后，双保险。
+     注：.card.picked 的光环原本就有同样毛病（选中卡悬停时光环消失），一并修掉。 */
+  .grid .card.pinned:not(.big):hover {
+    box-shadow: inset 3px 0 0 var(--mark), 0 4px 14px rgba(0,0,0,.08);
+  }
+  .grid .card.picked:not(.big):hover {
+    box-shadow: 0 0 0 2px var(--accent-weak), 0 4px 14px rgba(0,0,0,.08);
+  }
+  .grid .card.picked.pinned:not(.big):hover {
+    box-shadow: inset 3px 0 0 var(--mark), 0 0 0 2px var(--accent-weak), 0 4px 14px rgba(0,0,0,.08);
+  }
   .trash-item .t-acts button:hover { border-color: var(--accent); color: var(--accent); }
 }
 
@@ -871,10 +904,6 @@ button.danger:hover { background: #fbeeec; }
   .top-actions button { padding: 6px 8px; font-size: 12px; }
   .top-actions button.primary { padding: 6px 9px; font-size: 12.5px; }
 
-  /* 继续阅读大卡也走列表形态（与全部书籍一致）：大色块→小色点、去 accent 边框 */
-  .card.big { background: var(--panel); border: 0; }
-  .card.big .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; }
-
   /* 书架改单列紧凑列表（A1）：伪封面缩为小色点（保留同书同色辨识），
      书名不截断（最多两行），进度从右上胶囊改为信息行——一屏可见 ~14 本 */
   .grid { grid-template-columns: 1fr; gap: 8px; }
@@ -898,5 +927,4 @@ button.danger:hover { background: #fbeeec; }
   }
   .card.picking .card-block { display: none; } /* 批量勾选：左上勾选圈替代色点 */
   .card .pick-tick { top: 50%; transform: translateY(-50%); }
-  .card.pinned { box-shadow: inset 3px 0 0 #e0b23c, 0 1px 2px rgba(0,0,0,.04); } /* 置顶：左侧金条 */
 }

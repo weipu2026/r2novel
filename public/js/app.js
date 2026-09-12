@@ -342,7 +342,7 @@ function renderShelf() {
   els.continueWrap.classList.toggle('hidden', !reading.length);
   if (reading.length) {
     els.continueCard.innerHTML = '';
-    for (const b of reading) els.continueCard.appendChild(makeCard(b, false));
+    for (const b of reading) els.continueCard.appendChild(makeCard(b));
   }
 
   const list = sortedBooks(filteredBooks());
@@ -356,7 +356,7 @@ function renderGrid(list) {
   const grid = els.grid;
   grid.innerHTML = '';
   const shown = list.slice(0, ui.page * PAGE);
-  for (const b of shown) grid.appendChild(makeCard(b, false));
+  for (const b of shown) grid.appendChild(makeCard(b));
   const hasMore = shown.length < list.length;
   els.loadMoreBtn.classList.toggle('hidden', !hasMore);
   if (!list.length) {
@@ -599,13 +599,12 @@ function progBadgeText(b) {
   return `读到 ${first}/${cc} 章`;
 }
 
-function makeCard(b, big) {
+function makeCard(b) {
   // 卡片本体必须是 div（role=button）而不是 <button>：卡内还要放 ⋯ 按钮，
   // HTML 禁止交互元素嵌套（button>button 非法，部分浏览器/读屏的焦点与点击语义会异常）
   const c = document.createElement('div');
   c.className =
     'card' +
-    (big ? ' big' : '') +
     (b.pinned ? ' pinned' : '') +
     (readState(b) === 'done' ? ' read-done' : '') +
     (batchMode ? ' picking' : '') +
@@ -620,27 +619,18 @@ function makeCard(b, big) {
   t.textContent = b.title;
   const m = document.createElement('small');
   const tags = (b.tags || []).slice(0, 2).join(' · ');
-  m.textContent = [tags, `${b.chapterCount || 0} 章`, fmtWords(b.wordCount)].filter(Boolean).join(' · ');
+  // 「完结」标记从卡面撤掉后，元信息行在桌面最紧只有 143px（882px 视口），余量刚好归零；
+  // 故把「3.2 万字」省成「3.2 万」再回收约 11px——「万」本身已表量级，不歧义。
+  // 一万以下仍保留「845 字」（纯数字看不懂）。fmtWords 是 store.js 的共享函数，
+  // 书架总计 / 上传统计 / 章节编辑器等处照旧，这里只做卡片局部精简。
+  const wc = fmtWords(b.wordCount).replace(/ 万字$/, ' 万');
+  m.textContent = [tags, `${b.chapterCount || 0} 章`, wc].filter(Boolean).join(' · ');
   info.appendChild(t);
   info.appendChild(m);
-  // 「完结」与「星标」塞进同一个标记行：两者可以同时存在，各占一行会白留一行高度
-  // （这本书正好又是「完结」又是「星标」时最明显）。单标记出现时渲染与原来一致——
-  // 标记行自带 margin-top: 4px，行内胶囊的 margin-top 归零。
-  // 放 info 里而不是绝对定位：桌面网格卡 / 手机列表卡两套布局都自动适配，不必各写一套定位。
-  const flags = [];
-  if (b.finished) flags.push(['finish-pill', '完结']);
-  if (b.star) flags.push(['star-pill', '★ 星标']);
-  if (flags.length) {
-    const row = document.createElement('span');
-    row.className = 'card-flags';
-    for (const [cls, text] of flags) {
-      const f = document.createElement('span');
-      f.className = cls;
-      f.textContent = text;
-      row.appendChild(f);
-    }
-    info.appendChild(row);
-  }
+  // 卡面不再放「完结」标记：它固定占 34px + 4px 间距 = 元信息行宽的 27%，
+  // 一出现就把末尾的「3.2 万」挤掉（实测 `完结 · 仙侠 · 12 章 · 3.2 万字` 需 148px > 可用 143px）。
+  // 它属于「书本身的属性」而不是我的标记，改成按需查看更合适——筛选行「完结 / 连载中」频道、
+  // 编辑弹窗的「已完结」勾选框、批量标记三处都能看能改，服务端 finished 字段不受影响。
   c.appendChild(block);
   c.appendChild(info);
   if (batchMode) {
@@ -664,18 +654,29 @@ function makeCard(b, big) {
       p.textContent = badge;
       c.appendChild(p);
     }
-    if (!big) {
-      const more = document.createElement('button');
-      more.type = 'button';
-      more.className = 'card-more';
-      more.textContent = '⋯';
-      more.addEventListener('click', (e) => {
-        e.stopPropagation();
-        // 传触发按钮本身：桌面端操作单要贴着它展开（右上角 ⋯ 就在右上角弹，卡片 ⋯ 就在卡片旁弹）
-        openSheet(b, e.currentTarget);
-      });
-      c.appendChild(more);
+    // 星标＝金色 ★ 浮层（绝对定位，不进文档流）。原「★ 星标」胶囊与「完结」同行时，
+    // 标记行会把卡片撑高 26px（桌面一排高低不齐、手机单卡多占 24px），浮层则完全不影响卡高。
+    // ⚠️ 必须紧跟 .prog-badge 之后且为同级兄弟：CSS 用 `.prog-badge + .card-star` 区分
+    // 「有角标 → 下移」与「无角标 → 贴顶」两种落点，中间插入别的元素会静默错位。
+    // 也须是 .card 直接子元素：挂在 .card-block 里会被 `.read-done` 的 grayscale 一起灰掉。
+    if (b.star) {
+      const s = document.createElement('span');
+      s.className = 'card-star';
+      s.setAttribute('role', 'img');
+      s.setAttribute('aria-label', '已加星标');
+      s.textContent = '★';
+      c.appendChild(s);
     }
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'card-more';
+    more.textContent = '⋯';
+    more.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // 传触发按钮本身：桌面端操作单要贴着它展开（右上角 ⋯ 就在右上角弹，卡片 ⋯ 就在卡片旁弹）
+      openSheet(b, e.currentTarget);
+    });
+    c.appendChild(more);
     c.addEventListener('click', () => openRead(b.id));
   }
   // div 卡片的键盘可达性（原 <button> 自带，改 div 后补上）：Enter/Space 触发与点击一致。
@@ -1030,7 +1031,7 @@ function batchEditTags() {
   openModal(`
     <h3>批量改标签 <span class="muted">(${selected.size} 本)</span></h3>
     <div class="m-field">
-      <input id="btInput" class="input" type="text" placeholder="多个标签用逗号分隔，如：玄幻, 完结自用" autocomplete="off">
+      <input id="btInput" type="text" placeholder="多个标签用逗号分隔，如：玄幻, 完结自用" autocomplete="off">
       <div id="btChips" class="tag-chips"></div>
       <p class="modal-sub">「添加」把标签加到所选书；「移除」从所选书去掉这些标签</p>
     </div>
@@ -1089,7 +1090,7 @@ function renderTagMgr(data) {
       <div class="tm-row" data-tag="${esc(t.tag)}">
         <span class="tm-name" title="${esc(t.tag)}">${esc(t.tag)}</span>
         <span class="tm-count">${t.count} 本</span>
-        <input class="input tm-input" type="text" placeholder="改名 / 合并到…" autocomplete="off">
+        <input class="tm-input" type="text" placeholder="改名 / 合并到…" autocomplete="off">
         <button class="ghost slim tm-go" type="button" title="把「${esc(t.tag)}」改成或合并到左侧输入的标签">${IC.arrow}</button>
         <button class="ghost slim tm-del danger" type="button" title="从所有书上移除该标签">${IC.x}</button>
       </div>`
@@ -2150,7 +2151,7 @@ async function openChapterEditor(b) {
   ceState.dirty = false;
   ceBodies.clear();
   openModal(`
-    <div class="ce-head">
+    <div>
       <h3>编辑章节</h3>
       <p id="ceStat" class="ce-stat modal-sub"></p>
     </div>

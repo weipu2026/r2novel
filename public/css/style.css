@@ -364,17 +364,13 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 #readArt .ch-retry:hover { opacity: 1; }
 
-/* 工具栏自动隐藏（仅触屏窄屏；轻点正文空白唤出/收起）
-   双轨过渡：transform 负责滑入方向感，opacity 保证合成器全程持有正确的
-   backdrop 采样——纯 transform 位移会让部分手机把带 blur 的层渲染成白条 */
-@media (max-width: 899.98px) {
-  .read-top { transition: transform .22s ease, opacity .22s ease; }
-  .read-bar { transition: transform .22s ease, opacity .22s ease; }
-  #view-read.bars-hid .read-top { transform: translateY(-100%); opacity: 0; }
-  #view-read.bars-hid .read-bar { transform: translateY(100%); opacity: 0; }
-  /* 隐藏态彻底不响应点击：防止视觉上已消失却仍拦截正文点击（唤不出工具栏的经典诱因） */
-  #view-read.bars-hid .read-top, #view-read.bars-hid .read-bar { pointer-events: none; }
-}
+/* 工具栏常驻（手机端也不再隐藏）。
+   历史决策：曾做「轻点正文隐藏/唤出」的沉浸模式，但 .read-top/.read-bar 是
+   position:fixed + translateY 滑出屏幕，而正文区 #readScroll 的 top/bottom 是
+   写死的（44px / 46px+safe-area），与工具栏显隐无关 —— 工具栏一滑走，上下就露出
+   与正文不同色的两条底带（难看），而正文区并没有变大（纯亏）。故改为常驻。
+   附带收益：不再有 transform 位移动画，合成器丢 backdrop 采样把工具栏渲染成
+   白条的老问题（夜间主题下浅字压白底直接隐形）一并消失。 */
 
 /* 目录抽屉 */
 .drawer {

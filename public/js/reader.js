@@ -38,7 +38,6 @@ function defaultPref() {
 let els = {};
 let onNav = null;
 const mqDesktop = () => matchMedia('(min-width: 900px)').matches;
-const mqTouch = () => matchMedia('(pointer: coarse)').matches;
 
 let flushBound = false;
 
@@ -107,18 +106,15 @@ export function bindReader(root, navCb) {
   // 设置面板滑杆：拖动实时预览（值域与钳制在 setFontSize/setLineHeight 内）
   if (els.ppFsRange) els.ppFsRange.addEventListener('input', () => setFontSize(els.ppFsRange.value));
   if (els.ppLhRange) els.ppLhRange.addEventListener('input', () => setLineHeight(els.ppLhRange.value));
-  // 点正文：有浮层就关浮层；触屏窄屏下切换工具栏显隐（不再随滚动自动隐藏，避免翻页闪烁）。
-  // 注意：手机正文满屏是文字，若只认「空白处」点击，工具栏藏起后几乎唤不出——
-  // 因此正文区任意位置轻点均视为切换（按钮/链接等交互元素已被 closest 分支放行）。
+  // 点正文：只用于关掉设置浮层。
+  // 工具栏已改为常驻，不再轻点隐藏/唤出——原实现把 fixed 工具栏 translateY 滑出屏幕，
+  // 但正文区 #readScroll 的 top/bottom 是写死的，滑走后上下反而露出与正文不同色的两条
+  // 底带，正文区一点没变大：视觉脏、纯亏。详见 css 里 .read-top/.read-bar 处注释。
   els.scroll.addEventListener('click', (e) => {
     // 点到交互元素（按钮/输入框/选择区）不算「轻点正文」
     if (e.target.closest && e.target.closest('button, a, input, textarea, select, .ch-retry')) return;
     if (!els.prefPanel.classList.contains('hidden') || !els.drawer.classList.contains('hidden')) {
       closePref();
-      return;
-    }
-    if (mqTouch() && !mqDesktop()) {
-      els.root.classList.toggle('bars-hid');
     }
   });
   els.scroll.addEventListener('scroll', onScroll);
@@ -199,8 +195,6 @@ export async function openBook(id) {
 async function renderChapter(idx, restoreRatio) {
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
-  // 进入新章节（无论加载成败）：触屏窄屏下放回工具栏——用户跳章/重试时能看到下章/目录/退出
-  if (mqTouch() && !mqDesktop()) els.root.classList.remove('bars-hid');
   els.art.innerHTML = '';
   const ch = state.chapters[idx];
   let text;
@@ -387,8 +381,6 @@ function scrollSideCur() {
 
 function openToc() {
   closePref();
-  // 唤回工具栏：若此刻 bars-hid，抽屉关闭后正文轻点切换会让人误以为「点了没反应」
-  els.root.classList.remove('bars-hid');
   renderDrawerToc();
   const list = els.drawerList;
   list.scrollTop = 0;
@@ -495,7 +487,6 @@ function togglePref() {
   const panel = els.prefPanel;
   if (!panel) return;
   if (panel.classList.contains('hidden')) {
-    els.root.classList.remove('bars-hid'); // 打开设置面板时唤回工具栏，避免面板贴着隐形底栏
     renderPrefPanel();
     panel.classList.remove('hidden');
   } else {

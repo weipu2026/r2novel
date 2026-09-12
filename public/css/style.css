@@ -294,12 +294,11 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 /* 工具栏毛玻璃：跟随当前阅读主题色调（--read-chrome 由 reader.js 随主题写入），
    blur 把滚动正文融进工具栏——四主题下都不再是突兀的死黑条；
    backdrop-filter 不支持时退化为近实色，依然可读。
-   移动端坑位说明：backdrop-filter × transform 滑入动画在 iOS Safari / 部分
+   移动端坑位说明：backdrop-filter × transform 位移动画在 iOS Safari / 部分
    Android 合成器上会丢 backdrop 采样，把工具栏合成成「白条」（尤其夜间主题
-   浅字压白底 = 直接隐形）。两条对策：① --read-chrome 提高到 97% 不透明，
-   blur 只做质感、可读性不依赖它；② 滑入/滑出用 opacity+transform 双轨过渡，
-   隐藏时 opacity:0 + pointer-events:none，合成器不再对「带 backdrop 的层」
-   做位移重采样。 */
+   浅字压白底 = 直接隐形）。对策：① --read-chrome 提高到 97% 不透明，
+   blur 只做质感、可读性不依赖它；② 工具栏已改为常驻、不再做 translateY
+   滑入/滑出，合成器不再对「带 backdrop 的层」做位移重采样。 */
 .read-top, .read-bar {
   background: var(--read-chrome, var(--chrome));
   -webkit-backdrop-filter: blur(14px) saturate(1.15);
@@ -308,8 +307,13 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   box-shadow: inset 0 1px 0 rgba(127,127,127,.14), inset 0 -1px 0 rgba(127,127,127,.14);
 }
 .read-top {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: 44px;
-  padding: calc(env(safe-area-inset-top) + 0px) 8px 0;
+  position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+  /* 安全区必须「加」到高度上，不能从 44px 里扣：border-box 下若写 height:44px
+     又给 padding-top:env(safe-area-inset-top)，刘海机（inset 可达 47px）的内容盒
+     会被 padding 压成 0，按钮溢出到正文上；#readScroll 的 top 必须用同一表达式，
+     否则正文会被顶栏压住。 */
+  height: calc(44px + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) 8px 0;
   display: flex; align-items: center; justify-content: space-between;
 }
 .read-top span {
@@ -328,12 +332,16 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .read-top button:first-child, .read-bar button:first-child,
 .read-bar button:last-child { min-width: 40px; min-height: 40px; display: grid; place-items: center; padding: 0; }
 .read-bar {
-  position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; height: 46px;
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
+  /* 同理：46px 是内容高度，安全区另加。否则底栏实际只占 46px，而 #readScroll 的
+     bottom 按 46px+安全区 上收，两者之间会空出一条页面底色横带
+     ——正是「隐藏后上下两条空白」在刘海机上的残留来源。 */
+  height: calc(46px + env(safe-area-inset-bottom));
   padding: 0 6px env(safe-area-inset-bottom);
   display: flex; align-items: center; justify-content: space-between;
 }
 #readScroll {
-  position: fixed; top: 44px; bottom: calc(46px + env(safe-area-inset-bottom)); left: 0; right: 0;
+  position: fixed; top: calc(44px + env(safe-area-inset-top)); bottom: calc(46px + env(safe-area-inset-bottom)); left: 0; right: 0;
   overflow-y: auto; -webkit-overflow-scrolling: touch;
   background: var(--read-bg); color: var(--read-fg);
 }
@@ -712,11 +720,11 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
   #view-read.side-collapsed .side-open:hover { opacity: 1; }
 
   /* 顶栏 / 底栏 / 正文整体左移让出侧栏 */
-  .read-top { left: 264px; padding-left: 18px; padding-right: 18px; height: 52px; }
+  .read-top { left: 264px; padding-left: 18px; padding-right: 18px; height: calc(52px + env(safe-area-inset-top)); }
   .read-top span { font-size: 15.5px; }
   .read-top button, .read-bar button { font-size: 14.5px; padding: 8px 12px; }
-  .read-bar { left: 264px; height: 54px; padding: 0 12px; }
-  #readScroll { left: 264px; top: 52px; bottom: calc(54px + env(safe-area-inset-bottom)); }
+  .read-bar { left: 264px; height: calc(54px + env(safe-area-inset-bottom)); padding: 0 12px env(safe-area-inset-bottom); }
+  #readScroll { left: 264px; top: calc(52px + env(safe-area-inset-top)); bottom: calc(54px + env(safe-area-inset-bottom)); }
   #view-read.side-collapsed .read-top { left: 44px; }
   #view-read.side-collapsed .read-bar { left: 44px; }
   #view-read.side-collapsed #readScroll { left: 44px; }

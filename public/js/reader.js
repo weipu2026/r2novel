@@ -571,6 +571,11 @@ function goto(idx) {
 /* ---------- 键盘导航（桌面；连键盘手机同样生效） ---------- */
 function onKey(e) {
   if (!els.root || els.root.classList.contains('hidden')) return;
+  // 带 Ctrl/⌘/Alt 的组合键属于浏览器/系统快捷键（Ctrl+T 新标签、Ctrl+PageUp/Down 切标签、
+  // Alt+←/→ 前进后退），必须整类放行：这些分支里 't'/' '/PageUp/PageDown 的 key 与单键相同，
+  // 不挡就会「顺手」把侧栏或抽屉掀开、把章节翻掉。Shift 刻意不排除——下面的 'T' 分支
+  // 就是为了 CapsLock/Shift 敲出来的大写 T 仍然能开目录。
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
   const inBtn = !!(t && t.closest && t.closest('button, a'));

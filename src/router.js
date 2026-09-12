@@ -484,6 +484,9 @@ function indexEntryFromMeta(meta, extra = {}) {
     finished: !!meta.finished,
     // 阅读状态三态：true 已读完 / false 明确未读完 / undefined 走自动判定
     readDone: meta.readDone === undefined ? undefined : !!meta.readDone,
+    // 星标＝私人收藏标记。与阅读状态（readDone）/ 完结（finished）互不相干，也镜像进 index，
+    // 这样书架筛选不必逐本读 meta（与 pinned/finished 同一套「摘要即真相」策略）。
+    star: !!meta.star,
     chapterCount: meta.chapterCount || (meta.chapters || []).length,
     wordCount: meta.wordCount || 0,
     cleanVer: meta.cleanVer || 1,
@@ -880,6 +883,10 @@ async function apiPatchBook(req, store, id) {
     meta.readDone = !!body.readDone;
     patch.readDone = !!body.readDone;
   }
+  if (body.star !== undefined) {
+    meta.star = !!body.star;
+    patch.star = !!body.star;
+  }
   meta.updatedAt = Date.now();
   patch.updatedAt = meta.updatedAt;
   await store.putText(KEY.book(id), JSON.stringify(meta));
@@ -895,6 +902,7 @@ async function apiPatchBook(req, store, id) {
       pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
       finished: patch.finished !== undefined ? patch.finished : !!b.finished,
       readDone: patch.readDone !== undefined ? patch.readDone : b.readDone,
+      star: patch.star !== undefined ? patch.star : !!b.star,
       updatedAt: patch.updatedAt,
     };
   });

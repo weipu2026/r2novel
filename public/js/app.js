@@ -23,7 +23,7 @@ let presetTagsInflight = null;
 
 const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
-let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', page: 1 };
+let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
 
 export function init() {
   ['login', 'shelf', 'upload', 'trash'].forEach((v) => {
@@ -118,6 +118,15 @@ export function init() {
   els.login.addEventListener('submit', doLogin);
   els.uploadBtn.addEventListener('click', () => openUpload());
   els.moreBtn.addEventListener('click', openMoreSheet);
+  // 视口变化时操作单还开着 → 重新贴回触发按钮（否则它会停在旧坐标上）
+  window.addEventListener('resize', () => {
+    if (els.sheet.classList.contains('hidden')) return;
+    if (!sheetAnchor) {
+      clearSheetPos(); // 从桌面缩到手机：必须清内联样式，退回底部操作单
+      return;
+    }
+    placeSheet(sheetAnchor);
+  });
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
   els.bbExit.addEventListener('click', exitBatchMode);
   els.bbAll.addEventListener('click', () => {
@@ -293,6 +302,7 @@ function filteredBooks() {
   if (ui.finished === 'done') list = list.filter((b) => b.finished);
   if (ui.finished === 'ongoing') list = list.filter((b) => !b.finished);
   if (ui.readState) list = list.filter((b) => readState(b) === ui.readState);
+  if (ui.star) list = list.filter((b) => !!b.star);
   return list;
 }
 
@@ -329,7 +339,7 @@ function renderShelf() {
   }
 
   const list = sortedBooks(filteredBooks());
-  els.filterNote.textContent = ui.q || ui.tag || ui.finished || ui.readState ? `筛选出 ${list.length} 本` : '';
+  els.filterNote.textContent = ui.q || ui.tag || ui.finished || ui.readState || ui.star ? `筛选出 ${list.length} 本` : '';
   renderReadFilter();
   renderTagCloud();
   renderGrid(list);
@@ -382,8 +392,11 @@ function tagCounts() {
 
 /** 阅读状态计数：给筛选 chips 用（一眼看出还剩多少没看） */
 function readCounts() {
-  const c = { unread: 0, reading: 0, done: 0 };
-  for (const b of books) c[readState(b)]++;
+  const c = { unread: 0, reading: 0, done: 0, star: 0 };
+  for (const b of books) {
+    c[readState(b)]++;
+    if (b.star) c.star++;
+  }
   return c;
 }
 
@@ -405,10 +418,11 @@ function renderReadFilter() {
     return b;
   };
   box.appendChild(
-    mk('全部', !ui.readState && !ui.tag && !ui.finished, () => {
+    mk('全部', !ui.readState && !ui.tag && !ui.finished && !ui.star, () => {
       ui.readState = '';
       ui.tag = '';
       ui.finished = '';
+      ui.star = false;
       ui.page = 1;
       renderShelf();
     })
@@ -422,6 +436,15 @@ function renderReadFilter() {
   box.appendChild(one('未读', 'unread', c.unread));
   box.appendChild(one('在读', 'reading', c.reading));
   box.appendChild(one('已读完', 'done', c.done));
+  // 星标是独立维度（一本「已读完」的书同样可以打星），所以不走 one() 的互斥切换，自己管开关。
+  // 计数为 0 也常驻显示——藏起来用户就不知道有这功能，也就永远不会去标星。
+  const starOn = mk(`★ 星标 ${c.star}`, ui.star, () => {
+    ui.star = !ui.star;
+    ui.page = 1;
+    renderShelf();
+  });
+  starOn.classList.add('star-chip');
+  box.appendChild(starOn);
 }
 
 /** 分类导航栏：状态频道（完结/连载中）+ 全部标签 chips */
@@ -592,11 +615,23 @@ function makeCard(b, big) {
   m.textContent = [tags, `${b.chapterCount || 0} 章`, fmtWords(b.wordCount)].filter(Boolean).join(' · ');
   info.appendChild(t);
   info.appendChild(m);
-  if (b.finished) {
-    const f = document.createElement('span');
-    f.className = 'finish-pill';
-    f.textContent = '完结';
-    info.appendChild(f);
+  // 「完结」与「星标」塞进同一个标记行：两者可以同时存在，各占一行会白留一行高度
+  // （这本书正好又是「完结」又是「星标」时最明显）。单标记出现时渲染与原来一致——
+  // 标记行自带 margin-top: 4px，行内胶囊的 margin-top 归零。
+  // 放 info 里而不是绝对定位：桌面网格卡 / 手机列表卡两套布局都自动适配，不必各写一套定位。
+  const flags = [];
+  if (b.finished) flags.push(['finish-pill', '完结']);
+  if (b.star) flags.push(['star-pill', '★ 星标']);
+  if (flags.length) {
+    const row = document.createElement('span');
+    row.className = 'card-flags';
+    for (const [cls, text] of flags) {
+      const f = document.createElement('span');
+      f.className = cls;
+      f.textContent = text;
+      row.appendChild(f);
+    }
+    info.appendChild(row);
   }
   c.appendChild(block);
   c.appendChild(info);
@@ -628,7 +663,8 @@ function makeCard(b, big) {
       more.textContent = '⋯';
       more.addEventListener('click', (e) => {
         e.stopPropagation();
-        openSheet(b);
+        // 传触发按钮本身：桌面端操作单要贴着它展开（右上角 ⋯ 就在右上角弹，卡片 ⋯ 就在卡片旁弹）
+        openSheet(b, e.currentTarget);
       });
       c.appendChild(more);
     }
@@ -652,8 +688,8 @@ async function openRead(id) {
   }
 }
 
-/* ---------- 底部操作单 ---------- */
-function openSheet(b) {
+/* ---------- 操作单（手机＝底部操作单 / 桌面＝贴着触发按钮的下拉） ---------- */
+function openSheet(b, anchor) {
   const isPin = !!b.pinned;
   els.sheet.innerHTML = '';
   const title = document.createElement('div');
@@ -671,6 +707,7 @@ function openSheet(b) {
       },
     },
     { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { closeSheet(); await safePatch(b.id, { pinned: !isPin }); } },
+    { text: b.star ? '取消星标' : '标为星标', act: async () => { closeSheet(); await safePatch(b.id, { star: !b.star }); } },
     { text: '编辑信息（书名/作者/标签/备注）', act: () => { closeSheet(); openEditModal(b); } },
     { text: '编辑章节（标题/正文/增删章）', act: () => { closeSheet(); openChapterEditor(b); } },
     { text: '导出清洗后的 txt', act: () => { closeSheet(); exportBook(b); } },
@@ -707,9 +744,55 @@ function openSheet(b) {
   cancel.addEventListener('click', closeSheet);
   els.sheet.appendChild(cancel);
   els.sheet.classList.remove('hidden');
+  placeSheet(anchor); // 必须摘掉 hidden 之后再量尺寸，否则宽高都是 0
+}
+
+/* ---------- 操作单定位 ----------
+ * 手机（<900px）：底部操作单，拇指够得到，别动。
+ * 桌面（≥900px）：改成贴住触发按钮的下拉——原来固定贴在屏幕底部居中，
+ * 离右上角的 ⋯ 横跨半个屏幕，鼠标要跑一趟才够得着。
+ * 定位相关样式一律写内联，关闭时清干净；否则残留的 left/top 会盖住响应式 CSS，
+ * 手机端会莫名其妙跑到屏幕中间去。 */
+const SHEET_POS_PROPS = ['left', 'top', 'right', 'bottom', 'transform', 'visibility'];
+let sheetAnchor = null;
+
+function clearSheetPos() {
+  for (const k of SHEET_POS_PROPS) els.sheet.style.removeProperty(k);
+}
+
+function placeSheet(anchor) {
+  const s = els.sheet;
+  if (window.innerWidth < 900 || !anchor) {
+    sheetAnchor = null;
+    s.classList.remove('anchored');
+    clearSheetPos();
+    return;
+  }
+  sheetAnchor = anchor;
+  s.classList.add('anchored');
+  s.style.visibility = 'hidden'; // 先量尺寸再摆位，避免在旧坐标上闪一下
+  const w = s.offsetWidth;
+  const h = s.offsetHeight;
+  const a = anchor.getBoundingClientRect();
+  const M = 12; // 离视口边缘的最小留白
+  const left = Math.max(M, Math.min(a.right - w, window.innerWidth - M - w)); // 右边缘对齐按钮，再夹进视口
+  let top = a.bottom + 8;
+  if (top + h > window.innerHeight - M) {
+    const up = a.top - 8 - h; // 下方放不下就翻到按钮上方；上下都放不下时贴住底边
+    top = up >= M ? up : Math.max(M, window.innerHeight - M - h);
+  }
+  s.style.left = Math.round(left) + 'px';
+  s.style.top = Math.round(top) + 'px';
+  s.style.right = 'auto';
+  s.style.bottom = 'auto';
+  s.style.transform = 'none';
+  s.style.visibility = '';
 }
 
 function closeSheet() {
+  sheetAnchor = null;
+  els.sheet.classList.remove('anchored');
+  clearSheetPos();
   els.sheet.classList.add('hidden');
 }
 
@@ -718,6 +801,7 @@ async function safePatch(id, patch) {
     await api.patchBook(id, patch);
     await loadShelf();
     if (patch.pinned !== undefined) toast(patch.pinned ? '已置顶' : '已取消置顶', 1400);
+    if (patch.star !== undefined) toast(patch.star ? '已加星标' : '已取消星标', 1400);
   } catch (e) {
     toast('操作失败：' + (e.message || e), 2500);
   }
@@ -844,7 +928,7 @@ function exitBatchMode() {
 }
 
 /** 顶栏「⋯」收纳菜单：低频治理入口统一收进来，顶栏只留「＋ 上传」+「⋯」 */
-function openMoreSheet() {
+function openMoreSheet(ev) {
   els.sheet.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'sheet-title';
@@ -875,6 +959,7 @@ function openMoreSheet() {
   cancel.addEventListener('click', closeSheet);
   els.sheet.appendChild(cancel);
   els.sheet.classList.remove('hidden');
+  placeSheet(ev && ev.currentTarget); // 桌面上贴住右上角那个 ⋯
 }
 
 function syncBatchBar() {

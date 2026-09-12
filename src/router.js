@@ -53,9 +53,13 @@ const json = (data, status = 200, headers = {}) =>
 
 const notFound = () => new Response('Not Found', { status: 404 });
 
+/** 丢弃请求体：cancel 掉流即可，绝不能 arrayBuffer() 排空——排空等于把（可能超大且未经
+ * 校验的）请求体整体读进内存，免鉴权 401 / 校验失败路径上就是一个人为的 OOM 面
+ * （Workers 内存 128MB，与 readBodyBytes 的流式护栏同一个道理）。cancel 让运行时立即
+ * 回收上游，两端（Workers / Node undici）语义一致。 */
 async function dropBody(req) {
   try {
-    if (req.body && !req.bodyUsed) await req.arrayBuffer();
+    if (req.body && !req.bodyUsed) await req.body.cancel();
   } catch {
     /* 流异常忽略 */
   }

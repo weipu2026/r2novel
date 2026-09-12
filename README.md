@@ -269,6 +269,7 @@ r2novel/
 |---|---|
 | 单测（`test/*.test.mjs`，12 个文件） | 134/134 ✓ |
 | 端到端冒烟（M1 全链路 + M2 管理整套 + OPDS 通道） | 58/58 ✓ |
+| 浏览器实测套件（`.ui-tests/`，gitignored，本地串行跑） | iter3 31 · readstate 20 · audit 14 · prelaunch 17 · batch 12 · review-fixes 11 · desktop 20 ✓ |
 | 语法检查（`npm run check`）/ wrangler 打包 dry-run | ✓ |
 | OPDS / 整本导出（Basic Auth + 流式拼章 + XML 转义 + 防爆破覆盖 + 40 章护栏） | 单测 + 冒烟覆盖 ✓ |
 | 超大单章自动分段（UTF-8 边界安全，>2MB 不再 413 中断） | cleaner 单测覆盖 ✓ |

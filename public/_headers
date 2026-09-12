@@ -19,3 +19,7 @@
   Cache-Control: no-cache
 /manifest.webmanifest
   Cache-Control: no-cache
+# 根路径与 /index.html 是同一个入口：都必须协商缓存，否则部署后浏览器
+# 启发式缓存可能整段跳过 revalidate，首访用户拿到旧 index → 引用旧 JS
+/
+  Cache-Control: no-cache

@@ -130,17 +130,19 @@ export function init() {
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
   els.bbExit.addEventListener('click', exitBatchMode);
   els.bbAll.addEventListener('click', () => {
-    for (const b of filteredBooks()) selected.add(b.id);
+    const list = sortedBooks(filteredBooks()); // 过滤+排序只算一次（百本量级下重复算一遍纯浪费）
+    for (const b of list) selected.add(b.id);
     syncBatchBar();
-    renderGrid(sortedBooks(filteredBooks()));
+    renderGrid(list);
   });
   els.bbInvert.addEventListener('click', () => {
-    for (const b of filteredBooks()) {
+    const list = sortedBooks(filteredBooks());
+    for (const b of list) {
       if (selected.has(b.id)) selected.delete(b.id);
       else selected.add(b.id);
     }
     syncBatchBar();
-    renderGrid(sortedBooks(filteredBooks()));
+    renderGrid(list);
   });
   els.bbTags.addEventListener('click', batchEditTags);
   els.bbDone.addEventListener('click', () => batchRun('setFinished', { finished: true }, `把 ${selected.size} 本书标记为「已完结」？`));
@@ -272,7 +274,9 @@ function colorOf(title) {
   return c;
 }
 
+let shelfSeq = 0; // 并发去重：只应用最后一次 loadShelf 的结果，过期响应直接丢弃
 async function loadShelf(data) {
+  const seq = ++shelfSeq;
   if (!data) {
     // 打开提速：先用本地快照渲染上次的书架（打开即有内容），网络刷新后覆盖
     const snap = local.getShelfCache();
@@ -283,6 +287,9 @@ async function loadShelf(data) {
     }
     data = await api.books();
   }
+  // 等待期间又发起了新的 loadShelf（连点品牌/操作后立即刷新等）：本次响应已过期，
+  // 丢弃——否则旧数据会把刚 PATCH 的星标/置顶「点了又没了」，刷新才恢复
+  if (seq !== shelfSeq) return;
   books = data.books || [];
   tagCache = null; // books 已更新 → 标签计数缓存失效，下次 renderShelf 重算
   local.setShelfCache(books);
@@ -593,8 +600,9 @@ function progBadgeText(b) {
 }
 
 function makeCard(b, big) {
-  const c = document.createElement('button');
-  c.type = 'button';
+  // 卡片本体必须是 div（role=button）而不是 <button>：卡内还要放 ⋯ 按钮，
+  // HTML 禁止交互元素嵌套（button>button 非法，部分浏览器/读屏的焦点与点击语义会异常）
+  const c = document.createElement('div');
   c.className =
     'card' +
     (big ? ' big' : '') +
@@ -670,6 +678,24 @@ function makeCard(b, big) {
     }
     c.addEventListener('click', () => openRead(b.id));
   }
+  // div 卡片的键盘可达性（原 <button> 自带，改 div 后补上）：Enter/Space 触发与点击一致。
+  // 只在本体聚焦时响应（e.target !== c 的按键属于卡内 ⋯ 按钮，由它自己处理）。
+  c.setAttribute('role', 'button');
+  c.tabIndex = 0;
+  c.addEventListener('keydown', (e) => {
+    if (e.target !== c || (e.key !== 'Enter' && e.key !== ' ')) return;
+    e.preventDefault();
+    if (batchMode) {
+      if (selected.has(b.id)) selected.delete(b.id);
+      else selected.add(b.id);
+      c.classList.toggle('picked', selected.has(b.id));
+      const tick = c.querySelector('.pick-tick');
+      if (tick) tick.textContent = selected.has(b.id) ? '✓' : '';
+      syncBatchBar();
+    } else {
+      openRead(b.id);
+    }
+  });
   return c;
 }
 
@@ -1511,8 +1537,7 @@ function openUpload(opts = {}) {
     return;
   }
   els.upHead.textContent = '上传小说';
-  const hint2 = els.upUpdateHint;
-  hint2.classList.add('hidden');
+  els.upUpdateHint.classList.add('hidden');
 }
 
 function hint(text) {

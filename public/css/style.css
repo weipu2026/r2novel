@@ -616,9 +616,9 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 9px 26px; font
 
 /* ============ 桌面端（>=900px）布局调优 ============ */
 @media (min-width: 900px) {
-  /* 顶栏更舒展 */
+  /* 顶栏更舒展（安全区 inset 不能在断点里丢：iPad PWA 等带 inset 的桌面端同样要加回去） */
   .top {
-    padding: 16px 32px 14px;
+    padding: calc(16px + env(safe-area-inset-top)) 32px 14px;
   }
   .brand-name { font-size: 20px; }
   .brand-logo { width: 38px; height: 38px; border-radius: 11px; font-size: 18px; }

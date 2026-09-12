@@ -77,13 +77,21 @@ self.addEventListener('fetch', (event) => {
   // 「部署后首个导航就拿到新 JS」做成了时灵时不灵（命中缓存时 cache.put 常常没落盘，
   // 用户继续跑旧代码，且一直开着的 tab 永远不会重载 app.js）。
   const cacheP = caches.open(CACHE);
+  // put 必须单独成链并交给 waitUntil 等待：只在 fetch 的 then 里顺手起 Promise 是不够的——
+  // 那个 put 链仍是游离的，命中缓存时 respondWith 立即由缓存返回、事件随 fetch 结束而终止，
+  // 游离的 cache.put 会被浏览器丢弃（v13 的修复不彻底，真因就在这里）。
+  // 结构：respondWith 只等 fetch（命中缓存零延迟）；waitUntil = fetch 之后再加等 put 落盘。
+  let putP = null;
   const networkP = fetch(req, { cache: 'no-cache' }).then((res) => {
     // cache:'no-cache' = 每次强制条件校验（ETag/304），绕开浏览器 HTTP 缓存的
     // max-age 窗口（5 分钟），否则部署后首个导航仍可能拿到旧 JS/CSS
-    if (res && res.status === 200) cacheP.then((c) => c.put(req, res.clone())).catch(() => {});
+    if (res && res.status === 200) {
+      // clone 必须在返回前做（响应体只能 clone 一次）：一份给 put，一份继续往外走
+      putP = cacheP.then((c) => c.put(req, res.clone())).catch(() => {});
+    }
     return res;
   });
-  event.waitUntil(networkP.then(() => {}, () => {}));
+  event.waitUntil(networkP.then(() => putP, () => {}));
   event.respondWith(
     cacheP.then(async (cache) => {
       const cached = await cache.match(req);

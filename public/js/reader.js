@@ -25,6 +25,7 @@ const state = {
   toc: { draw: TOC_PAGE, side: TOC_PAGE }, // 两个目录容器各自的已渲染量
   dirty: false,
   lastSave: 0,
+  failedIdx: null, // 加载失败的章（下标）：失败章不算「读到」，切后台/滚动不得把进度写过去
   pref: { ...defaultPref(), ...local.getPref() },
 };
 
@@ -139,7 +140,9 @@ export function bindReader(root, navCb) {
 }
 
 /* ---------- 打开一本书 ---------- */
+let openSeq = 0; // 递增令牌：只有最新一次 openBook 允许写 state/渲染
 export async function openBook(id) {
+  const seq = ++openSeq;
   let meta;
   try {
     meta = await api.bookMeta(id);
@@ -150,6 +153,7 @@ export async function openBook(id) {
     if (off) meta = { ...off, id }; // IndexedDB 记录只存 bookId，补齐 id 供后续取章
     else throw e;
   }
+  if (seq !== openSeq) return; // meta 等待期间用户已开了别的书：本次打开整体作废
   if (!meta.chapters || !meta.chapters.length) throw new Error('这本书还没有可读章节');
   state.book = meta;
   state.chapters = meta.chapters.map((c, i) => ({ ...c, i }));
@@ -168,6 +172,7 @@ export async function openBook(id) {
     ratio = lp.ratio || 0;
   }
   const sp = await api.getProgress(id);
+  if (seq !== openSeq) return; // 进度请求等待期间已切书：同样作废（尚未渲染，不影响新书）
   if (sp && sp.updatedAt && Number.isFinite(sp.ch) && (!lp || sp.updatedAt > (lp.updatedAt || 0))) {
     ch = clampCh((sp.ch || 1) - 1);
     ratio = sp.ratio || 0;
@@ -195,6 +200,7 @@ export async function openBook(id) {
 async function renderChapter(idx, restoreRatio) {
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
+  state.failedIdx = null; // 新一次渲染先按「会成功」处理，失败路径再标记
   els.art.innerHTML = '';
   const ch = state.chapters[idx];
   let text;
@@ -207,6 +213,9 @@ async function renderChapter(idx, restoreRatio) {
     }
     // 等待期间用户已翻到别的章：本次失败作废（否则重试提示会盖在新章正文上）
     if (state.cur !== idx) return;
+    // 失败章标记：saveProgress 见到「当前章＝失败章」一律跳过——否则切后台会把
+    // 进度写成「读到该章 0%」，覆盖掉此前的真实位置（跨设备继续阅读会跳错章）
+    state.failedIdx = idx;
     // 网络失败且无离线缓存：给出可点的重试入口（文案与行为对齐）
     const retry = document.createElement('p');
     retry.className = 'ch-retry';
@@ -422,8 +431,8 @@ let appliedTheme = null; // 主题未变时跳过重建偏好面板
 function applyPref() {
   const root = els.root;
   const th = THEMES.find((t) => t.key === state.pref.theme) || THEMES[0];
-  root.style.setProperty('--fs', state.pref.fs + 'px');
-  root.style.setProperty('--lh', state.pref.lh);
+  // 注：字号/行距直接写在 #readArt 的内联样式上（下面两行）——曾往根节点设 --fs/--lh
+  // 但全 CSS 无消费者，纯属死变量，已删
   root.style.setProperty('--read-bg', th.bg);
   root.style.setProperty('--read-fg', th.fg);
   // 工具栏/设置面板的毛玻璃底：当前主题色 + 97% 不透明（hex8）。
@@ -534,6 +543,7 @@ function onHidden() {
  * 滚动中由 8s 节流与切后台触发；离线入队、回网补传。 */
 function saveProgress() {
   if (!state.book) return;
+  if (state.failedIdx !== null && state.failedIdx === state.cur) return; // 失败章不算读到
   const p = { ch: state.cur + 1, ratio: curRatio(), updatedAt: Date.now() };
   local.setProg(state.book.id, p);
   if (navigator.onLine === false) {

@@ -408,7 +408,7 @@ function readCounts() {
 }
 
 /** 阅读状态筛选行：全部 / 未读 N / 在读 N / 已读完 N。
- * 「全部」是本页的总重置入口——它同时清掉 tag / finished / readState 三个维度
+ * 「全部」是本页的总重置入口——它同时清掉 tag / finished / readState / star 四个维度
  * （标签云行里原来的「全部」已挪走，避免两处同名按钮语义打架）；
  * 其余三个是单选，再点同一个即取消筛选。计数让「书多了还剩哪些没看」一眼可见。 */
 function renderReadFilter() {
@@ -443,18 +443,13 @@ function renderReadFilter() {
   box.appendChild(one('未读', 'unread', c.unread));
   box.appendChild(one('在读', 'reading', c.reading));
   box.appendChild(one('已读完', 'done', c.done));
-  // 星标是独立维度（一本「已读完」的书同样可以打星），所以不走 one() 的互斥切换，自己管开关。
-  // 计数为 0 也常驻显示——藏起来用户就不知道有这功能，也就永远不会去标星。
-  const starOn = mk(`★ 星标 ${c.star}`, ui.star, () => {
-    ui.star = !ui.star;
-    ui.page = 1;
-    renderShelf();
-  });
-  starOn.classList.add('star-chip');
-  box.appendChild(starOn);
 }
 
-/** 分类导航栏：状态频道（完结/连载中）+ 全部标签 chips */
+/** 分类导航栏：星标（独立维度）+ 状态频道（完结/连载中）+ 全部标签 chips。
+ * 星标放这行行首而非阅读状态行（2026-09-13）：手机端「★星标 / 完结 / 连载中」三个
+ * 「组织动作」正好凑一行（分隔符在手机断点改整行断行，标签从下一行起排），
+ * 阅读状态行只剩 全部/未读/在读/已读完，一行放得下。逻辑不变：仍是自己的开关，
+ * 「全部」总重置（renderReadFilter）照旧把它清掉。 */
 function renderTagCloud() {
   const cloud = els.tagCloud;
   cloud.innerHTML = '';
@@ -475,7 +470,17 @@ function renderTagCloud() {
     cloud.appendChild(b);
   };
   // 注：「全部」总重置按钮已挪到阅读状态筛选行（renderReadFilter）——
-  // 由它统一清除 tag / finished / readState 三个维度，避免两处「全部」语义打架。
+  // 由它统一清除 tag / finished / readState / star 四个维度，避免两处「全部」语义打架。
+  // 星标是独立维度（一本「已读完」的书同样可以打星），不走互斥切换、自己管开关。
+  // 计数为 0 也常驻显示——藏起来用户就不知道有这功能，也就永远不会去标星。
+  const starBtn = mk(`★ 星标 ${readCounts().star}`, ui.star);
+  starBtn.classList.add('star-chip');
+  starBtn.addEventListener('click', () => {
+    ui.star = !ui.star;
+    ui.page = 1;
+    renderShelf();
+  });
+  cloud.appendChild(starBtn);
   stateBtn('完结', 'done');
   stateBtn('连载中', 'ongoing');
   const tags = tagCounts();

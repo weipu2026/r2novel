@@ -475,9 +475,12 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   font-variant-numeric: tabular-nums;
 }
 .readfilter button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-/* 星标筛选是独立维度（可与任一阅读状态叠加），用金色与阅读状态 chip 区分开 */
-.readfilter button.star-chip { color: #a97c1a; }
-.readfilter button.star-chip.on { background: #e0b23c; border-color: #e0b23c; color: #fff; }
+/* 星标筛选是独立维度（可与任一阅读状态叠加），用金色与其它 chip 区分开。
+   注意：星标 chip 已从 #readFilter 挪到 #tagCloud（2026-09-13）——选择器必须挂在 .tagcloud 下，
+   否则会被 .tagcloud button / .tagcloud button.on 覆盖成普通「灰字 / 主色调底」，
+   金色语义整体丢失、且与「完结」选中态同色不可区分（曾踩此坑，有探针 audit-star-chip.mjs 守着）。 */
+.tagcloud button.star-chip { color: #a97c1a; }
+.tagcloud button.star-chip.on { background: #e0b23c; border-color: #e0b23c; color: #fff; }
 .tagcloud { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 2px; }
 .tagcloud button {
   border: 1px solid var(--line); background: var(--panel); color: var(--muted);
@@ -898,9 +901,14 @@ button.danger:hover { background: #fbeeec; }
   .batch-bar button { padding: 4px 9px; font-size: 12px; }
   .tm-name { max-width: 38%; }
 
-  /* 手机顶栏两行布局：品牌一行、按钮一行（上传 + ⋯ 收纳后单行从容） */
-  .top { flex-wrap: wrap; row-gap: 6px; padding-bottom: 8px; }
-  .top-actions { width: 100%; justify-content: flex-start; gap: 4px; }
+  /* 手机顶栏单行（2026-09-13）：logo/品牌与 上传/⋯ 同行，固定高度省一行。
+     brand-name 可收缩截断（min-width:0 + ellipsis），320px 窄屏也不挤破。 */
+  .top { padding: calc(10px + env(safe-area-inset-top)) 12px 8px; }
+  .top-actions { gap: 6px; }
+  .brand-name { font-size: 16px; }
+  /* 「★星标 / 完结 / 连载中」三个组织 chip 独占一行：分隔符在手机上改为整行断行
+     （flex-basis:100% 强制换行、本体隐藏），标签 chips 从下一行起排；桌面仍内联。 */
+  .tagcloud-sep { flex-basis: 100%; height: 0; line-height: 0; visibility: hidden; margin: 0; }
   .top-actions button { padding: 6px 8px; font-size: 12px; }
   .top-actions button.primary { padding: 6px 9px; font-size: 12.5px; }
 

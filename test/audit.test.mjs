@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { ENV, memStore, req, call, login } from './_harness.mjs';
 
 async function makeBook(store, cookie, title, n, chapters) {
   const chs = chapters || Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));

@@ -4,8 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleRequest } from '../src/router.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login } from './_harness.mjs';
 
 async function makeReadyBook(store, cookie, title, n) {
   const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));

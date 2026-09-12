@@ -1,4 +1,4 @@
-/* check.mjs — 跨平台语法检查：node --check 遍历 src/public/scripts/test */
+/* check.mjs — 跨平台语法检查：node --check 递归遍历全仓库（跳过 node_modules/data-dev/.git） */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

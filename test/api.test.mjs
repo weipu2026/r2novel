@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { ENV, memStore, req, call, login } from './_harness.mjs';
 
 test('鉴权：未登录一律 401，口令错 401，口令对返回 cookie', async () => {
   const store = memStore();

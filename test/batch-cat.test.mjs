@@ -3,10 +3,9 @@
  * 与 api-m2.test.mjs 同款内存 store，零外部依赖。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleRequest } from '../src/router.js';
 import { BULK_CHAPTER_BATCH } from '../public/js/shared-const.js';
 import { maybeGzip } from '../public/js/store.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { ENV, memStore, req, call, login } from './_harness.mjs';
 
 async function makeDraftBook(store, cookie, title, n = 3) {
   const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章');

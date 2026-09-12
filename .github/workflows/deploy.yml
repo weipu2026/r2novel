@@ -24,9 +24,9 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+# 注意：Cloudflare 凭据刻意不放 workflow 级 env —— 那会注入到 npm ci / npm test 等
+# 所有 step 的环境（含第三方依赖的任何生命周期脚本）。只在下游真正调 wrangler 的
+# step 上按需注入。
 
 jobs:
   deploy:
@@ -44,9 +44,27 @@ jobs:
       - name: 单测 + 语法检查
         run: npm test && npm run check
 
-      # 幂等：桶已存在时报错没关系，继续往下走（需 CLOUDFLARE_API_TOKEN 含 R2:Edit）
+      # 幂等：桶已存在可继续往下走；但**只放行「已存在」这一种失败**——原写法
+      # `|| echo` 会吞掉一切失败，token 缺 R2:Edit 时也会打印「bucket 已存在」，
+      # 之后部署失败却查不到真正原因
       - name: 确保 R2 桶存在
-        run: npx wrangler r2 bucket create r2novel-7d1a || echo "· bucket 已存在，跳过"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set +e
+          OUT=$(npx wrangler r2 bucket create r2novel-7d1a 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "· R2 桶已创建"
+          elif printf '%s' "$OUT" | grep -qiE 'already exists|already owned by you|10004'; then
+            echo "· R2 桶已存在，跳过"
+          else
+            printf '%s\n' "$OUT"
+            echo "::error::创建 R2 桶失败——请检查 CLOUDFLARE_API_TOKEN 是否含 Account·R2:Edit"
+            exit 1
+          fi
 
       # 域名不进仓库：CUSTOM_DOMAIN 非空时注入 wrangler.toml 副本末尾；
       # 为空则用默认 workers.dev 地址（域名值不打印到日志）。
@@ -74,17 +92,29 @@ jobs:
       # pipefail 保证 wrangler 失败时步骤失败（tee 会吞退出码）；输出存档用于提取访问地址
       - name: 部署 Worker
         shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -o pipefail
           # SW 缓存版本自动化（路径 B）：每次部署用时间戳替换 CACHE 版本号，
           # 保证「push 后用户第一次打开就是新前端」，消除手动 bump 的遗忘风险；
-          # 只改 runner 上的副本，仓库文件不受影响
-          sed -i "s/const CACHE = 'r2novel-shell-v[0-9]*';/const CACHE = 'r2novel-shell-$(date +%s)';/" public/sw.js
+          # 只改 runner 上的副本，仓库文件不受影响。
+          # 匹配式放宽为「任意版本串」并**替换后自校验**：原先写死 '...-v[0-9]*'，
+          # 一旦仓库里的字面量格式被改动（如去掉 v），sed 会静默不匹配 →
+          # SW 版本号永不变化 → 用户长期跑旧前端，且没有任何报错提示。
+          sed -i -E "s|const CACHE = '[^']*';|const CACHE = 'r2novel-shell-$(date +%s)';|" public/sw.js
+          if ! grep -q "const CACHE = 'r2novel-shell-" public/sw.js; then
+            echo "::error::public/sw.js 的 CACHE 版本号替换失败（字面量格式已变？）"
+            exit 1
+          fi
           npx wrangler deploy 2>&1 | tee deploy.log
 
       # 先部署代码（保证 Worker 存在，secret put 才有目标），再同步密钥；改 Secret 后跑一次部署即生效
       - name: 同步密钥到 Worker
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
         run: |

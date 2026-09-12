@@ -74,8 +74,8 @@ cp .dev.vars.example .dev.vars  # 填 ADMIN_PASSWORD / SESSION_SECRET
 
 npm run dev                     # → http://localhost:8088（数据落 data-dev/）
 
-npm test                        # 单测 92 项（另开终端）
-SMOKE_PASSWORD=<.dev.vars 里的 ADMIN_PASSWORD> npm run smoke    # 端到端冒烟 46 项
+npm test                        # 单测 128 项（另开终端）
+SMOKE_PASSWORD=<.dev.vars 里的 ADMIN_PASSWORD> npm run smoke    # 端到端冒烟 58 项
 SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自动清走测试书（可重复执行）
 ```
 
@@ -84,9 +84,9 @@ SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自
 | 命令 | 说明 |
 |---|---|
 | `npm run dev` | 本地联调服务器（端口 8088，与生产共用同一套路由核心代码） |
-| `npm test` | 92 项单测（7 个文件：cleaner / api / api-m2 / audit / diag / batch-cat / batch-tags）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 |
-| `npm run smoke` | 端到端冒烟 46 项：M1 全链路 + M2 管理整套 + OPDS 通道；`SMOKE_CLEANUP=1` 结束自动清理测试书 |
-| `npm run check` | 跨平台语法检查（遍历 src/public/scripts/test 全部 js） |
+| `npm test` | 128 项单测（`test/*.test.mjs`，11 个文件）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 + 请求体护栏 + 阅读状态 |
+| `npm run smoke` | 端到端冒烟 58 项：M1 全链路 + M2 管理整套 + OPDS 通道；`SMOKE_CLEANUP=1` 结束自动清理测试书 |
+| `npm run check` | 跨平台语法检查（递归遍历全仓库 js，跳过 node_modules/data-dev/.git） |
 | `npm run icons` | 重新生成 PWA 图标（零依赖 zlib 手写 PNG） |
 | `npm run deploy` | 本地 `wrangler deploy`（日常部署走 GitHub Actions，见下） |
 
@@ -163,7 +163,7 @@ R2 桶（私有；无公开读、无直链）
 填好 Secrets 后，**push 到 main 即自动发布**（也可在 Actions 页手动 Run workflow）。CI 流程：跑单测+语法检查 → 自动建 R2 桶（幂等）→ 部署 Worker → 同步密钥 → **对生产环境跑端到端冒烟（自动清走测试书）**。
 
 ### 部署前置
-- **Node.js 18+**：本地联调需 `npm ci` 装 wrangler（纯部署可交给 CI，无需本地安装）
+- **Node.js 22+**（`package.json` 的 `engines` 已声明）：本地联调需 `npm ci` 装 wrangler（纯部署可交给 CI，无需本地安装）
 - **Cloudflare 账号**：含可用 R2 额度，免费层即可
 - **Private GitHub 仓库**：凭据零入库，域名也不入库
 
@@ -231,7 +231,7 @@ r2novel/
 │   ├── smoke.mjs          端到端冒烟（SMOKE_CLEANUP=1 自动清理测试书，CI 幂等）
 │   ├── check.mjs          跨平台语法检查
 │   └── gen-icon.mjs       零依赖手写 PNG 图标
-├── test/                  7 个单测文件，92 项（cleaner/api/api-m2/audit/diag/batch-cat/batch-tags）
+├── test/                  11 个单测文件，128 项（`test/*.test.mjs`，公共脚手架见 _harness.mjs）
 ├── .github/workflows/deploy.yml   push main → 测试 → 部署 → 生产冒烟
 ├── wrangler.toml          Worker/R2/限额配置（无凭据无域名）
 └── .dev.vars.example      本地开发变量模板
@@ -259,8 +259,8 @@ r2novel/
 
 | 验证 | 结果 |
 |---|---|
-| 单测（7 个文件：cleaner / api / api-m2 / audit / diag / batch-cat / batch-tags） | 92/92 ✓ |
-| 端到端冒烟（M1 全链路 + M2 管理整套 + OPDS 通道） | 46/46 ✓ |
+| 单测（`test/*.test.mjs`，11 个文件） | 128/128 ✓ |
+| 端到端冒烟（M1 全链路 + M2 管理整套 + OPDS 通道） | 58/58 ✓ |
 | 语法检查（`npm run check`）/ wrangler 打包 dry-run | ✓ |
 | OPDS / 整本导出（Basic Auth + 流式拼章 + XML 转义 + 防爆破覆盖 + 40 章护栏） | 单测 + 冒烟覆盖 ✓ |
 | 超大单章自动分段（UTF-8 边界安全，>2MB 不再 413 中断） | cleaner 单测覆盖 ✓ |

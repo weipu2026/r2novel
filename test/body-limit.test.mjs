@@ -6,8 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleRequest } from '../src/router.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login } from './_harness.mjs';
 
 /** 用 CompressionStream 生成 gzip 字节（前端上传原件走的正是这条路径） */
 async function gzip(str) {

@@ -1,9 +1,8 @@
 /* api-m2.test.mjs — M2 书库管理 API 单测（内存 store 模拟 R2/文件系统） */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleRequest } from '../src/router.js';
 import { BULK_CHAPTER_BATCH } from '../public/js/shared-const.js';
-import { BASE, ENV, memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login } from './_harness.mjs';
 
 async function makeReadyBook(store, cookie, title, n, tags = []) {
   const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));

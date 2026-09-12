@@ -482,6 +482,8 @@ function indexEntryFromMeta(meta, extra = {}) {
     tags: meta.tags || [],
     pinned: !!meta.pinned,
     finished: !!meta.finished,
+    // 阅读状态三态：true 已读完 / false 明确未读完 / undefined 走自动判定
+    readDone: meta.readDone === undefined ? undefined : !!meta.readDone,
     chapterCount: meta.chapterCount || (meta.chapters || []).length,
     wordCount: meta.wordCount || 0,
     cleanVer: meta.cleanVer || 1,
@@ -871,6 +873,13 @@ async function apiPatchBook(req, store, id) {
     meta.finished = !!body.finished;
     patch.finished = meta.finished;
   }
+  // 「已读完」＝我的阅读状态，与 finished（这本书本身写完了）是两回事，故单独一个字段。
+  // 三态：true 强制已读完 / false 强制未读完（用来摘掉自动判定出来的标记）/ 缺省走自动判定。
+  // 老书没有该字段 → undefined → 自动回落判定，天然兼容，无需迁移。
+  if (body.readDone !== undefined) {
+    meta.readDone = !!body.readDone;
+    patch.readDone = !!body.readDone;
+  }
   meta.updatedAt = Date.now();
   patch.updatedAt = meta.updatedAt;
   await store.putText(KEY.book(id), JSON.stringify(meta));
@@ -885,6 +894,7 @@ async function apiPatchBook(req, store, id) {
       tags: patch.tags !== undefined ? patch.tags : b.tags,
       pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
       finished: patch.finished !== undefined ? patch.finished : !!b.finished,
+      readDone: patch.readDone !== undefined ? patch.readDone : b.readDone,
       updatedAt: patch.updatedAt,
     };
   });

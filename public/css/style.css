@@ -461,6 +461,15 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   padding: 9px 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
   font-size: 13.5px; color: var(--fg); outline: none; flex: none;
 }
+/* 阅读状态筛选行（全部 / 未读 N / 在读 N / 已读完 N）：与标签云同款 chips，
+   单独一行并带计数——书多了「还剩哪些没看」一眼可见 */
+.readfilter { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 2px; }
+.readfilter button {
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+  border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.readfilter button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .tagcloud { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 2px; }
 .tagcloud button {
   border: 1px solid var(--line); background: var(--panel); color: var(--muted);

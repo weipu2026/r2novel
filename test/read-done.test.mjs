@@ -109,3 +109,49 @@ test('镜像：无章数的书不会被误判为已读完', async () => {
   assert.ok(p, '无章数时也会建镜像（换章路径），但绝不写成「读完」');
   assert.equal(p.ch, 1);
 });
+
+/* ---------------- 手动标记（readDone 三态） ---------------- */
+
+test('手动标记：PATCH readDone 同时落到 meta 与 index 镜像', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '手动标记A', 2);
+
+  let r = await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: true } }));
+  assert.equal(r.status, 200);
+  assert.equal((await progOf(store, id)), undefined, '标记不碰进度镜像');
+
+  let idx = JSON.parse(await store.getText('meta/index.json'));
+  assert.equal(idx.books.find((b) => b.id === id).readDone, true, 'index 镜像应带 readDone');
+
+  const meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.equal(meta.readDone, true, 'meta 侧也要写，否则后续从 meta 重建 index 会丢标记');
+
+  // 摘掉标记（false 是「强制未读完」，不等于「没标过」）
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: false } }));
+  idx = JSON.parse(await store.getText('meta/index.json'));
+  assert.equal(idx.books.find((b) => b.id === id).readDone, false, 'false 必须显式保留（用于摘掉自动判定的标记）');
+});
+
+test('手动标记：无关的 patch 不会凭空写入 readDone（老书天然兼容）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '手动标记B', 2);
+
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { pinned: true } }));
+  const idx = JSON.parse(await store.getText('meta/index.json'));
+  const b = idx.books.find((x) => x.id === id);
+  assert.equal(b.pinned, true);
+  assert.equal('readDone' in b, false, '没标记过的书不该出现该字段——前端据此回落自动判定');
+});
+
+test('手动标记：新建书的 index 条目不含 readDone（走自动判定）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '手动标记C', 2);
+
+  const idx = JSON.parse(await store.getText('meta/index.json'));
+  const b = idx.books.find((x) => x.id === id);
+  assert.equal('readDone' in b, false);
+  assert.equal(b.finished, false, 'finished（书是否完结）是另一个维度，不该被牵连');
+});

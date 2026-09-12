@@ -23,7 +23,7 @@ let presetTagsInflight = null;
 
 const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
-let ui = { sort: 'recent', q: '', tag: '', finished: '', page: 1 };
+let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', page: 1 };
 
 export function init() {
   ['login', 'shelf', 'upload', 'trash'].forEach((v) => {
@@ -51,6 +51,7 @@ export function init() {
   els.searchInput = $('#searchInput');
   els.sortSel = $('#sortSel');
   els.tagCloud = $('#tagCloud');
+  els.readFilter = $('#readFilter');
   els.filterNote = $('#filterNote');
   els.loadMoreBtn = $('#loadMoreBtn');
   els.trashCount = $('#trashCount');
@@ -291,6 +292,7 @@ function filteredBooks() {
   if (ui.tag) list = list.filter((b) => (b.tags || []).includes(ui.tag));
   if (ui.finished === 'done') list = list.filter((b) => b.finished);
   if (ui.finished === 'ongoing') list = list.filter((b) => !b.finished);
+  if (ui.readState) list = list.filter((b) => readState(b) === ui.readState);
   return list;
 }
 
@@ -327,7 +329,8 @@ function renderShelf() {
   }
 
   const list = sortedBooks(filteredBooks());
-  els.filterNote.textContent = ui.q || ui.tag || ui.finished ? `筛选出 ${list.length} 本` : '';
+  els.filterNote.textContent = ui.q || ui.tag || ui.finished || ui.readState ? `筛选出 ${list.length} 本` : '';
+  renderReadFilter();
   renderTagCloud();
   renderGrid(list);
 }
@@ -377,7 +380,51 @@ function tagCounts() {
   return tagCache;
 }
 
-/** 分类导航栏（方向1）：状态频道（全部/完结/连载中）+ 全部标签 chips */
+/** 阅读状态计数：给筛选 chips 用（一眼看出还剩多少没看） */
+function readCounts() {
+  const c = { unread: 0, reading: 0, done: 0 };
+  for (const b of books) c[readState(b)]++;
+  return c;
+}
+
+/** 阅读状态筛选行：全部 / 未读 N / 在读 N / 已读完 N。
+ * 「全部」是本页的总重置入口——它同时清掉 tag / finished / readState 三个维度
+ * （标签云行里原来的「全部」已挪走，避免两处同名按钮语义打架）；
+ * 其余三个是单选，再点同一个即取消筛选。计数让「书多了还剩哪些没看」一眼可见。 */
+function renderReadFilter() {
+  const box = els.readFilter;
+  if (!box) return;
+  box.innerHTML = '';
+  const c = readCounts();
+  const mk = (label, on, act) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.classList.toggle('on', !!on);
+    b.addEventListener('click', act);
+    return b;
+  };
+  box.appendChild(
+    mk('全部', !ui.readState && !ui.tag && !ui.finished, () => {
+      ui.readState = '';
+      ui.tag = '';
+      ui.finished = '';
+      ui.page = 1;
+      renderShelf();
+    })
+  );
+  const one = (label, val, n) =>
+    mk(`${label} ${n}`, ui.readState === val, () => {
+      ui.readState = ui.readState === val ? '' : val;
+      ui.page = 1;
+      renderShelf();
+    });
+  box.appendChild(one('未读', 'unread', c.unread));
+  box.appendChild(one('在读', 'reading', c.reading));
+  box.appendChild(one('已读完', 'done', c.done));
+}
+
+/** 分类导航栏：状态频道（完结/连载中）+ 全部标签 chips */
 function renderTagCloud() {
   const cloud = els.tagCloud;
   cloud.innerHTML = '';
@@ -397,14 +444,8 @@ function renderTagCloud() {
     });
     cloud.appendChild(b);
   };
-  const all = mk('全部', !ui.tag && !ui.finished);
-  all.addEventListener('click', () => {
-    ui.tag = '';
-    ui.finished = '';
-    ui.page = 1;
-    renderShelf();
-  });
-  cloud.appendChild(all);
+  // 注：「全部」总重置按钮已挪到阅读状态筛选行（renderReadFilter）——
+  // 由它统一清除 tag / finished / readState 三个维度，避免两处「全部」语义打架。
   stateBtn('完结', 'done');
   stateBtn('连载中', 'ongoing');
   const tags = tagCounts();
@@ -501,6 +542,8 @@ async function refreshPresetTags(force = false) {
  * 所以角标只报章号、不再报百分比——章号是准的（仅换章时变），百分比注定滞后。 */
 function readState(b) {
   if (b.readDone === true) return 'done';
+  // readDone === false：用户明确标过「未读完」→ 强制不判为读完（用于摘掉自动判定出来的标记）
+  if (b.readDone === false) return b.prog && b.prog.updatedAt ? 'reading' : 'unread';
   const p = b.prog;
   if (!p || !p.updatedAt) return 'unread';
   const cc = b.chapterCount || 0;
@@ -613,6 +656,14 @@ function openSheet(b) {
   els.sheet.appendChild(title);
   const items = [
     { text: '阅读', act: () => { closeSheet(); openRead(b.id); } },
+    {
+      text: readState(b) === 'done' ? '标记为未读完' : '标记为已读完',
+      act: async () => {
+        const next = readState(b) !== 'done';
+        closeSheet();
+        await markReadDone(b, next);
+      },
+    },
     { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { closeSheet(); await safePatch(b.id, { pinned: !isPin }); } },
     { text: '编辑信息（书名/作者/标签/备注）', act: () => { closeSheet(); openEditModal(b); } },
     { text: '编辑章节（标题/正文/增删章）', act: () => { closeSheet(); openChapterEditor(b); } },
@@ -661,6 +712,20 @@ async function safePatch(id, patch) {
     await api.patchBook(id, patch);
     await loadShelf();
     if (patch.pinned !== undefined) toast(patch.pinned ? '已置顶' : '已取消置顶', 1400);
+  } catch (e) {
+    toast('操作失败：' + (e.message || e), 2500);
+  }
+}
+
+/** 手动标记「已读完」/ 摘掉标记（PATCH readDone）。
+ * 存在的意义：自动判定依赖进度（停在末章且滚动过阈值），跳着看、听书、或想手动归档时
+ * 手动标记是唯一可靠的兜底。三态由服务端与 readState 共同保证：
+ * true 强制已读完 / false 强制未读完 / 缺省走自动判定。 */
+async function markReadDone(b, done) {
+  try {
+    await api.patchBook(b.id, { readDone: done });
+    await loadShelf();
+    toast(done ? '已标记为读完' : '已取消「已读完」标记', 1600);
   } catch (e) {
     toast('操作失败：' + (e.message || e), 2500);
   }

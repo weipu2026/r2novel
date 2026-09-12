@@ -1,6 +1,6 @@
 /* reader.js — 双端阅读器（桌面：左目录+右正文 / 手机：沉浸滚读）
  * 滚读 + 进度（8s 节流 / 切后台立即存 / 离线入队回网上送）+ 目录分页 + 4 主题/字号
- * + 键盘导航（桌面）+ 工具栏自动隐藏（触屏窄屏）+ 预取 + PWA 离线兜底 + 导出
+ * + 键盘导航（桌面）+ 上下工具栏常驻 + 预取 + PWA 离线兜底 + 导出
  */
 import { api, local, fetchChaptersAll, ApiError } from './store.js';
 import { offline, bindOnlineFlush } from './offline.js';
@@ -205,6 +205,8 @@ async function renderChapter(idx, restoreRatio) {
       showTip('会话过期，请重新登录', 2000);
       throw e;
     }
+    // 等待期间用户已翻到别的章：本次失败作废（否则重试提示会盖在新章正文上）
+    if (state.cur !== idx) return;
     // 网络失败且无离线缓存：给出可点的重试入口（文案与行为对齐）
     const retry = document.createElement('p');
     retry.className = 'ch-retry';
@@ -216,6 +218,10 @@ async function renderChapter(idx, restoreRatio) {
     els.art.replaceChildren(retry);
     return;
   }
+  // 加载是异步的：若等待期间用户已翻到别的章（快速连点「下一章」/目录连点），
+  // 本次结果直接作废——否则会出现「显示的是旧章正文，而 state.cur 与随后落盘的
+  // 进度却记的是新章」，既错位又会把云端进度写坏。
+  if (state.cur !== idx) return;
   const docFrag = renderParas(text, els.art, makeChHead(idx));
   els.art.replaceChildren(docFrag);
   // 翻章淡入：消除内容瞬间替换的生硬感（重排触发重播动画；系统减动效时 CSS 侧自动关闭）
@@ -511,7 +517,7 @@ function curRatio() {
 
 function onScroll() {
   if (!state.book) return;
-  // 进度节流保存（触屏窄屏下滚动不再自动切工具栏——显隐改由正文 click 控制，避免翻页闪烁）
+  // 进度节流保存（上下工具栏已常驻，滚动只负责存进度）
   const now = Date.now();
   if (now - state.lastSave > 8000) {
     state.lastSave = now;

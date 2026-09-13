@@ -308,6 +308,7 @@ function bindProgLine() {
   const p = els.prog;
   if (!p) return;
   let dragging = false;
+  let lastTarget = -1; // 拖动中目标章去重：move 是逐像素事件，同章重复写 DOM 会让长书拖动掉帧
   const targetOf = (e) => {
     const n = state.chapters.length;
     if (!n) return 0;
@@ -316,22 +317,29 @@ function bindProgLine() {
     return Math.max(0, Math.min(n - 1, Math.round(t * (n - 1))));
   };
   const label = (i) => `第 ${i + 1}/${state.chapters.length} 章`;
+  // 拖动中提示给足 3s：去重后同章不再重置定时器，时长太短会在停顿时淡出
+  const tipFor = (i, ms = 3000) => {
+    if (i === lastTarget) return; // 目标章没变 → 不重写文案（逐像素 move 的 DOM 写就去掉了）
+    lastTarget = i;
+    showTip(label(i), ms);
+  };
   p.addEventListener('pointerdown', (e) => {
     if (!state.book || !state.chapters.length) return;
     dragging = true;
+    lastTarget = -1;
     if (p.setPointerCapture) p.setPointerCapture(e.pointerId); // 移出热区仍能收到 move/up
-    showTip(label(targetOf(e)), 1400);
+    tipFor(targetOf(e));
     e.preventDefault(); // 防触发页面滚动（配合 CSS touch-action:none）
   });
   p.addEventListener('pointermove', (e) => {
-    if (dragging) showTip(label(targetOf(e)), 1400);
+    if (dragging) tipFor(targetOf(e));
   });
   const finish = (e) => {
     if (!dragging) return;
     dragging = false;
     const i = targetOf(e);
-    showTip(label(i), 1200);
-    if (i !== state.cur) goto(i);
+    if (i !== state.cur) goto(i); // 跳章后进度线由 renderChapter 统一刷新
+    showTip(label(i), 1200); // 收尾提示总是要给（tipFor 可能因去重跳过）
   };
   p.addEventListener('pointerup', finish);
   p.addEventListener('pointercancel', () => {

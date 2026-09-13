@@ -337,6 +337,22 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   padding: 0 6px env(safe-area-inset-bottom);
   display: flex; align-items: center; justify-content: space-between;
 }
+/* 进度线：贴底栏上沿的 2px 细线（看全书进度），热区向上扩到 16px 好点好拖。
+   视觉细、热区大——不占任何按钮位，手机底栏按钮排布完全不受影响。 */
+.read-prog {
+  position: absolute; left: 0; right: 0; top: -14px; height: 16px;
+  cursor: pointer; touch-action: none;
+}
+.read-prog::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: rgba(127,127,127,.28); /* 中性半透明底线，四主题下都不刺眼 */
+}
+.read-prog-fill {
+  position: absolute; left: 0; bottom: 0; height: 2px; width: 0;
+  background: var(--accent); transition: width .12s linear;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) { .read-prog-fill { transition: none; } }
 #readScroll {
   position: fixed; top: calc(44px + env(safe-area-inset-top)); bottom: calc(46px + env(safe-area-inset-bottom)); left: 0; right: 0;
   overflow-y: auto; -webkit-overflow-scrolling: touch;

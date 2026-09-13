@@ -200,6 +200,10 @@
     <article id="readArt"></article>
   </div>
   <div class="read-bar">
+    <!-- 进度线：贴底栏上沿的 2px 细线，看进度 + 点击/拖动跳章（热区向上扩，不占按钮位） -->
+    <div id="readProg" class="read-prog" role="slider" aria-label="阅读进度" aria-valuemin="1" aria-valuenow="1" aria-valuemax="1">
+      <div id="readProgFill" class="read-prog-fill"></div>
+    </div>
     <button data-act="prev" type="button" title="上一章" aria-label="上一章">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg>
     </button>

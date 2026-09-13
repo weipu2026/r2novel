@@ -59,6 +59,8 @@ export function bindReader(root, navCb) {
     tocTitle: root.querySelector('#tocTitle'),
     tocMore: root.querySelector('#tocMore'),
     tip: root.querySelector('#readTip'),
+    prog: root.querySelector('#readProg'),
+    progFill: root.querySelector('#readProgFill'),
     prefPanel: root.querySelector('#prefPanel'),
     ppFs: root.querySelector('#ppFs'),
     ppLh: root.querySelector('#ppLh'),
@@ -107,6 +109,7 @@ export function bindReader(root, navCb) {
   // 设置面板滑杆：拖动实时预览（值域与钳制在 setFontSize/setLineHeight 内）
   if (els.ppFsRange) els.ppFsRange.addEventListener('input', () => setFontSize(els.ppFsRange.value));
   if (els.ppLhRange) els.ppLhRange.addEventListener('input', () => setLineHeight(els.ppLhRange.value));
+  bindProgLine();
   // 点正文：只用于关掉设置浮层。
   // 工具栏已改为常驻，不再轻点隐藏/唤出——原实现把 fixed 工具栏 translateY 滑出屏幕，
   // 但正文区 #readScroll 的 top/bottom 是写死的，滑走后上下反而露出与正文不同色的两条
@@ -201,6 +204,7 @@ async function renderChapter(idx, restoreRatio) {
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
   state.failedIdx = null; // 新一次渲染先按「会成功」处理，失败路径再标记
+  updateProgressLine(); // 章号此刻已定，成功/失败两路都该反映当前位置
   els.art.innerHTML = '';
   const ch = state.chapters[idx];
   let text;
@@ -285,6 +289,54 @@ async function loadChapter(idx) {
   } finally {
     state.inflight.delete(ch.key);
   }
+}
+
+/* ---------- 进度线（底栏上沿细线：看全书位置 + 点/拖跳章） ----------
+ * 手机底栏按钮位已满，故不加按钮：细线同时承担「看进度」与「跳章」。
+ * 拖动中只更新浮标文案，松手才真正 goto——拖动不触发渲染，长书也不卡。 */
+function updateProgressLine() {
+  const n = state.chapters.length || 1;
+  const i = Math.min(state.cur, n - 1);
+  if (els.progFill) els.progFill.style.width = Math.max(0.6, ((i + 1) / n) * 100) + '%';
+  if (els.prog) {
+    els.prog.setAttribute('aria-valuemax', String(n));
+    els.prog.setAttribute('aria-valuenow', String(i + 1));
+  }
+}
+
+function bindProgLine() {
+  const p = els.prog;
+  if (!p) return;
+  let dragging = false;
+  const targetOf = (e) => {
+    const n = state.chapters.length;
+    if (!n) return 0;
+    const r = p.getBoundingClientRect();
+    const t = (e.clientX - r.left) / Math.max(1, r.width); // 可能略微越界，下面夹取
+    return Math.max(0, Math.min(n - 1, Math.round(t * (n - 1))));
+  };
+  const label = (i) => `第 ${i + 1}/${state.chapters.length} 章`;
+  p.addEventListener('pointerdown', (e) => {
+    if (!state.book || !state.chapters.length) return;
+    dragging = true;
+    if (p.setPointerCapture) p.setPointerCapture(e.pointerId); // 移出热区仍能收到 move/up
+    showTip(label(targetOf(e)), 1400);
+    e.preventDefault(); // 防触发页面滚动（配合 CSS touch-action:none）
+  });
+  p.addEventListener('pointermove', (e) => {
+    if (dragging) showTip(label(targetOf(e)), 1400);
+  });
+  const finish = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const i = targetOf(e);
+    showTip(label(i), 1200);
+    if (i !== state.cur) goto(i);
+  };
+  p.addEventListener('pointerup', finish);
+  p.addEventListener('pointercancel', () => {
+    dragging = false;
+  });
 }
 
 /** 写入章缓存（LRU：命中提升为最新，超上限淘汰最久未读的章） */

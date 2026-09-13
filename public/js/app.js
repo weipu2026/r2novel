@@ -127,6 +127,18 @@ export function init() {
     }
     placeSheet(sheetAnchor);
   });
+  // 书架滚动：桌面锚定操作单是 fixed 定位、不跟随锚点，滚动后会"飘"在旧坐标上 →
+  // 滚动即关闭。只关锚定模式（sheetAnchor 非空）；手机底部操作单保持不动（本就固定在底部）。
+  const shelfBody = $('.shelf-body', els.shelf);
+  if (shelfBody) {
+    shelfBody.addEventListener(
+      'scroll',
+      () => {
+        if (sheetAnchor && !els.sheet.classList.contains('hidden')) closeSheet();
+      },
+      { passive: true }
+    );
+  }
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
   els.bbExit.addEventListener('click', exitBatchMode);
   els.bbAll.addEventListener('click', () => {
@@ -425,11 +437,13 @@ function renderReadFilter() {
     return b;
   };
   box.appendChild(
-    mk('全部', !ui.readState && !ui.tag && !ui.finished && !ui.star, () => {
+    mk('全部', !ui.readState && !ui.tag && !ui.finished && !ui.star && !ui.q, () => {
       ui.readState = '';
       ui.tag = '';
       ui.finished = '';
       ui.star = false;
+      ui.q = '';
+      els.searchInput.value = ''; // 搜索框一并清空（「全部」= 五维总重置）
       ui.page = 1;
       renderShelf();
     })

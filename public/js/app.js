@@ -636,6 +636,10 @@ function makeCard(b) {
   info.className = 'card-info';
   const t = document.createElement('em');
   t.textContent = b.title;
+  // 元信息行容器：桌面端只是 <small> 的无害外壳（角标在其内部绝对定位，不参与排版），
+  // 手机端则是「2 行卡片」的承载者——进度角标从独占第 3 行改为 inline 落在这行的右端。
+  const metaRow = document.createElement('span');
+  metaRow.className = 'card-meta-row';
   const m = document.createElement('small');
   const tags = (b.tags || []).slice(0, 2).join(' · ');
   // 「完结」标记从卡面撤掉后，元信息行在桌面最紧只有 143px（882px 视口），余量刚好归零；
@@ -644,8 +648,9 @@ function makeCard(b) {
   // 书架总计 / 上传统计 / 章节编辑器等处照旧，这里只做卡片局部精简。
   const wc = fmtWords(b.wordCount).replace(/ 万字$/, ' 万');
   m.textContent = [tags, `${b.chapterCount || 0} 章`, wc].filter(Boolean).join(' · ');
+  metaRow.appendChild(m);
   info.appendChild(t);
-  info.appendChild(m);
+  info.appendChild(metaRow);
   // 卡面不再放「完结」标记：它固定占 34px + 4px 间距 = 元信息行宽的 27%，
   // 一出现就把末尾的「3.2 万」挤掉（实测 `完结 · 仙侠 · 12 章 · 3.2 万字` 需 148px > 可用 143px）。
   // 它属于「书本身的属性」而不是我的标记，改成按需查看更合适——筛选行「完结 / 连载中」频道、
@@ -671,13 +676,15 @@ function makeCard(b) {
       const p = document.createElement('span');
       p.className = 'prog-badge' + (readState(b) === 'done' ? ' done' : '');
       p.textContent = badge;
-      c.appendChild(p);
+      metaRow.appendChild(p);
+      // 桌面端用「有没有角标」决定 ★ 落点（有角标就下移一行）。
+      // 原先是 `.prog-badge + .card-star` 相邻选择器：角标一挪进 .card-meta-row 就失效，
+      // 且相邻关系是静默的（插个元素就错位）。改成显式类，谁也不用再数兄弟顺序。
+      c.classList.add('has-badge');
     }
     // 星标＝金色 ★ 浮层（绝对定位，不进文档流）。原「★ 星标」胶囊与「完结」同行时，
     // 标记行会把卡片撑高 26px（桌面一排高低不齐、手机单卡多占 24px），浮层则完全不影响卡高。
-    // ⚠️ 必须紧跟 .prog-badge 之后且为同级兄弟：CSS 用 `.prog-badge + .card-star` 区分
-    // 「有角标 → 下移」与「无角标 → 贴顶」两种落点，中间插入别的元素会静默错位。
-    // 也须是 .card 直接子元素：挂在 .card-block 里会被 `.read-done` 的 grayscale 一起灰掉。
+    // 须是 .card 直接子元素：挂在 .card-block 里会被 `.read-done` 的 grayscale 一起灰掉。
     if (b.star) {
       const s = document.createElement('span');
       s.className = 'card-star';

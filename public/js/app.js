@@ -197,6 +197,7 @@ export function init() {
   // 上传页内任意处粘贴整段文本 → 直接当书（书名输入框等表单控件内粘贴除外）
   document.addEventListener('paste', (e) => {
     if (els.upload.classList.contains('hidden')) return; // 仅上传页生效
+    if (uploading || importing) return; // 上传进行中：一律不换会话
     if (!els.upPrev.classList.contains('hidden')) return; // 预览已出则忽略（避免误触覆盖已选文件）
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
@@ -211,6 +212,11 @@ export function init() {
 }
 
 function onNavBack() {
+  // 先关掉阅读器再切视图：closeReader 清掉 state.book，让它挂在 document / window 上的
+  // visibilitychange 与 pagehide 监听彻底停写。漏掉这一步 → 返回书架后切后台仍会写进度，
+  // 且比例读的是已 display:none 的正文区（scrollHeight 与 clientHeight 同为 0），
+  // 把云端「末章 + 读完比例」覆盖成「末章 0%」。
+  reader.closeReader();
   showView('shelf');
   loadShelf().catch(() => {});
 }
@@ -1526,6 +1532,8 @@ async function clearTrashFlow() {
 // 上传会话：{ title, bytes, preview, updating:null|{id,op,book}, keepRaw }
 let pending = null;
 let importing = false; // 批量导入进行中：屏蔽「确认入库」，防止与批量循环并发操作 pending
+// 单文件/重洗上传进行中：冻结上传会话（换文件/粘贴/拖入一律拒绝，防 pending 被换掉后串台）
+let uploading = false;
 // 本次「新建」出来的书 id：入库中途失败时用它把半成品移入回收站（否则它不在书架、也清不掉）
 let createdId = null;
 
@@ -1592,6 +1600,13 @@ function hint(text) {
 
 async function handleFiles(files) {
   if (!files.length) return;
+  // 上传进行中冻结会话：此时换文件会把 pending 换掉，而正文与原件要等到 await 之后才读
+  // → 章节表来自旧文件、正文与原件来自新文件，产出「标题A/正文B」的坏书且全程无报错。
+  if (uploading || importing) {
+    els.upFile.value = ''; // 复位，否则下次选同一个文件 change 不再触发
+    toast('上传进行中，请等本次完成后再换文件', 2600);
+    return;
+  }
   if (files.length > 1) {
     await importBatch(files);
     return;
@@ -1629,7 +1644,8 @@ async function importBatch(files) {
       setProg(i / n, `处理 ${i + 1}/${n}：《${title}》`);
       try {
         const buf = new Uint8Array(await file.arrayBuffer());
-        pending = { title, bytes: buf, updating: null, keepRaw };
+        const sess = { title, bytes: buf, updating: null, keepRaw };
+        pending = sess;
         runPreview();
         els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
         const preview = pending.preview;
@@ -1652,7 +1668,7 @@ async function importBatch(files) {
           continue;
         }
         createdId = created.id;
-        const pub = await uploadChapters(created.id, created.chapterKeys, keepRaw);
+        const pub = await uploadChapters(created.id, created.chapterKeys, keepRaw, sess);
         if (pub && pub.books) lastBooks = pub.books; // 每本 publish 后的 index 快照，最后一份即全量
         createdId = null;
         ok++;
@@ -1921,11 +1937,11 @@ function renderPreviewChapters() {
   updateConfirmBtn();
 }
 
-function collectPayload() {
-  const preview = pending.preview;
+function collectPayload(session) {
+  const preview = session.preview; // 唯一调用点 onConfirm 必传 session；不兜底 pending，宁可 fail loud
   if (preview.chapters.length > CHAPTER_MAX) toast(`章节数超过上限 ${CHAPTER_MAX}，多余章节将被截断`, 2600);
   return {
-    title: els.upTitle.value.trim() || pending.title,
+    title: els.upTitle.value.trim() || session.title,
     author: els.upAuthor.value.trim(),
     tags: parseTagInput(els.upTags.value),
     note: els.upNote.value.trim(),
@@ -1943,17 +1959,22 @@ function setProg(pct, text) {
 
 async function onConfirm() {
   if (importing) return; // 批量导入中：runPreview 会重启用确认按钮，这里兜底屏蔽
+  if (uploading) return; // 已有一次上传在飞：防重复提交
   if (!pending || !pending.preview || !pending.preview.chapters.length) return;
-  const payload = collectPayload();
+  // 冻结本次会话快照：此后每次 await 之后都从 session 取数据（而非模块级 pending）。
+  // 即便期间 pending 被换文件/重置，本次上传仍用当初确认的那份，从根上杜绝串台。
+  const session = pending;
+  const payload = collectPayload(session);
   const keepRaw = els.upKeepRaw.checked;
   createdId = null;
+  uploading = true;
   els.upConfirm.disabled = true;
   els.upProgWrap.classList.remove('hidden');
 
   try {
     let pub = null;
-    if (pending.updating && pending.updating.id) {
-      pub = await uploadToExisting(pending.updating.id, pending.updating.op, payload, keepRaw);
+    if (session.updating && session.updating.id) {
+      pub = await uploadToExisting(session.updating.id, session.updating.op, payload, keepRaw, session);
     } else {
       const dup = books.find((b) => normTitle(b.title) === normTitle(payload.title));
       if (dup) {
@@ -1963,12 +1984,13 @@ async function onConfirm() {
           els.upConfirm.disabled = false;
           return;
         }
-        if (mode === 'new') pub = await createAndUpload(payload, keepRaw);
-        else pub = await uploadToExisting(dup.id, mode, payload, keepRaw);
+        if (mode === 'new') pub = await createAndUpload(payload, keepRaw, session);
+        else pub = await uploadToExisting(dup.id, mode, payload, keepRaw, session);
       } else {
-        pub = await createAndUpload(payload, keepRaw);
+        pub = await createAndUpload(payload, keepRaw, session);
       }
     }
+    uploading = false; // 上传已成功：先解冻再刷书架，loadShelf 期间用户即可开始下一次上传
     toast(pub && pub.rawFailed ? '《' + payload.title + '》已入库，但原件上传失败，重洗不可用' : '《' + payload.title + '》已入库', 2200);
     pending = null;
     els.upFile.value = '';
@@ -1986,6 +2008,8 @@ async function onConfirm() {
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
     toast('上传失败：' + (e.message || e), 3200);
+  } finally {
+    uploading = false; // 无论成败都解冻上传会话
   }
 }
 
@@ -2007,7 +2031,7 @@ function askDup(dup) {
   });
 }
 
-async function createAndUpload(payload, keepRaw) {
+async function createAndUpload(payload, keepRaw, session) {
   const created = await api.createBook(payload);
   if (created.duplicate && created.needCreate && created.book) {
     const mode = await askDup(created.book);
@@ -2023,15 +2047,15 @@ async function createAndUpload(payload, keepRaw) {
       }
       if (created2.duplicate) throw new Error('无法创建副本（同名冲突过多）');
       createdId = created2.id;
-      return uploadChapters(created2.id, created2.chapterKeys, keepRaw);
+      return uploadChapters(created2.id, created2.chapterKeys, keepRaw, session);
     }
-    return uploadToExisting(created.book.id, mode, payload, keepRaw);
+    return uploadToExisting(created.book.id, mode, payload, keepRaw, session);
   }
   createdId = created.id;
-  return uploadChapters(created.id, created.chapterKeys, keepRaw);
+  return uploadChapters(created.id, created.chapterKeys, keepRaw, session);
 }
 
-async function uploadToExisting(id, op, payload, keepRaw) {
+async function uploadToExisting(id, op, payload, keepRaw, session) {
   // append 不覆盖书名/作者/标签（保留旧书的）；replace 全量带
   const body = op === 'append' ? { op, chapters: payload.chapters, wordCount: payload.wordCount } : { op, ...payload };
   const updated = await api.updateChapters(id, body);
@@ -2041,7 +2065,7 @@ async function uploadToExisting(id, op, payload, keepRaw) {
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
   // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：替换/追加/重洗流程依赖响应里的
   // books 快照免刷新书架，漏掉会静默退化成一次全量 GET /api/books（慢链路 ~2s）
-  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw);
+  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session);
   return finalizeUpload(id, rawRes);
 }
 
@@ -2051,14 +2075,16 @@ async function uploadToExisting(id, op, payload, keepRaw) {
  *  raw 是可选附件（不勾「保留原件」就没有，书照样合法）→ 失败不算上传失败：
  *  返回 { rawFailed:true }，由调用方决定提示文案；书照常发布，仅重洗不可用。
  *  （旧实现 raw 失败 throw → onConfirm 兜底 deleteBook，会因非必需附件失败删掉整本正文。） */
-async function uploadBulkAndRaw(id, keys, keepRaw) {
-  const rawP = keepRaw && pending.bytes ? api.putRaw(id, pending.bytes) : null;
+async function uploadBulkAndRaw(id, keys, keepRaw, session) {
+  // 一律用会话快照（session），不读模块级 pending —— 上传期间 pending 可能已被换掉
+  if (!session) throw new Error('上传会话已失效，请重新选择文件');
+  const rawP = keepRaw && session.bytes ? api.putRaw(id, session.bytes) : null;
   // raw 在后台并行传输：bulk 进度文字里捎带原件状态，慢链路下 20s 黑箱不再像卡死
   rawInflightReq = rawP;
   if (rawP) setProg(0, `上传章节 0/${keys.length}（原件传输中…）`);
   let bulkErr = null;
   try {
-    await uploadMany(id, keys, pending.preview.chapters);
+    await uploadMany(id, keys, session.preview.chapters);
   } catch (e) {
     bulkErr = e;
   }
@@ -2088,8 +2114,8 @@ async function finalizeUpload(id, rawRes) {
   return { ...rawRes, ...pub }; // rawFailed + books/wordCount 等发布结果
 }
 
-async function uploadChapters(id, keys, keepRaw) {
-  const rawRes = await uploadBulkAndRaw(id, keys, keepRaw);
+async function uploadChapters(id, keys, keepRaw, session) {
+  const rawRes = await uploadBulkAndRaw(id, keys, keepRaw, session);
   return finalizeUpload(id, rawRes);
 }
 

@@ -144,6 +144,22 @@ export function bindReader(root, navCb) {
 
 /* ---------- 打开一本书 ---------- */
 let openSeq = 0; // 递增令牌：只有最新一次 openBook 允许写 state/渲染
+
+/** 关闭阅读器（返回书架时由 app.js 调用）：清空 state.book，让 saveProgress/onScroll 彻底停写。
+ * 漏掉这一步的话，返回书架后切后台仍会走到 saveProgress —— 那时正文区已 display:none，
+ * 比例读到 0，把云端「末章 + 读完比例」覆盖成「末章 0%」（跨设备跳回章首、已读完翻回在读）。
+ * 同时推进 openSeq：作废任何仍在途的 openBook，否则它 await 回来会重新把 state.book 填上。 */
+export function closeReader() {
+  openSeq++;
+  state.book = null;
+  state.chapters = [];
+  state.cur = 0;
+  state.failedIdx = null;
+  state.cache.clear();
+  state.inflight.clear();
+  state.lastSave = 0;
+}
+
 export async function openBook(id) {
   const seq = ++openSeq;
   let meta;
@@ -158,15 +174,11 @@ export async function openBook(id) {
   }
   if (seq !== openSeq) return; // meta 等待期间用户已开了别的书：本次打开整体作废
   if (!meta.chapters || !meta.chapters.length) throw new Error('这本书还没有可读章节');
-  state.book = meta;
-  state.chapters = meta.chapters.map((c, i) => ({ ...c, i }));
-  state.cache.clear();
-  state.inflight.clear();
-  state.cur = 0;
-  state.toc = { draw: TOC_PAGE, side: TOC_PAGE };
 
-  // 恢复进度（本地 / 云端均为 1-based 章节号，取较新；0/-1 视为未读首章）
-  const clampCh = (x) => Math.max(0, Math.min(state.chapters.length - 1, x));
+  // 恢复进度（本地 / 云端均为 1-based 章节号，取较新；0/-1 视为未读首章）。
+  // ⚠️ 顺序要紧：进度取回之后再落 state —— 若先落 state 再 await，期间用户点返回
+  // （closeReader 已把 state.book 置 null）会被这次 await 回来重新填上，白修一场。
+  const clampCh = (x) => Math.max(0, Math.min(meta.chapters.length - 1, x));
   let ch = 0;
   let ratio = 0;
   const lp = local.getProg(id);
@@ -175,12 +187,19 @@ export async function openBook(id) {
     ratio = lp.ratio || 0;
   }
   const sp = await api.getProgress(id);
-  if (seq !== openSeq) return; // 进度请求等待期间已切书：同样作废（尚未渲染，不影响新书）
+  if (seq !== openSeq) return; // 进度请求等待期间已切书/已关闭：整次打开作废（state 尚未落，无需清理）
   if (sp && sp.updatedAt && Number.isFinite(sp.ch) && (!lp || sp.updatedAt > (lp.updatedAt || 0))) {
     ch = clampCh((sp.ch || 1) - 1);
     ratio = sp.ratio || 0;
   }
+
+  state.book = meta;
+  state.chapters = meta.chapters.map((c, i) => ({ ...c, i }));
+  state.cache.clear();
+  state.inflight.clear();
   state.cur = ch;
+  state.failedIdx = null;
+  state.toc = { draw: TOC_PAGE, side: TOC_PAGE };
 
   els.topTitle.textContent = meta.title;
   els.sideTitle.textContent = meta.title;
@@ -201,6 +220,7 @@ export async function openBook(id) {
 }
 
 async function renderChapter(idx, restoreRatio) {
+  if (!state.book) return; // 已被 closeReader 关闭：迟到的渲染请求直接作废
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
   state.failedIdx = null; // 新一次渲染先按「会成功」处理，失败路径再标记
@@ -216,7 +236,7 @@ async function renderChapter(idx, restoreRatio) {
       throw e;
     }
     // 等待期间用户已翻到别的章：本次失败作废（否则重试提示会盖在新章正文上）
-    if (state.cur !== idx) return;
+    if (!state.book || state.cur !== idx) return;
     // 失败章标记：saveProgress 见到「当前章＝失败章」一律跳过——否则切后台会把
     // 进度写成「读到该章 0%」，覆盖掉此前的真实位置（跨设备继续阅读会跳错章）
     state.failedIdx = idx;
@@ -234,7 +254,7 @@ async function renderChapter(idx, restoreRatio) {
   // 加载是异步的：若等待期间用户已翻到别的章（快速连点「下一章」/目录连点），
   // 本次结果直接作废——否则会出现「显示的是旧章正文，而 state.cur 与随后落盘的
   // 进度却记的是新章」，既错位又会把云端进度写坏。
-  if (state.cur !== idx) return;
+  if (!state.book || state.cur !== idx) return;
   const docFrag = renderParas(text, els.art, makeChHead(idx));
   els.art.replaceChildren(docFrag);
   // 翻章淡入：消除内容瞬间替换的生硬感（重排触发重播动画；系统减动效时 CSS 侧自动关闭）
@@ -578,10 +598,24 @@ function savePref() {
 }
 
 /* ---------- 进度 ---------- */
+/** 当前章滚动比例；不可测时返回 null（调用方一律跳过写盘）。三种情形必须分开：
+ *  ① 阅读器已隐藏（返回书架后切后台/锁屏）：display:none 子树 scrollHeight 与 clientHeight
+ *     同时为 0 —— 原实现 max>0 不成立就返 0，等于写下「末章 0%」，跨设备续读跳回章首、
+ *     已读完翻回在读（见 .ui-tests/verify-3bugs.mjs）。
+ *  ② 内容不足一屏（短末章/尾声）：有内容但无滚动量，整章都在眼前 → 就是读完了，返 1；
+ *     原实现同样返 0，使这类书的「已读完」结构上永远点不亮。
+ *  ③ 正常：scrollTop / (scrollHeight - clientHeight)。 */
 function curRatio() {
   const el = els.scroll;
-  const max = el.scrollHeight - el.clientHeight;
-  return max > 0 ? Math.min(1, Math.max(0, el.scrollTop / max)) : 0;
+  const sh = el.scrollHeight;
+  const ch = el.clientHeight;
+  if (sh === 0 && ch === 0) return null; // 已隐藏：比例不可测
+  if (!els.art.childElementCount) return null; // 正文未渲染/渲染中（art 已被清空）：此时
+  // scrollHeight===clientHeight（无溢出），会误判成「一屏装得下=读完」把当前章写成 100%，
+  // 覆盖云端真实进度。art 空 ⇔ 未渲染/渲染中/已关闭，一律视为不可测。
+  const max = sh - ch;
+  if (max <= 0) return 1; // 一屏装得下 → 视为已读到底
+  return Math.min(1, Math.max(0, el.scrollTop / max));
 }
 
 function onScroll() {
@@ -604,7 +638,9 @@ function onHidden() {
 function saveProgress() {
   if (!state.book) return;
   if (state.failedIdx !== null && state.failedIdx === state.cur) return; // 失败章不算读到
-  const p = { ch: state.cur + 1, ratio: curRatio(), updatedAt: Date.now() };
+  const ratio = curRatio();
+  if (ratio === null) return; // 阅读器已隐藏/未渲染：比例不可测，宁可不写也不写 0（防覆盖真实进度）
+  const p = { ch: state.cur + 1, ratio, updatedAt: Date.now() };
   local.setProg(state.book.id, p);
   if (navigator.onLine === false) {
     // 离线：入队，回网自动上送

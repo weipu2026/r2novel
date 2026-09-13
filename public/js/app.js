@@ -606,7 +606,7 @@ function readState(b) {
   return ch >= cc && (p.ratio || 0) >= READ_DONE_RATIO ? 'done' : 'reading';
 }
 
-function progBadgeText(b) {
+function progBadgeText(b, compact) {
   const st = readState(b);
   if (st === 'unread') return '';
   if (st === 'done') return '✓ 已读完';
@@ -615,7 +615,10 @@ function progBadgeText(b) {
   const first = Math.min(b.prog.ch || 0, cc);
   // 章号为 0/负（脏数据，或只标了「在读」还没真正翻过章）时不编造「读到 1/N 章」
   if (first <= 0) return '在读';
-  return `读到 ${first}/${cc} 章`;
+  // compact：手机端用的紧凑形态（「1234/1988」），比长文案省约 48px。
+  // 它是「元信息四项不删减」的一半前提，另一半是手机端整行降到 11px（见 style.css）——
+  // 只做这一半仍会差 9px，末尾「452 万」会被省略号吃掉。
+  return compact ? `${first}/${cc}` : `读到 ${first}/${cc} 章`;
 }
 
 function makeCard(b) {
@@ -675,7 +678,22 @@ function makeCard(b) {
     if (badge) {
       const p = document.createElement('span');
       p.className = 'prog-badge' + (readState(b) === 'done' ? ' done' : '');
-      p.textContent = badge;
+      // 长/短两套文案都渲染出来，由 CSS 按屏宽显隐（手机显短、桌面显长）。
+      // 不用 JS 判屏宽：窗口尺寸变化时无需重渲染，也不会出现「文案滞后于断点」。
+      // 两者相同时（✓ 已读完 / 在读）只放一份纯文本、不打类 ——
+      // 打了类就会在手机上被 .pb-full{display:none} 连唯一那份一起隐藏掉。
+      const compact = progBadgeText(b, true);
+      if (compact === badge) {
+        p.textContent = badge;
+      } else {
+        const full = document.createElement('span');
+        full.className = 'pb-full';
+        full.textContent = badge;
+        const short = document.createElement('span');
+        short.className = 'pb-compact';
+        short.textContent = compact;
+        p.append(full, short);
+      }
       metaRow.appendChild(p);
       // 桌面端用「有没有角标」决定 ★ 落点（有角标就下移一行）。
       // 原先是 `.prog-badge + .card-star` 相邻选择器：角标一挪进 .card-meta-row 就失效，

@@ -601,6 +601,12 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
   pointer-events: none; z-index: 2;
 }
 .card .prog-badge.done { background: var(--accent); color: #fff; font-weight: 600; }
+/* 角标长/短两套文案（见 app.js progBadgeText 的 compact 参数）：
+   默认（桌面）显长「读到 1234/1988 章」，手机端显短「1234/1988」，省约 48px。
+   这是「元信息四项不删减」的一半前提，另一半是手机端整行降到 11px（见下方移动端块）：
+   只缩短文案仍差 9px，末尾「452 万」会被省略号吃掉。
+   只在两套文案确实不同时才会打这两个类（✓ 已读完 / 在读 不打类，恒可见）。 */
+.card .prog-badge .pb-compact { display: none; }
 /* 已读完：书脊色点灰化 + 书名转次要色。
    刻意不用整卡 opacity —— 那会把书名和角标一起压糊，反而更难扫；
    只弱化「色点」与书名色，让读完的卡片在列表里一眼退到背景层。 */
@@ -972,7 +978,10 @@ button.danger:hover { background: #fbeeec; }
 
   /* 书架改单列紧凑列表（A1）：伪封面缩为小色点（保留同书同色辨识），
      书名不截断（最多两行），进度并入元信息行——单卡再省一整行（约 18px） */
-  .grid { grid-template-columns: 1fr; gap: 8px; }
+  /* minmax(0, 1fr) 而不是 1fr：1fr 的最小值是 auto = 卡片 min-content，
+     一旦卡片里有「不可断行的长串」（纯英文书名的整串、超长元信息）就会把整列撑宽、
+     顶破视口。minmax(0,1fr) 把列宽钉死在容器上，溢出改由书名/元信息自己省略号消化。 */
+  .grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .card { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 12px; }
   .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; padding: 0; }
   /* flex-basis 必须是 0、不能是 auto：flex 换行判定用的是「假想主轴尺寸」，auto 会取书名的
@@ -982,16 +991,33 @@ button.danger:hover { background: #fbeeec; }
   .card-info { margin-top: 0; flex: 1 1 0; min-width: 0; gap: 3px; }
   /* 元信息与进度同处一行（进度原先独占第 3 行；单卡从 3 行降到 2 行）。
      无头实测（Edge，390px 视口，新旧 CSS 同结构对比）：带进度角标的卡
-     81→61 / 76→62 / 100→80px（省 14–20px）；不带角标的卡两版同为 57px 不变。 */
-     右侧留 34px 给右下角 ⋯ 菜单：它与本行同处一个水平带，不留位就会被按钮压住。
-     （批量模式没有 ⋯（见 makeCard 的 else 分支），故用 :not(.picking) 把那 34px 还给文字。）
-     窄屏下先压 <small>（min-width:0 + 省略号），徽标 flex:0 0 auto 恒完整，
-     不会再出现「读到 12/1…」这种被截断的进度。 */
-  .card:not(.picking) .card-meta-row { padding-right: 34px; }
+     81→61 / 76→62 / 100→80px（省 14–20px）；不带角标的卡两版同为 57px 不变。
+
+     ⚠️ 下面这条 padding-right 是「角标不与右下角 ⋯ 叠字」的唯一保障，46px 是算出来的、
+     不是拍的。以卡片右边缘为基准：⋯ 左界在 38px 处（右偏 4px + 定宽 34px），
+     行内容右界在 12px + padding-right 处（12px 是卡片自身 padding），
+     故净空 = padding-right − 26。取 46px → 净空 20px（34px 时只有 8px，实测偏紧）。
+     批量模式没有 ⋯（见 makeCard 的 else 分支），用 :not(.picking) 把这 46px 还给文字。
+     窄屏下先压 <small>（min-width:0 + 省略号），徽标 flex:0 0 auto 恒完整。 */
+  .card:not(.picking) .card-meta-row { padding-right: 46px; }
+  /* ⋯ 定宽定高：Alook 等手机浏览器的「字体大小」会放大 px 字号，
+     若让按钮随字号长大，它会同时向左右和上方膨胀（上行就啃到书名末行），
+     定死 34×24 后占用区间恒定，上面的 46px 才成立。字号被放大时字形在盒内居中溢出，
+     字形本身很小（⋯ 在 24px 下约 20×6px），不会越界。 */
+  .card .card-more { width: 34px; height: 24px; padding: 0; display: grid; place-items: center; }
+  /* 元信息与角标在手机上统一降一档到 11px（--fz-2xs）：
+     目的是把「标签 · 标签 · N 章 · 字数」四项原样留在这一行里，不做任何删减。
+     实测（390px，46px 让位后行内可用 268px）：12px 时最挤的组合
+     （长标签「都市异能 · 系统流」+ 1988 章 · 452 万 + 紧凑角标 1234/1988）
+     需要 277px，末尾「452 万」会被省略号吃掉；降一档后需要 254px，留 14px 余量。
+     角标同步降到 11px 是为了同一行字号统一（混排 12/11 会显脏），不是为了省宽度。 */
+  .card-meta-row small { font-size: var(--fz-2xs); }
   .card .prog-badge {
     position: static; flex: 0 0 auto; margin-left: auto;
-    background: none; color: var(--muted); font-size: var(--fz-xs);
+    background: none; color: var(--muted); font-size: var(--fz-2xs);
   }
+  .card .prog-badge .pb-full { display: none; }     /* 手机显紧凑形态 */
+  .card .prog-badge .pb-compact { display: inline; }
   /* 已读完：手机列表里改实心印章。原设计只是把文字染成主题色，太弱，书一多根本扫不出来。 */
   .card .prog-badge.done {
     padding: 2px 10px; background: var(--accent); color: #fff;

@@ -186,9 +186,38 @@ function toWeb(req) {
     if (typeof v === 'string') headers.set(k, v);
     else if (Array.isArray(v)) for (const item of v) headers.append(k, item);
   }
-  const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : Readable.toWeb(req);
+  const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : reqBodyStream(req);
   return new Request(url.href, { method: req.method, headers, body, duplex: 'half' });
 }
+/**
+ * Node IncomingMessage → Web ReadableStream（自管，不用 Readable.toWeb）。
+ *
+ * 为什么不用 Readable.toWeb(req)：它的 onData 是裸 enqueue，没有「已关闭」判断。
+ * 消费者一旦提前取消（典型：未鉴权/参数非法的 POST 早退时 handler 调 dropBody() →
+ * req.body.cancel()），controller 被关闭，而此后到达的分片仍会 enqueue 到已关闭的
+ * controller，抛出未捕获的 ERR_INVALID_STATE("Controller is already closed")，
+ * 直接把 dev-server 进程打死 —— 现场表现为「测试莫名 Failed to fetch」，
+ * 把真正的 401/400 伪装成服务崩溃。
+ * 这里自己接管：关闭后不再 enqueue，改为 resume() 排空丢弃，进程不受影响。
+ */
+function reqBodyStream(req) {
+  let closed = false;
+  return new ReadableStream({
+    start(c) {
+      req.on('data', (chunk) => {
+        if (closed) return;
+        try { c.enqueue(chunk); } catch { closed = true; req.resume(); return; }
+        // 背压：队列满则暂停读取，消费者 pull 时再恢复（否则大文件会全量堆在内存里）
+        if (c.desiredSize !== null && c.desiredSize <= 0) req.pause();
+      });
+      req.on('end', () => { if (closed) return; closed = true; try { c.close(); } catch {} });
+      req.on('error', (e) => { if (closed) return; closed = true; try { c.error(e); } catch {} });
+    },
+    pull() { if (!closed) req.resume(); },
+    cancel() { closed = true; req.resume(); },
+  });
+}
+
 function fromWeb(res, r) {
   res.writeHead(r.status, Object.fromEntries(r.headers.entries()));
   if (r.body) {

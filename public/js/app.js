@@ -939,7 +939,7 @@ function closeModal() {
  *  用遮罩/Esc 关掉同名弹层时既不 resolve 也不复位上传态：onConfirm 永久卡在 await askDup 上，
  *  isUploading() 恒真 → 确认按钮锁死、后续选文件/粘贴全被 isBusy() 拦掉，只能刷新页面。 */
 function modalDismiss() {
-  const cancel = $('#cfNo', els.modalBox);
+  const cancel = $('#dpCancel', els.modalBox) || $('#cfNo', els.modalBox);
   if (cancel) {
     cancel.click();
     return;

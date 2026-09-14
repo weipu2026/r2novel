@@ -7,10 +7,10 @@ import { bindBusy, busy, busyDone } from './ui.js';
 import { exportBookTxt } from './exporter.js';
 import { offline } from './offline.js';
 import * as upSession from './upload/session.js';
-
-const $ = (sel, scope) => (scope || document).querySelector(sel);
-const $$ = (sel, scope) => Array.from((scope || document).querySelectorAll(sel));
-const normTitle = (s) => String(s || '').replace(/\s+/g, '');
+import { els, $, $$, esc, normTitle } from './dom.js';
+import { prepareFile, openEncPick, hint } from './upload/prepare.js';
+import { runPreview, pvIconBtn, pvIconBtnSvg } from './upload/preview.js';
+import { provide as provideUploadHost } from './upload/ctx.js';
 
 const PAGE = 60; // 书库分页
 
@@ -22,7 +22,6 @@ let presetTags = [];
 let presetTagsAt = 0; // 上次云端刷新时间（导航切换时去重，避免同一波操作连发多次 GET /api/tags）
 let presetTagsInflight = null;
 
-const els = {};
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
 let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
 
@@ -171,6 +170,19 @@ export function init() {
   });
   els.sortSel.addEventListener('change', () => { ui.sort = els.sortSel.value; ui.page = 1; renderShelf(); });
   els.loadMoreBtn.addEventListener('click', () => { ui.page++; renderShelf(); });
+
+  // 上传域（upload/）的宿主能力注入：切视图 / 刷书架 / 弹层 / 标签 chips，单向依赖 app.js
+  provideUploadHost({
+    showView,
+    loadShelf,
+    getBooks: () => books,
+    openModal,
+    closeModal,
+    confirmModal,
+    syncPresetChips,
+    refreshPresetTags,
+    parseTagInput,
+  });
 
   // 上传事件
   els.upCancel.addEventListener('click', () => showView('shelf'));
@@ -982,8 +994,6 @@ function confirmModal(text, okText = '确定') {
   });
 }
 
-const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
 /* ---------- 书架批量操作（多选治理：加/去标签、完结状态、软删） ---------- */
 let batchMode = false;
 const selected = new Set();
@@ -1593,11 +1603,6 @@ function openUpload(opts = {}) {
   els.upUpdateHint.classList.add('hidden');
 }
 
-function hint(text) {
-  els.upUpdateHint.textContent = text;
-  els.upUpdateHint.classList.remove('hidden');
-}
-
 async function handleFiles(files) {
   if (!files.length) return;
   // 上传进行中冻结会话：此时换文件会把当前会话换掉，而正文与原件要等到 await 之后才读
@@ -1713,231 +1718,6 @@ function onPasteText(e) {
   });
   hint('已粘贴文本（不计原件留档）');
   runPreview();
-}
-
-async function prepareFile(file) {
-  const buf = new Uint8Array(await file.arrayBuffer());
-  if (!els.upTitle.value) {
-    els.upTitle.value = file.name.replace(/\.(txt|text)$/i, '').trim();
-  }
-  upSession.begin({ title: els.upTitle.value.trim(), bytes: buf, updating: null, keepRaw: true });
-  els.upUpdateHint.classList.add('hidden');
-  runPreview();
-}
-
-function currentCleanOpts() {
-  const o = { ...cleaner.DEFAULT_CLEAN_OPTS };
-  const chosen = new Set($$('input[name=cleanitem]:checked', els.upCleanOpts).map((i) => i.value));
-  o.stripMarkdown = chosen.has('md');
-  o.stripRefMarks = chosen.has('ref');
-  o.cleanGarbled = chosen.has('garbled');
-  o.collapseBlank = chosen.has('blank');
-  o.indent = chosen.has('indent');
-  o.joinSoft = chosen.has('join');
-  o.unifyQuotes = chosen.has('quote');
-  o.stripSite = chosen.has('site');
-  return o;
-}
-
-/** 手动指定编码：展开下拉并填入常见编码（自动检测异常时人工纠正用） */
-function openEncPick() {
-  const enc = els.upEncoding;
-  const have = Array.from(enc.options).map((o) => o.value);
-  for (const c of ['utf-8', 'gb18030', 'big5']) {
-    if (!have.includes(c)) enc.appendChild(new Option(c, c));
-  }
-  if (!have.includes('auto')) enc.insertBefore(new Option('自动检测', 'auto'), enc.firstChild);
-  enc.value = 'auto';
-  els.encManual.classList.add('hidden');
-  els.encWrap.classList.remove('hidden');
-}
-
-function runPreview() {
-  const sess = upSession.current(); // 本函数作用域内下方已有 const cur（当前编码），故这里用 sess
-  if (!sess || !sess.bytes) return;
-  // 总开关「自动清洗排版」：关闭则整链不套清理（只按编码解码 + 分章）
-  const useClean = els.upClean.checked;
-  const cleanOpts = useClean ? currentCleanOpts() : { clean: false };
-  let forceEncoding = els.upEncoding.value;
-  if (forceEncoding === 'auto') forceEncoding = null;
-  const t0 = Date.now();
-  const r = cleaner.processBook(sess.bytes, {
-    fallbackTitle: sess.title,
-    cleanOpts,
-    forceEncoding,
-  });
-  // 服务端单章上限 2MB：超大章（整本一章兜底等）先按 UTF-8 字节边界自动分段，避免 413 中断留下半成品书
-  const fit = cleaner.fitChapters(r.chapters);
-  if (fit.extra > 0) r.fitNote = `含 ${fit.extra} 个超大单章，已自动分段`;
-  r.chapters = fit.chapters;
-  sess.preview = r;
-  sess.cleanOpts = cleanOpts;
-  const ms = Date.now() - t0;
-
-  // 编码下拉：只在该出手时才出现 ——
-  // · 自动检测且结果唯一（其余候选都解不出/分数极低）→ 纯文本展示，无下拉
-  // · 自动检测存在歧义候选 / 曾手动指定过 → 显示下拉可切换
-  const encSel = els.upEncoding;
-  const manual = !!forceEncoding;
-  const cur = forceEncoding || r.encoding;
-  const pool = manual
-    ? ['utf-8', 'gb18030', 'big5']
-    : (r.candidates || []).filter((c) => c.encoding !== 'auto' && c.score > -100).map((c) => c.encoding);
-  if (manual && !pool.includes(cur)) pool.unshift(cur);
-  const showSel = manual || pool.some((c) => c !== cur);
-  encSel.innerHTML = '';
-  encSel.appendChild(new Option('自动检测', 'auto'));
-  for (const c of pool) encSel.appendChild(new Option(c, c));
-  encSel.value = cur;
-  els.encWrap.classList.toggle('hidden', !showSel);
-  // 无歧义时隐藏下拉，但保留「手动指定编码」小入口（自动结果异常时可干预）
-  els.encManual.classList.toggle('hidden', showSel);
-  els.upDetected.textContent = manual
-    ? (r.chapters.length
-        ? `已按 ${cur} 编码解析${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''}`
-        : `按 ${cur} 编码解析失败，请换一种或改回自动检测`)
-    : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected || '未识别（整本一章）'} · 处理 ${ms}ms`;
-
-  if (upSession.isImporting()) {
-    // 批量导入：预览面板整段不可见（反馈走上传进度条），这里只需会话里的 preview 数据。
-    // 跳过 renderPreviewChapters 的 ≤500 行 DOM 重建（每本一次，纯无效开销，大库批量导入会明显卡顿）
-    els.upPrev.classList.add('hidden');
-    return;
-  }
-  els.upPrev.classList.remove('hidden');
-  // 统计与列表交给 renderPreviewChapters 实时维护（预览可编辑后章数/字数会变）
-  renderPreviewChapters();
-}
-
-/* ---------- v1.1：分章预览可编辑（改标题 / 改正文 / 增删章） ----------
- * 预览只是本地数组，直接改当前会话的 preview.chapters，确认后走原入库通道。 */
-const MAX_PREVIEW = 500;
-
-function refreshPreviewStats() {
-  const pv = upSession.current().preview;
-  const chs = pv.chapters;
-  const words = chs.reduce((s, c) => s + cleaner.countWords(c.content || ''), 0);
-  pv.words = words; // 入库 payload 从此处读取
-  els.upStats.textContent = `${chs.length} 章 · ${fmtWords(words)}${pv.fitNote ? ' · ' + pv.fitNote : ''}`;
-}
-
-function updateConfirmBtn() {
-  const cur = upSession.current();
-  const chs = cur && cur.preview ? cur.preview.chapters : [];
-  els.upConfirm.disabled = !chs.length;
-  const isUpd = !!(cur && cur.updating && cur.updating.id);
-  els.upConfirm.textContent = isUpd
-    ? (cur.updating.op === 'append' ? `追加到《${cur.updating.book.title}》` : `整本替换《${cur.updating.book.title}》`)
-    : '确认入库';
-}
-
-function pvIconBtn(text, title, onClick, danger) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'pv-btn' + (danger ? ' danger' : '');
-  b.textContent = text;
-  b.title = title;
-  b.addEventListener('click', onClick);
-  return b;
-}
-
-/** 细线 SVG 图标（与阅读工具栏同款语言）：受控字面量，非用户输入，innerHTML 安全 */
-const IC = {
-  plus: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-  x: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-  pen: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>',
-  arrow: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m0 0l-5-5m5 5l-5 5"/></svg>',
-};
-/** 图标版小按钮（与 pvIconBtn 同构，内容为 SVG） */
-function pvIconBtnSvg(name, title, onClick, danger) {
-  const b = pvIconBtn('', title, onClick, danger);
-  b.innerHTML = IC[name];
-  return b;
-}
-
-function buildPreviewRow(ch, i) {
-  const li = document.createElement('li');
-  li.className = 'pv-row';
-  const line = document.createElement('div');
-  line.className = 'pv-line';
-  const n = document.createElement('span');
-  n.className = 'ch-no';
-  n.textContent = String(i + 1);
-  const input = document.createElement('input');
-  input.className = 'ch-t';
-  input.placeholder = '第' + (i + 1) + '章';
-  input.value = ch.title || '';
-  input.addEventListener('input', () => { ch.title = input.value; });
-  const w = document.createElement('span');
-  w.className = 'ch-w';
-  const wcText = () => { w.textContent = fmtWords(cleaner.countWords(ch.content || '')); };
-  wcText();
-  const bodyBox = document.createElement('div');
-  bodyBox.className = 'pv-body hidden';
-  const ta = document.createElement('textarea');
-  ta.rows = 8;
-  ta.placeholder = '本章正文（清洗后的内容，将原样入库；标题留空则按位置自动命名）';
-  ta.value = ch.content || '';
-  ta.addEventListener('input', () => { ch.content = ta.value; wcText(); });
-  bodyBox.appendChild(ta);
-  line.append(
-    n,
-    input,
-    w,
-    pvIconBtnSvg('pen', '编辑正文', () => {
-      bodyBox.classList.toggle('hidden');
-      if (!bodyBox.classList.contains('hidden')) ta.focus();
-    }),
-    pvIconBtnSvg('plus', '在本章后插入一章', () => insertPreviewAfter(i)),
-    pvIconBtnSvg('x', '删除本章', () => {
-      upSession.current().preview.chapters.splice(i, 1);
-      renderPreviewChapters();
-    }, true)
-  );
-  li.append(line, bodyBox);
-  return li;
-}
-
-/** 在第 i 章（0-based）之后插一个空章；-1/空列表时插在最前 */
-function insertPreviewAfter(i) {
-  upSession.current().preview.chapters.splice(i + 1, 0, { title: '', content: '' });
-  renderPreviewChapters();
-  const rows = $$('#upList .pv-row');
-  const t = rows[i + 1] && rows[i + 1].querySelector('.ch-t');
-  if (t) {
-    t.focus();
-    t.scrollIntoView({ block: 'nearest' });
-  }
-}
-
-function appendPreview() {
-  upSession.current().preview.chapters.push({ title: '', content: '' });
-  renderPreviewChapters();
-  const rows = $$('#upList .pv-row');
-  const t = rows[rows.length - 1] && rows[rows.length - 1].querySelector('.ch-t');
-  if (t) {
-    t.focus();
-    t.scrollIntoView({ block: 'nearest' });
-  }
-}
-
-function renderPreviewChapters() {
-  const ul = els.upList;
-  ul.innerHTML = '';
-  const chs = upSession.current().preview.chapters;
-  chs.slice(0, MAX_PREVIEW).forEach((c, i) => ul.appendChild(buildPreviewRow(c, i)));
-  if (chs.length > MAX_PREVIEW) {
-    const li = document.createElement('li');
-    li.className = 'muted';
-    li.textContent = `…共 ${chs.length} 章，确认后全部上传`;
-    ul.appendChild(li);
-  }
-  const addLi = document.createElement('li');
-  addLi.className = 'pv-add';
-  addLi.appendChild(pvIconBtn('＋ 在末尾追加一章', '追加到末尾', appendPreview));
-  ul.appendChild(addLi);
-  refreshPreviewStats();
-  updateConfirmBtn();
 }
 
 function collectPayload(session) {

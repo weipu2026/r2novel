@@ -26,6 +26,22 @@ export function busyDone() {
   if (ui.bar) ui.bar.style.width = '0%';
 }
 
+const toastBox = { el: null, timer: null };
+
+/** 由 app.init 绑定一次 toast 元素（与 bindBusy 同款：绑定一次，全局复用） */
+export function bindToast(el) {
+  toastBox.el = el;
+}
+
+/** 右上角提示条（app 与 upload/ 各模块共用，避免双份实现） */
+export function toast(msg, ms = 2000) {
+  if (!toastBox.el) return; // 未绑定（极早期错误路径）时静默：提示不该演变成二次异常
+  toastBox.el.textContent = msg;
+  toastBox.el.classList.add('show');
+  clearTimeout(toastBox.timer);
+  toastBox.timer = setTimeout(() => toastBox.el.classList.remove('show'), ms);
+}
+
 /** 触发浏览器下载一个 Blob（整本导出走它，避免把大文本整份读进 JS 字符串） */
 export function downloadBlob(blob, filename) {
   const a = document.createElement('a');

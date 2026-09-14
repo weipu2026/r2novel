@@ -21,6 +21,7 @@ const SHELL = [
   '/js/upload/ctx.js',
   '/js/upload/prepare.js',
   '/js/upload/preview.js',
+  '/js/upload/upload.js',
   '/js/store.js',
   '/js/reader.js',
   '/js/cleaner.js',

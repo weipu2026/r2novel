@@ -2,9 +2,13 @@
  *   ① 语法门禁：node --check 递归遍历全仓库（跳过 node_modules / .git / .ui-tests / shots / .wrangler / data-*）
  *   ② 模块一致性：只查浏览器侧 public/**\/*.js —— node --check 只看语法，抓不到下面三类「运行时才炸」的缺陷，
  *      而且它们常常被 try/catch 吞成静默失败（页面零报错、功能静默失效），必须靠静态检查提前拦：
- *        a) 命名导入 / 再导出 的名字在目标模块里根本不存在（如 upload/rewash.js 漏 export）
- *        b) 全大写常量被引用却既没 import 也没声明（如 files.js 漏 import CHAPTER_MAX）
+ *        a) 命名导入 / 再导出 的名字在目标模块里根本不存在（如 upload/rewash.js 漏 export）；
+ *           副作用导入 `import './x.js'` 与 `export * from './y.js'` 无法校验名字，只校验**路径存在性**
+ *        b) 全大写常量被引用却既没 import 也没声明（如 files.js 漏 import CHAPTER_MAX）。
+ *           判据 = token 总长 ≥4，**或**该名字在 public/ 里确实被 export 过（覆盖 IC 这类短名常量）
  *        c) upload/ 里绕过 ctx.host() 直接调用宿主能力（app.js 顶层函数 / init 注入的那批）
+ *      已知边界（有意不处理，改动前先想清楚）：`export { default as X } from` 会被 exp.names 判成
+ *      未导出而误报（exportsOf 只记 hasDefault 布尔）；`host()['showName']` 括号式访问绕过规则 c。
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -36,8 +40,25 @@ console.log(`SYNTAX_OK · ${files.length} files`);
 /* ══════════════ ② public 模块一致性 ══════════════ */
 
 const PUBLIC = path.join(ROOT, 'public');
-/** init() 注入给 upload/ 的宿主能力（改 app.js 的注入名单时同步改这里） */
-const HOST_CAPS = ['showView', 'loadShelf', 'getBooks', 'openModal', 'closeModal', 'confirmModal', 'syncPresetChips', 'refreshPresetTags', 'parseTagInput'];
+/** init() 注入给 upload/ 的宿主能力 —— 从 app.js 的 `initUpload({ ... })` 实参里**自动抽取**，
+ *  不再手写镜像（手写的那份在 app.js 改了注入名单后极易忘记同步）。识别 ES6 简写与 `k: v` 两种写法。 */
+const HOST_CAPS = (() => {
+  const p = path.join(PUBLIC, 'js', 'app.js');
+  if (!fs.existsSync(p)) return [];
+  const code = stripCode(fs.readFileSync(p, 'utf8')); // 函数声明会提升，可先用后定义
+  const i = code.indexOf('initUpload(');
+  if (i < 0) return [];
+  const open = code.indexOf('(', i);
+  let depth = 0, close = -1;
+  for (let k = open; k < code.length; k++) {
+    if (code[k] === '(') depth++;
+    else if (code[k] === ')') { depth--; if (!depth) { close = k; break; } }
+  }
+  if (close < 0) return [];
+  const out = new Set();
+  for (const m of code.slice(open + 1, close).matchAll(/(?:^|[,{\s])([A-Za-z_$][\w$]*)\s*(?=[:,}]|$)/g)) out.add(m[1]);
+  return [...out];
+})();
 
 const publicFiles = [];
 (function walkPublic(d) {
@@ -47,6 +68,23 @@ const publicFiles = [];
     else if (e.name.endsWith('.js')) publicFiles.push(path.resolve(p));
   }
 })(PUBLIC);
+
+/** public/ 下所有被 export 的全大写常量名 —— 规则 b 靠它覆盖「短名常量漏 import」（如 2 字符的 IC） */
+const exportedCaps = (() => {
+  const out = new Set();
+  for (const f of publicFiles) {
+    const s = fs.readFileSync(f, 'utf8');
+    for (const m of s.matchAll(/^[ \t]*export\s+(?:const|let|var)\s+([A-Z][A-Z0-9_]*)/gm)) out.add(m[1]);
+    for (const m of s.matchAll(/^[ \t]*export\s*\{([^}]*)\}/gm)) {
+      for (const part of m[1].split(',')) {
+        const t = part.trim(); if (!t) continue;
+        const n = t.split(/\s+as\s+/).pop().trim();
+        if (/^[A-Z][A-Z0-9_]*$/.test(n)) out.add(n);
+      }
+    }
+  }
+  return out;
+})();
 
 /** 去掉注释与字符串字面量（模板串保留 ${...} 内的表达式），避免把文案当成标识符 */
 function stripCode(src) {
@@ -133,6 +171,18 @@ for (const f of publicFiles) {
       }
     }
   }
+  // 副作用导入（无绑定）与 `export * from`：名字无从校验，但**路径存在性必须校验**——
+  // 路径写错时整张模块图在运行时才炸，node --check 完全看不到
+  for (const m of raw.matchAll(/^[ \t]*import\s+['"]([^'"]+)['"]/gm)) {
+    const spec = m[1];
+    if (!spec.startsWith('.')) continue;
+    if (!getExports(path.resolve(path.dirname(f), spec))) say('MISSING FILE', `${rel} -> ${spec}（副作用导入）`);
+  }
+  for (const m of raw.matchAll(/^[ \t]*export\s*\*\s*from\s+['"]([^'"]+)['"]/gm)) {
+    const spec = m[1];
+    if (!spec.startsWith('.')) continue;
+    if (!getExports(path.resolve(path.dirname(f), spec))) say('MISSING FILE', `${rel} -> ${spec}（export * 再导出）`);
+  }
   // 再导出链
   for (const m of raw.matchAll(/^[ \t]*export\s*\{([^}]*)\}\s*from\s+['"]([^'"]+)['"]/gm)) {
     const spec = m[2];
@@ -169,10 +219,13 @@ for (const f of publicFiles) {
   for (const m of code.matchAll(/(?:^|[^\w$.])import\s*\{([^}]*)\}/g)) for (const p of m[1].split(',')) { const t = p.trim(); if (t) declared.add(t.split(/\s+as\s+/).pop().trim()); }
 
   // ---- a/b) 全大写常量被引用却既没导入也没声明（排除成员访问 a.B 与 JS 内建全局）----
+  // 判据 = token 总长 ≥4 **或** 该名字在 public/ 里确实被 export 过。后者让 IC 这类短名常量漏 import
+  // 也能被抓到，同时不会把 GET / ID / OK 之类「不是常量」的大写词误报成未定义。
   const GLOBAL_OK = new Set(['JSON', 'URLSearchParams', 'NaN', 'Infinity']);
-  const usedCaps = new Set([...code.matchAll(/(?<![\w$.])([A-Z][A-Z0-9_]{3,})\b/g)].map((m) => m[1]));
+  const usedCaps = new Set([...code.matchAll(/(?<![\w$.])([A-Z][A-Z0-9_]*)\b/g)].map((m) => m[1]));
   for (const n of usedCaps) {
-    if (!imported.has(n) && !declared.has(n) && !GLOBAL_OK.has(n)) say('UNDEF CONST', `${rel} 引用 ${n} 但既未 import 也未声明（运行时 ReferenceError）`);
+    if (imported.has(n) || declared.has(n) || GLOBAL_OK.has(n)) continue;
+    if (n.length >= 4 || exportedCaps.has(n)) say('UNDEF CONST', `${rel} 引用 ${n} 但既未 import 也未声明（运行时 ReferenceError）`);
   }
 
   // ---- c) upload/ 里调用宿主能力必须走 host().NAME( ----

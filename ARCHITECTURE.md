@@ -15,21 +15,21 @@ public/
   index.html (278)      单页多视图：shelf / upload / read / trash / login，视图切换走 showView()
   js/
     main.js             入口：import { init } from './app.js'
-    app.js (1,509)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
-    dom.js (17)         共享 DOM 薄层：els 元素表 + $ / $$ / esc / normTitle
+    app.js (1,512)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
+    dom.js (28)         共享 DOM 薄层：els 元素表 + $ / $$ / esc / normTitle + IC（图标字面量，两端共用）
     reader.js (774)     阅读器（交互禁区密度全站最高，改动前必读 §3）
     store.js (255)      api（fetch 封装）+ local（localStorage）+ fmtWords
     cleaner.js (427)    纯函数分章引擎（语义冻结：只动它必须先跑 cleaner.test）
     offline.js (143)    离线队列（进度/操作的回网补传）
     ui.js (61) / exporter.js / shared-const.js   通用薄层（bindBusy/bindToast/busy/toast）/ 导出 / 前后端共享常量
     sw.js (107)         PWA shell 缓存（CACHE 版本号由 CI 部署时 sed 替换成时间戳，本地字面量是占位符）
-    upload/ (1,147)     上传域（2026-09-13 拆分完成）：
+    upload/ (1,141)     上传域（2026-09-13 拆分完成）：
       index.js (59)       唯一对外入口：再导出 openUpload/rewashConfirm/openChapterEditor + init(caps) 注入宿主能力
       session.js (76)     上传会话状态唯一事实源（原 app.js 的 5 个上传裸变量，见 §2）
       ctx.js (21)         宿主注入点 provide(host) / host()（未注入即 fail loud）
       files.js (192)      上传页入口 openUpload + handleFiles（选文件/拖入/粘贴）+ importBatch
       prepare.js (36)     读字节建会话 / 编码选择
-      preview.js (213)    预览面板（runPreview / 分章表 / 清洗选项）
+      preview.js (205)    预览面板（runPreview / 分章表 / 清洗选项）
       upload.js (256)     上传核心链路（onConfirm / 建书 / 逐章上传 / 原件 / 重试）
       editor.js (266)     编辑章节弹层
       rewash.js (28)      重洗确认 + 转交上传链路
@@ -99,6 +99,12 @@ test/                   139 项单测；.ui-tests/（gitignored）多套 Playwri
   （只有 `verify-review-fixes` 的「两本均入库」抓得到）。**这类缺陷 `npm run check` 的 ② 模块一致性检查
   现在能拦住了**（报 `UNDEF CONST`），但静态检查只覆盖 `public/**/*.js` 的导入 / 常量 / 宿主调用三种模式，
   搬完仍要跑 §4 全套
+- **搬常量同理，而且更隐蔽**：`IC`（图标字面量）原本是 app.js 的模块级常量，跟着 `pvIconBtnSvg`
+  一起被搬进 `upload/preview.js`，但 app.js 的「标签管理」弹层还在用它 → app.js 成了「引用 `IC`
+  却没 import」的悬空引用，**一开标签管理就 `ReferenceError`、弹层空白**。当时三层全漏：`npm run check`
+  只查语法、`IC` 只有 2 字符、旧版大写常量正则要求总长 ≥4；`verify-review-fixes` 不碰标签管理，
+  唯一覆盖它的 `batch-tags-ui` 报红却被当成「既有不稳定」。**判据：搬任何模块级声明前，先 grep 全仓库
+  数一遍它的引用点，逐个确认引用方能拿到它**（本轮已把 `IC` 移到共享层 `dom.js`）
 
 **UI/CSS（改元素位置或容器时必查）**
 - 安全区：`.read-top`/`.read-bar` 的 env(safe-area-inset-*) 必须加在 **height** 上
@@ -129,20 +135,27 @@ npm run check          # 门禁一次跑完两项，任一有问题即 MODULE_FA
 #   ① 语法：全仓库 node --check（SYNTAX_OK · 40 files）
 #      跳过 node_modules / data-* / .git / .ui-tests / .wrangler / shots
 #   ② 模块一致性（MODULE_OK · 20 files）：只查 public/**/*.js，补 ① 抓不到的运行时缺陷
-#      a) 命名 import / 再导出的名字在目标模块里不存在（rewash.js 漏 export 事故）
-#      b) 全大写常量被引用却未 import / 未声明（files.js 漏 import CHAPTER_MAX 事故）
-#      c) upload/ 里绕过 ctx.host() 裸调宿主能力（含 app.js 顶层函数）
+#      a) 命名 import / 再导出的名字在目标模块里不存在（rewash.js 漏 export 事故）；
+#         副作用 import `import './x.js'` 与 `export * from './y.js'` 只校验**路径存在性**
+#      b) 全大写常量被引用却未 import / 未声明（files.js 漏 CHAPTER_MAX、app.js 悬空 IC 事故）；
+#         判据 = 名字总长 ≥4 **或** 它在 public/ 里确实被 export 过（后半句才抓得到 2 字符的 IC）
+#      c) upload/ 里绕过 ctx.host() 裸调宿主能力（含 app.js 顶层函数）；宿主能力名单从
+#         app.js 的 `initUpload({...})` 实参**自动抽取**，不再手写镜像
 npm test               # 139 项单测
 # UI 回归（每套独立数据目录、串行跑）：
 # verify-fix-3bugs(27) / audit-render-window(5) / verify-readstate / audit-marks(21)
 # audit-star-chip(10) / verify-iter3(33) / verify-batch(12) / verify-prelaunch(17)
-# verify-audit(14) / verify-audit4(12) / verify-review-fixes(11) / feat-ui(18)* / ui-desktop(20)*
+# verify-audit(14) / verify-audit4(12) / verify-review-fixes(11) / verify-0915-fixes(7)
+# feat-ui(18)* / ui-desktop(20)*
 # * 这两套要求空书架，各自单独用一个干净数据目录
 npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），35 项
 ```
 
 > 已知与重构无关的既有失败（用旧代码复跑基线同样红，别误判成回归）：`verify-publish` 12/13
-> （C2 章内滚动 updatedAt 抖动 5ms）、`batch-tags-ui` 超时、`check-raw-degrade` 正常路径文案断言。
+> （C2「章内滚动不更新镜像 updatedAt」时间敏感，三轮实测抖动 5 / 6 / 76ms）、`batch-tags-ui` 12 项里
+> 「批量软删后书架少一本」偶发时序抖动（实测数值正确：3 本 + batchBar 已隐藏 + 共 3 本）。
+> ⚠️ `batch-tags-ui` 的「标签管理列出全量标签」曾长期报红并被归因于「不稳定」，实际是 app.js
+> 悬空 `IC` 的真 BUG（见 §3，已修）。**「既有失败」必须先量出实际数值再定性**，否则会把真回归写进基线。
 
 发布：单 commit 一次 push（一次 push = 一次 CI run）；推前 `git ls-remote origin main` 确认快进；
 推后用 REST API `?head_sha=<sha>` 轮询 CI（total_count 必须=1）；线上验证加 cache-buster
@@ -153,7 +166,8 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），35 项
 - **上传域已于 2026-09-13 拆出**（触发条件 ② 命中：上传竞态反复出事）。6 步、每步一个独立
   commit + 全量回归：①session 状态收敛 ②dom.js + ctx.js，搬出 prepare/preview ③上传核心链路 +
   toast 提到 ui.js ④editor.js ⑤files/rewash/index 装配 + 上传页事件迁移 ⑥文档与推送。
-  app.js 2464 → 1509 行，§2 的 5 个上传裸变量收敛为 `upload/session.js`
+  app.js 2464 → 1509 行，§2 的 5 个上传裸变量收敛为 `upload/session.js`。
+  **2026-09-15 复审又修掉两处遗留**（悬空 `IC`、同名弹窗被遮罩关闭后上传页死锁）→ 现 1512 行
 - app.js 其余部分暂不拆（域分节清晰、系统全绿）。后续触发条件：① 新增功能域时先拆相关旧域再叠加；
   ③ 两台电脑并行开发冲突变频繁 → 按域拆文件降低合并冲突面
 - 不动：cleaner.js（纯函数语义冻结）、store/offline/sw（稳定薄层）、CSS（刚令牌化）

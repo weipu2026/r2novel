@@ -20,9 +20,11 @@ export { openUpload } from './files.js';
 export { rewashConfirm } from './rewash.js';
 export { openChapterEditor } from './editor.js';
 
-/** app.init 调用一次：注入宿主能力 + 绑定上传页事件 */
+/** app.init 调用一次：注入宿主能力 + 绑定上传页事件。重复调用只刷新宿主能力，绝不重复绑事件 */
+let _bound = false;
 export function init(caps) {
   provide(caps);
+  if (_bound) return; // 幂等守卫：document 级 paste 等全局监听尤其不能叠绑
 
   // 上传事件
   els.upCancel.addEventListener('click', () => caps.showView('shelf'));

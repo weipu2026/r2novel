@@ -1,6 +1,7 @@
 node_modules/
 .dev.vars
-data-dev/
+# 本地临时数据目录：data-dev（日常开发）/ data-uireg / data-regX（UI 回归专用）一律不入库
+data-*/
 wrangler.local.toml
 .wrangler/
 *.log

@@ -96,8 +96,9 @@ test/                   139 项单测；.ui-tests/（gitignored）多套 Playwri
   的 `init(caps)` 里注入，再在目标模块写 `host().xxx(`
 - **搬函数必须连 import 一起搬**：`importBatch` 从 app.js 搬到 files.js 时漏带 `CHAPTER_MAX` 的
   import，ReferenceError 又被同函数 `catch { fail++ }` 吞掉 → 批量导入静默 0 本入库、页面无任何报错
-  （只有 `verify-review-fixes` 的「两本均入库」抓得到）。**`npm run check` 只查语法，查不出这类问题**，
-  搬完务必核对目标模块用到的常量/函数是否都 import 了（见 §4 的模块一致性自检）
+  （只有 `verify-review-fixes` 的「两本均入库」抓得到）。**这类缺陷 `npm run check` 的 ② 模块一致性检查
+  现在能拦住了**（报 `UNDEF CONST`），但静态检查只覆盖 `public/**/*.js` 的导入 / 常量 / 宿主调用三种模式，
+  搬完仍要跑 §4 全套
 
 **UI/CSS（改元素位置或容器时必查）**
 - 安全区：`.read-top`/`.read-bar` 的 env(safe-area-inset-*) 必须加在 **height** 上
@@ -124,12 +125,14 @@ test/                   139 项单测；.ui-tests/（gitignored）多套 Playwri
 ## 4. 验证命令（改动后按此顺序，缺一不可）
 
 ```bash
-npm run check          # 语法门禁（SYNTAX_OK · 40 files）—— 只查语法，不查 ESM 命名导入
+npm run check          # 门禁一次跑完两项，任一有问题即 MODULE_FAIL 且 RC=1
+#   ① 语法：全仓库 node --check（SYNTAX_OK · 40 files）
+#      跳过 node_modules / data-* / .git / .ui-tests / .wrangler / shots
+#   ② 模块一致性（MODULE_OK · 20 files）：只查 public/**/*.js，补 ① 抓不到的运行时缺陷
+#      a) 命名 import / 再导出的名字在目标模块里不存在（rewash.js 漏 export 事故）
+#      b) 全大写常量被引用却未 import / 未声明（files.js 漏 import CHAPTER_MAX 事故）
+#      c) upload/ 里绕过 ctx.host() 裸调宿主能力（含 app.js 顶层函数）
 npm test               # 139 项单测
-# 模块一致性自检（仓库外脚本，拆分/搬迁后必跑；专补 check 的缺口）：
-#   node D:/workspace/_ui/export-check.mjs D:/workspace/r2novel/public
-#   ① import / 再导出的名字是否真的存在 ② 全大写常量是否漏 import（ReferenceError）
-#   ③ upload/ 是否裸调宿主能力（未走 host()）
 # UI 回归（每套独立数据目录、串行跑）：
 # verify-fix-3bugs(27) / audit-render-window(5) / verify-readstate / audit-marks(21)
 # audit-star-chip(10) / verify-iter3(33) / verify-batch(12) / verify-prelaunch(17)
@@ -155,4 +158,4 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），35 项
   ③ 两台电脑并行开发冲突变频繁 → 按域拆文件降低合并冲突面
 - 不动：cleaner.js（纯函数语义冻结）、store/offline/sw（稳定薄层）、CSS（刚令牌化）
 - 拆分纪律：函数+注释**整体搬家**、一个 commit 只搬一个域、每步跑 §4 全量回归后才推；
-  **搬完先跑 §4 的模块一致性自检再跑 UI 套件**（自检 1 秒出结果，UI 套件要十几分钟）
+  **搬完先跑 §4 的 `npm run check`（1 秒出结果，含模块一致性检查）再跑 UI 套件**（十几分钟）

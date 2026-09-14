@@ -22,6 +22,7 @@ const SHELL = [
   '/js/upload/prepare.js',
   '/js/upload/preview.js',
   '/js/upload/upload.js',
+  '/js/upload/editor.js',
   '/js/store.js',
   '/js/reader.js',
   '/js/cleaner.js',

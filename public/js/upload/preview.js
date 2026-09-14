@@ -80,9 +80,8 @@ export function runPreview() {
   renderPreviewChapters();
 }
 
-/* ---------- v1.1：分章预览可编辑（改标题 / 改正文 / 增删章） ----------
- * 预览只是本地数组，直接改当前会话的 preview.chapters，确认后走原入库通道。 */
-
+/* 预览可编辑（改标题 / 改正文 / 增删章）：预览只是本地数组，直接改当前会话的
+ * preview.chapters，确认后走原入库通道。超过 MAX_PREVIEW 章只渲染前 500 行，确认时仍整本上传。 */
 const MAX_PREVIEW = 500;
 
 function refreshPreviewStats() {
@@ -114,7 +113,7 @@ export function pvIconBtn(text, title, onClick, danger) {
 }
 
 /** 细线 SVG 图标（与阅读工具栏同款语言）：受控字面量，非用户输入，innerHTML 安全 */
-const IC = {
+export const IC = {
   plus: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   x: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   pen: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>',

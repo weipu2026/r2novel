@@ -6,6 +6,7 @@ import * as reader from './reader.js';
 import { bindBusy, busy, busyDone } from './ui.js';
 import { exportBookTxt } from './exporter.js';
 import { offline } from './offline.js';
+import * as upSession from './upload/session.js';
 
 const $ = (sel, scope) => (scope || document).querySelector(sel);
 const $$ = (sel, scope) => Array.from((scope || document).querySelectorAll(sel));
@@ -197,7 +198,7 @@ export function init() {
   // 上传页内任意处粘贴整段文本 → 直接当书（书名输入框等表单控件内粘贴除外）
   document.addEventListener('paste', (e) => {
     if (els.upload.classList.contains('hidden')) return; // 仅上传页生效
-    if (uploading || importing) return; // 上传进行中：一律不换会话
+    if (upSession.isBusy()) return; // 上传进行中：一律不换会话
     if (!els.upPrev.classList.contains('hidden')) return; // 预览已出则忽略（避免误触覆盖已选文件）
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
@@ -1529,13 +1530,9 @@ async function clearTrashFlow() {
 
 /* ================= 上传流程 ================= */
 
-// 上传会话：{ title, bytes, preview, updating:null|{id,op,book}, keepRaw }
-let pending = null;
-let importing = false; // 批量导入进行中：屏蔽「确认入库」，防止与批量循环并发操作 pending
-// 单文件/重洗上传进行中：冻结上传会话（换文件/粘贴/拖入一律拒绝，防 pending 被换掉后串台）
-let uploading = false;
-// 本次「新建」出来的书 id：入库中途失败时用它把半成品移入回收站（否则它不在书架、也清不掉）
-let createdId = null;
+// 上传会话状态（会话对象 / uploading / importing / createdId / rawInflightReq）
+// 统一由 upload/session.js 持有：本文件只通过它的 API 读写，不再有模块级裸变量。
+// 会话对象形状：{ title, bytes, preview, updating:null|{id,op,book}, keepRaw, cleanOpts }
 
 function openUpload(opts = {}) {
   showView('upload');
@@ -1553,17 +1550,17 @@ function openUpload(opts = {}) {
   els.upUpdateHint.classList.add('hidden');
   els.upProgWrap.classList.add('hidden');
   els.upConfirm.disabled = true;
-  pending = null;
+  upSession.clear();
   syncPresetChips(); // 重洗/新建都会重置标签输入 → 同步常用分类 chips 高亮
   if (opts.book) {
     // 重新清洗入口
-    pending = {
+    upSession.begin({
       updating: { id: opts.book.id, op: 'replace', book: opts.book },
       // title 必须带上：runPreview 用它做 fallbackTitle，缺失时 cleaners 检测不到书名会退成 "undefined"
       title: opts.book.title || '',
       bytes: null,
       keepRaw: true,
-    };
+    });
     els.upHead.textContent = '重新清洗';
     els.upTitle.value = opts.book.title || '';
     els.upAuthor.value = opts.book.author || '';
@@ -1573,12 +1570,15 @@ function openUpload(opts = {}) {
     hint(`正在用原件重新清洗《${opts.book.title}》，确认后整本替换`);
     busy(0.05, '下载原件…');
     const bookId = opts.book.id;
-    const sameSession = () => !!(pending && pending.updating && pending.updating.id === bookId);
+    const sameSession = () => {
+      const s = upSession.current();
+      return !!(s && s.updating && s.updating.id === bookId);
+    };
     api.rawBytes(bookId)
       .then((bytes) => {
-        // 下载期间用户可能又选了别的文件（pending 已被替换）→ 丢弃这次回调，避免数据串台
+        // 下载期间用户可能又选了别的文件（会话已被替换）→ 丢弃这次回调，避免数据串台
         if (!sameSession()) return;
-        pending.bytes = bytes;
+        upSession.current().bytes = bytes;
         runPreview();
       })
       .catch((e) => {
@@ -1600,9 +1600,9 @@ function hint(text) {
 
 async function handleFiles(files) {
   if (!files.length) return;
-  // 上传进行中冻结会话：此时换文件会把 pending 换掉，而正文与原件要等到 await 之后才读
+  // 上传进行中冻结会话：此时换文件会把当前会话换掉，而正文与原件要等到 await 之后才读
   // → 章节表来自旧文件、正文与原件来自新文件，产出「标题A/正文B」的坏书且全程无报错。
-  if (uploading || importing) {
+  if (upSession.isBusy()) {
     els.upFile.value = ''; // 复位，否则下次选同一个文件 change 不再触发
     toast('上传进行中，请等本次完成后再换文件', 2600);
     return;
@@ -1612,7 +1612,7 @@ async function handleFiles(files) {
     return;
   }
   const f = files[0];
-  pending = null;
+  upSession.clear();
   els.upPrev.classList.add('hidden');
   await prepareFile(f);
 }
@@ -1633,7 +1633,7 @@ async function importBatch(files) {
   let skip = 0;
   let fail = 0;
   let rawFail = 0; // 原件上传失败本数（书仍入库，重洗不可用）
-  importing = true;
+  upSession.setImporting(true);
   els.upProgWrap.classList.remove('hidden');
   els.upConfirm.disabled = true;
   let lastBooks = null;
@@ -1645,10 +1645,10 @@ async function importBatch(files) {
       try {
         const buf = new Uint8Array(await file.arrayBuffer());
         const sess = { title, bytes: buf, updating: null, keepRaw };
-        pending = sess;
+        upSession.begin(sess);
         runPreview();
         els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
-        const preview = pending.preview;
+        const preview = upSession.current().preview;
         if (!preview || !preview.chapters.length) {
           fail++;
           continue;
@@ -1667,28 +1667,28 @@ async function importBatch(files) {
           skip++; // 同名 → 跳过（批量不弹窗确认）
           continue;
         }
-        createdId = created.id;
+        upSession.setCreatedId(created.id);
         const pub = await uploadChapters(created.id, created.chapterKeys, keepRaw, sess);
         if (pub && pub.books) lastBooks = pub.books; // 每本 publish 后的 index 快照，最后一份即全量
-        createdId = null;
+        upSession.setCreatedId(null);
         ok++;
         if (pub && pub.rawFailed) rawFail++; // raw 失败不算失败：书已入库，仅重洗不可用
       } catch (e) {
         fail++;
-        if (createdId) {
+        if (upSession.createdId()) {
           // 失败时把停在 creating 的半成品移入回收站，不留孤儿数据
-          await api.deleteBook(createdId).catch(() => {});
-          createdId = null;
+          await api.deleteBook(upSession.createdId()).catch(() => {});
+          upSession.setCreatedId(null);
         }
       }
       setProg((i + 1) / n, `完成 ${ok + skip + fail}/${n}（成功 ${ok}）`);
     }
   } finally {
-    importing = false;
+    upSession.setImporting(false);
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
   }
-  pending = null;
+  upSession.clear();
   els.upFile.value = '';
   toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : '', rawFail ? `原件缺失 ${rawFail} 本（重洗不可用）` : ''].filter(Boolean).join(' · '), 3200);
   showView('shelf');
@@ -1705,12 +1705,12 @@ function onPasteText(e) {
   if (!txt || !txt.trim()) return;
   e.preventDefault();
   if (!els.upTitle.value) els.upTitle.value = '粘贴文本_' + new Date().toISOString().slice(0, 10);
-  pending = {
+  upSession.begin({
     title: els.upTitle.value.trim(),
     bytes: new TextEncoder().encode(txt),
     keepRaw: false,
     updating: null,
-  };
+  });
   hint('已粘贴文本（不计原件留档）');
   runPreview();
 }
@@ -1720,7 +1720,7 @@ async function prepareFile(file) {
   if (!els.upTitle.value) {
     els.upTitle.value = file.name.replace(/\.(txt|text)$/i, '').trim();
   }
-  pending = { title: els.upTitle.value.trim(), bytes: buf, updating: null, keepRaw: true };
+  upSession.begin({ title: els.upTitle.value.trim(), bytes: buf, updating: null, keepRaw: true });
   els.upUpdateHint.classList.add('hidden');
   runPreview();
 }
@@ -1753,15 +1753,16 @@ function openEncPick() {
 }
 
 function runPreview() {
-  if (!pending || !pending.bytes) return;
+  const sess = upSession.current(); // 本函数作用域内下方已有 const cur（当前编码），故这里用 sess
+  if (!sess || !sess.bytes) return;
   // 总开关「自动清洗排版」：关闭则整链不套清理（只按编码解码 + 分章）
   const useClean = els.upClean.checked;
   const cleanOpts = useClean ? currentCleanOpts() : { clean: false };
   let forceEncoding = els.upEncoding.value;
   if (forceEncoding === 'auto') forceEncoding = null;
   const t0 = Date.now();
-  const r = cleaner.processBook(pending.bytes, {
-    fallbackTitle: pending.title,
+  const r = cleaner.processBook(sess.bytes, {
+    fallbackTitle: sess.title,
     cleanOpts,
     forceEncoding,
   });
@@ -1769,8 +1770,8 @@ function runPreview() {
   const fit = cleaner.fitChapters(r.chapters);
   if (fit.extra > 0) r.fitNote = `含 ${fit.extra} 个超大单章，已自动分段`;
   r.chapters = fit.chapters;
-  pending.preview = r;
-  pending.cleanOpts = cleanOpts;
+  sess.preview = r;
+  sess.cleanOpts = cleanOpts;
   const ms = Date.now() - t0;
 
   // 编码下拉：只在该出手时才出现 ——
@@ -1797,8 +1798,8 @@ function runPreview() {
         : `按 ${cur} 编码解析失败，请换一种或改回自动检测`)
     : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected || '未识别（整本一章）'} · 处理 ${ms}ms`;
 
-  if (importing) {
-    // 批量导入：预览面板整段不可见（反馈走上传进度条），这里只需 pending.preview 数据。
+  if (upSession.isImporting()) {
+    // 批量导入：预览面板整段不可见（反馈走上传进度条），这里只需会话里的 preview 数据。
     // 跳过 renderPreviewChapters 的 ≤500 行 DOM 重建（每本一次，纯无效开销，大库批量导入会明显卡顿）
     els.upPrev.classList.add('hidden');
     return;
@@ -1809,22 +1810,24 @@ function runPreview() {
 }
 
 /* ---------- v1.1：分章预览可编辑（改标题 / 改正文 / 增删章） ----------
- * 预览只是本地数组，直接改 pending.preview.chapters，确认后走原入库通道。 */
+ * 预览只是本地数组，直接改当前会话的 preview.chapters，确认后走原入库通道。 */
 const MAX_PREVIEW = 500;
 
 function refreshPreviewStats() {
-  const chs = pending.preview.chapters;
+  const pv = upSession.current().preview;
+  const chs = pv.chapters;
   const words = chs.reduce((s, c) => s + cleaner.countWords(c.content || ''), 0);
-  pending.preview.words = words; // 入库 payload 从此处读取
-  els.upStats.textContent = `${chs.length} 章 · ${fmtWords(words)}${pending.preview.fitNote ? ' · ' + pending.preview.fitNote : ''}`;
+  pv.words = words; // 入库 payload 从此处读取
+  els.upStats.textContent = `${chs.length} 章 · ${fmtWords(words)}${pv.fitNote ? ' · ' + pv.fitNote : ''}`;
 }
 
 function updateConfirmBtn() {
-  const chs = pending && pending.preview ? pending.preview.chapters : [];
+  const cur = upSession.current();
+  const chs = cur && cur.preview ? cur.preview.chapters : [];
   els.upConfirm.disabled = !chs.length;
-  const isUpd = !!(pending && pending.updating && pending.updating.id);
+  const isUpd = !!(cur && cur.updating && cur.updating.id);
   els.upConfirm.textContent = isUpd
-    ? (pending.updating.op === 'append' ? `追加到《${pending.updating.book.title}》` : `整本替换《${pending.updating.book.title}》`)
+    ? (cur.updating.op === 'append' ? `追加到《${cur.updating.book.title}》` : `整本替换《${cur.updating.book.title}》`)
     : '确认入库';
 }
 
@@ -1887,7 +1890,7 @@ function buildPreviewRow(ch, i) {
     }),
     pvIconBtnSvg('plus', '在本章后插入一章', () => insertPreviewAfter(i)),
     pvIconBtnSvg('x', '删除本章', () => {
-      pending.preview.chapters.splice(i, 1);
+      upSession.current().preview.chapters.splice(i, 1);
       renderPreviewChapters();
     }, true)
   );
@@ -1897,7 +1900,7 @@ function buildPreviewRow(ch, i) {
 
 /** 在第 i 章（0-based）之后插一个空章；-1/空列表时插在最前 */
 function insertPreviewAfter(i) {
-  pending.preview.chapters.splice(i + 1, 0, { title: '', content: '' });
+  upSession.current().preview.chapters.splice(i + 1, 0, { title: '', content: '' });
   renderPreviewChapters();
   const rows = $$('#upList .pv-row');
   const t = rows[i + 1] && rows[i + 1].querySelector('.ch-t');
@@ -1908,7 +1911,7 @@ function insertPreviewAfter(i) {
 }
 
 function appendPreview() {
-  pending.preview.chapters.push({ title: '', content: '' });
+  upSession.current().preview.chapters.push({ title: '', content: '' });
   renderPreviewChapters();
   const rows = $$('#upList .pv-row');
   const t = rows[rows.length - 1] && rows[rows.length - 1].querySelector('.ch-t');
@@ -1921,7 +1924,7 @@ function appendPreview() {
 function renderPreviewChapters() {
   const ul = els.upList;
   ul.innerHTML = '';
-  const chs = pending.preview.chapters;
+  const chs = upSession.current().preview.chapters;
   chs.slice(0, MAX_PREVIEW).forEach((c, i) => ul.appendChild(buildPreviewRow(c, i)));
   if (chs.length > MAX_PREVIEW) {
     const li = document.createElement('li');
@@ -1938,7 +1941,7 @@ function renderPreviewChapters() {
 }
 
 function collectPayload(session) {
-  const preview = session.preview; // 唯一调用点 onConfirm 必传 session；不兜底 pending，宁可 fail loud
+  const preview = session.preview; // 唯一调用点 onConfirm 必传 session 快照；不兜底当前会话，宁可 fail loud
   if (preview.chapters.length > CHAPTER_MAX) toast(`章节数超过上限 ${CHAPTER_MAX}，多余章节将被截断`, 2600);
   return {
     title: els.upTitle.value.trim() || session.title,
@@ -1958,16 +1961,17 @@ function setProg(pct, text) {
 }
 
 async function onConfirm() {
-  if (importing) return; // 批量导入中：runPreview 会重启用确认按钮，这里兜底屏蔽
-  if (uploading) return; // 已有一次上传在飞：防重复提交
-  if (!pending || !pending.preview || !pending.preview.chapters.length) return;
-  // 冻结本次会话快照：此后每次 await 之后都从 session 取数据（而非模块级 pending）。
-  // 即便期间 pending 被换文件/重置，本次上传仍用当初确认的那份，从根上杜绝串台。
-  const session = pending;
+  if (upSession.isImporting()) return; // 批量导入中：runPreview 会重启用确认按钮，这里兜底屏蔽
+  if (upSession.isUploading()) return; // 已有一次上传在飞：防重复提交
+  const cur = upSession.current();
+  if (!cur || !cur.preview || !cur.preview.chapters.length) return;
+  // 冻结本次会话快照：此后每次 await 之后都从 session（这份快照）取数据，而非 session 模块的当前值。
+  // 即便期间当前会话被换文件/重置，本次上传仍用当初确认的那份，从根上杜绝串台。
+  const session = cur;
   const payload = collectPayload(session);
   const keepRaw = els.upKeepRaw.checked;
-  createdId = null;
-  uploading = true;
+  upSession.setCreatedId(null);
+  upSession.setUploading(true);
   els.upConfirm.disabled = true;
   els.upProgWrap.classList.remove('hidden');
 
@@ -1990,9 +1994,9 @@ async function onConfirm() {
         pub = await createAndUpload(payload, keepRaw, session);
       }
     }
-    uploading = false; // 上传已成功：先解冻再刷书架，loadShelf 期间用户即可开始下一次上传
+    upSession.setUploading(false); // 上传已成功：先解冻再刷书架，loadShelf 期间用户即可开始下一次上传
     toast(pub && pub.rawFailed ? '《' + payload.title + '》已入库，但原件上传失败，重洗不可用' : '《' + payload.title + '》已入库', 2200);
-    pending = null;
+    upSession.clear();
     els.upFile.value = '';
     showView('shelf');
     // publish 响应已带回发布后的 books 快照 → 直接渲染书架，省一次 GET /api/books（慢链路 ≈2s）
@@ -2001,15 +2005,15 @@ async function onConfirm() {
   } catch (e) {
     // 新建流程中途失败 → 书停在 creating 且从未进书架：看不见、回收站也清不掉。
     // 移入回收站，让用户能看见并彻底删除（或重试），不留孤儿数据。
-    if (createdId) {
-      await api.deleteBook(createdId).catch(() => {});
-      createdId = null;
+    if (upSession.createdId()) {
+      await api.deleteBook(upSession.createdId()).catch(() => {});
+      upSession.setCreatedId(null);
     }
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
     toast('上传失败：' + (e.message || e), 3200);
   } finally {
-    uploading = false; // 无论成败都解冻上传会话
+    upSession.setUploading(false); // 无论成败都解冻上传会话
   }
 }
 
@@ -2046,12 +2050,12 @@ async function createAndUpload(payload, keepRaw, session) {
         k++;
       }
       if (created2.duplicate) throw new Error('无法创建副本（同名冲突过多）');
-      createdId = created2.id;
+      upSession.setCreatedId(created2.id);
       return uploadChapters(created2.id, created2.chapterKeys, keepRaw, session);
     }
     return uploadToExisting(created.book.id, mode, payload, keepRaw, session);
   }
-  createdId = created.id;
+  upSession.setCreatedId(created.id);
   return uploadChapters(created.id, created.chapterKeys, keepRaw, session);
 }
 
@@ -2076,11 +2080,11 @@ async function uploadToExisting(id, op, payload, keepRaw, session) {
  *  返回 { rawFailed:true }，由调用方决定提示文案；书照常发布，仅重洗不可用。
  *  （旧实现 raw 失败 throw → onConfirm 兜底 deleteBook，会因非必需附件失败删掉整本正文。） */
 async function uploadBulkAndRaw(id, keys, keepRaw, session) {
-  // 一律用会话快照（session），不读模块级 pending —— 上传期间 pending 可能已被换掉
+  // 一律用会话快照（session），不读 upSession.current() —— 上传期间当前会话可能已被换掉
   if (!session) throw new Error('上传会话已失效，请重新选择文件');
   const rawP = keepRaw && session.bytes ? api.putRaw(id, session.bytes) : null;
   // raw 在后台并行传输：bulk 进度文字里捎带原件状态，慢链路下 20s 黑箱不再像卡死
-  rawInflightReq = rawP;
+  upSession.setRawReq(rawP);
   if (rawP) setProg(0, `上传章节 0/${keys.length}（原件传输中…）`);
   let bulkErr = null;
   try {
@@ -2096,15 +2100,14 @@ async function uploadBulkAndRaw(id, keys, keepRaw, session) {
       rawFailed = true; // raw 失败降级为警告，不再向上抛
     }
   }
-  rawInflightReq = null;
+  upSession.setRawReq(null);
   if (bulkErr) throw bulkErr;
   return { rawFailed };
 }
 
-/** raw 请求是否仍在途（仅用于进度文案；uploadBulkAndRaw 之外读不到 rawP，挂到模块级） */
-let rawInflightReq = null;
+/** raw 请求是否仍在途（仅用于进度文案；rawP 只在 uploadBulkAndRaw 内可见，故挂到会话状态） */
 function rawInFlight() {
-  return rawInflightReq != null;
+  return upSession.rawReq() != null;
 }
 
 /** 收尾：发布（创建/替换/追加/批量导入共用）。返回 publish 响应与 rawFailed 合并结果。 */

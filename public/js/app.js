@@ -4,7 +4,7 @@ import { BATCH_BOOKS_MAX, TRASH_DAYS, READ_DONE_RATIO } from './shared-const.js'
 import * as reader from './reader.js';
 import { bindBusy, bindToast, busy, busyDone, toast } from './ui.js';
 import { exportBookTxt } from './exporter.js';
-import { els, $, $$, esc, normTitle } from './dom.js';
+import { els, $, $$, esc, normTitle, IC } from './dom.js';
 import { init as initUpload, openUpload, rewashConfirm, openChapterEditor } from './upload/index.js';
 
 const PAGE = 60; // 书库分页
@@ -934,7 +934,10 @@ function closeModal() {
   els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
 }
-/** 遮罩点击 / Esc 的统一退出：确认弹层点「取消」（Promise resolve(false)），其余直接关 */
+/** 遮罩点击 / Esc 的统一退出：优先点「取消」按钮，让弹层自己把 Promise resolve 掉；其余直接关。
+ *  ⚠️ 必须同时认 #dpCancel —— 那是「发现同名书籍」弹层（askDup）的取消键。只认 #cfNo 的话，
+ *  用遮罩/Esc 关掉同名弹层时既不 resolve 也不复位上传态：onConfirm 永久卡在 await askDup 上，
+ *  isUploading() 恒真 → 确认按钮锁死、后续选文件/粘贴全被 isBusy() 拦掉，只能刷新页面。 */
 function modalDismiss() {
   const cancel = $('#cfNo', els.modalBox);
   if (cancel) {

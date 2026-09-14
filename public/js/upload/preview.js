@@ -4,7 +4,7 @@
  * 入库的唯一事实源），这里只负责把它画出来、把编辑写回去。
  * pvIconBtn / pvIconBtnSvg 被「编辑章节」复用（同款细线图标按钮语言）。
  */
-import { els, $$ } from '../dom.js';
+import { els, $$, IC } from '../dom.js';
 import { fmtWords } from '../store.js';
 import * as cleaner from '../cleaner.js';
 import * as upSession from './session.js';
@@ -111,14 +111,6 @@ export function pvIconBtn(text, title, onClick, danger) {
   b.addEventListener('click', onClick);
   return b;
 }
-
-/** 细线 SVG 图标（与阅读工具栏同款语言）：受控字面量，非用户输入，innerHTML 安全 */
-export const IC = {
-  plus: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-  x: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-  pen: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>',
-  arrow: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m0 0l-5-5m5 5l-5 5"/></svg>',
-};
 
 /** 图标版小按钮（与 pvIconBtn 同构，内容为 SVG） */
 export function pvIconBtnSvg(name, title, onClick, danger) {

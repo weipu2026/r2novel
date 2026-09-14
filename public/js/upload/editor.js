@@ -4,13 +4,13 @@
  * 所以每个动作都是「先与服务端对齐，再以服务端返回的章表为唯一事实源重绘」。
  * 弹层里的按钮复用 preview.js 的 pvIconBtn / pvIconBtnSvg（同款细线图标语言）。
  */
-import { els, $ } from '../dom.js';
+import { els, $, IC } from '../dom.js';
 import { api, fmtWords } from '../store.js';
 import { toast } from '../ui.js';
 import * as cleaner from '../cleaner.js';
 import { offline } from '../offline.js';
 import { host } from './ctx.js';
-import { pvIconBtn, pvIconBtnSvg, IC } from './preview.js';
+import { pvIconBtn, pvIconBtnSvg } from './preview.js';
 
 const ceState = { id: null, bookTitle: '', chapters: [], count: 0, words: 0, dirty: false };
 

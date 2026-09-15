@@ -79,8 +79,8 @@ cp .dev.vars.example .dev.vars  # 填 ADMIN_PASSWORD / SESSION_SECRET
 
 npm run dev                     # → http://localhost:8088（数据落 data-dev/）
 
-npm test                        # 单测 134 项（另开终端）
-SMOKE_PASSWORD=<.dev.vars 里的 ADMIN_PASSWORD> npm run smoke    # 端到端冒烟 58 项
+npm test                        # 单测 139 项（另开终端）
+SMOKE_PASSWORD=<.dev.vars 里的 ADMIN_PASSWORD> npm run smoke    # 端到端冒烟 55 项
 SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自动清走测试书（可重复执行）
 ```
 
@@ -89,9 +89,9 @@ SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自
 | 命令 | 说明 |
 |---|---|
 | `npm run dev` | 本地联调服务器（端口 8088，与生产共用同一套路由核心代码） |
-| `npm test` | 134 项单测（`test/*.test.mjs`，12 个文件）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 + 请求体护栏 + 阅读状态 + 星标 |
-| `npm run smoke` | 端到端冒烟 58 项：M1 全链路 + M2 管理整套 + OPDS 通道；`SMOKE_CLEANUP=1` 结束自动清理测试书 |
-| `npm run check` | 跨平台语法检查（递归遍历全仓库 js，跳过 node_modules/data-dev/.git） |
+| `npm test` | 139 项单测（`test/*.test.mjs`，13 个文件）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 + 请求体护栏 + 阅读状态 + 星标 |
+| `npm run smoke` | 端到端冒烟 55 项：M1 全链路 + M2 管理整套 + v1.1 章节编辑 + OPDS 通道；`SMOKE_CLEANUP=1` 结束自动清理测试书 |
+| `npm run check` | 两道门禁：① 跨平台语法检查（递归遍历全仓库 js，跳过 node_modules/data-*/.git）② 模块一致性（命名导入/再导出存在性、全大写常量漏 import、上传域宿主能力、import/export 路径存在性），任一违规 RC=1 |
 | `npm run icons` | 重新生成 PWA 图标（零依赖 zlib 手写 PNG） |
 | `npm run deploy` | 本地 `wrangler deploy`（日常部署走 GitHub Actions，见下） |
 
@@ -223,20 +223,31 @@ r2novel/
 │   ├── css/style.css      手机优先 + 桌面（≥900px）三栏阅读布局
 │   └── js/
 │       ├── main.js        启动入口 + PWA 注册
-│       ├── app.js         登录/书架（分类·批量·标签治理）/上传/回收站/章节编辑
+│       ├── app.js         登录/书架（分类·批量·标签治理）/回收站；上传域经 initUpload() 注入 9 项宿主能力
+│       ├── dom.js         共享 DOM 层（els/$/$$/esc + IC 图标常量，app 与 upload 共用）
 │       ├── reader.js      阅读器（目录双容器/键盘导航/进度/Aa 面板/离线兜底）
 │       ├── store.js       API 客户端 + localStorage 镜像 + 并发拉全章
 │       ├── cleaner.js     编码识别 + 清理规则 + 智能分章引擎
 │       ├── offline.js     IndexedDB 封装（章/书目/离线进度队列）
-│       ├── ui.js          共用：忙碌层 + 文件下载
+│       ├── ui.js          共用：忙碌层 + toast + 文件下载
 │       ├── exporter.js    共用：导出清洗后 txt
-│       └── shared-const.js 前后端共用数值协议（唯一来源：批大小/上限/已读完阈值，防数字漂移）
+│       ├── shared-const.js 前后端共用数值协议（唯一来源：批大小/上限/已读完阈值，防数字漂移）
+│       └── upload/        上传域（自 app.js 拆分，单向依赖 app→index→各模块→dom/store/ui，无环）
+│           ├── index.js   装配入口：事件接线 + 宿主能力经 ctx 注入
+│           ├── ctx.js     宿主注入点（provide/host，未注入 fail loud）
+│           ├── session.js 上传会话状态（isBusy/clear，init 幂等守卫）
+│           ├── files.js   文件选择/拖拽/粘贴收集
+│           ├── prepare.js 建书准备（去重 弹窗、预设标签）
+│           ├── preview.js 清洗分章预览（逐章核对/重洗）
+│           ├── upload.js  上传核心链路（逐章 + bulk 通道）
+│           ├── editor.js  就地编辑章节（搬自 app.js）
+│           └── rewash.js  重新清洗入口
 ├── scripts/
 │   ├── dev-server.mjs     本地联调服务器（fs store，与生产同一 router）
 │   ├── smoke.mjs          端到端冒烟（SMOKE_CLEANUP=1 自动清理测试书，CI 幂等）
-│   ├── check.mjs          跨平台语法检查
+│   ├── check.mjs          语法检查 + 模块一致性门禁
 │   └── gen-icon.mjs       零依赖手写 PNG 图标
-├── test/                  12 个单测文件，134 项（`test/*.test.mjs`，公共脚手架见 _harness.mjs）
+├── test/                  13 个单测文件，139 项（`test/*.test.mjs`，公共脚手架见 _harness.mjs）
 ├── .github/workflows/deploy.yml   push main → 测试 → 部署 → 生产冒烟
 ├── wrangler.toml          Worker/R2/限额配置（无凭据无域名）
 └── .dev.vars.example      本地开发变量模板
@@ -267,10 +278,10 @@ r2novel/
 
 | 验证 | 结果 |
 |---|---|
-| 单测（`test/*.test.mjs`，12 个文件） | 134/134 ✓ |
-| 端到端冒烟（M1 全链路 + M2 管理整套 + OPDS 通道） | 58/58 ✓ |
+| 单测（`test/*.test.mjs`，13 个文件） | 139/139 ✓ |
+| 端到端冒烟（M1 全链路 + M2 管理整套 + v1.1 章节编辑 + OPDS 通道） | 55/55 ✓ |
 | 浏览器实测套件（`.ui-tests/`，gitignored，本地串行跑） | iter3 31 · readstate 20 · audit 14 · audit4 12 · prelaunch 17 · batch 12 · review-fixes 11 · desktop 20 ✓ |
-| 语法检查（`npm run check`）/ wrangler 打包 dry-run | ✓ |
+| 语法检查 + 模块一致性门禁（`npm run check`）/ wrangler 打包 dry-run | ✓ |
 | OPDS / 整本导出（Basic Auth + 流式拼章 + XML 转义 + 防爆破覆盖 + 40 章护栏） | 单测 + 冒烟覆盖 ✓ |
 | 超大单章自动分段（UTF-8 边界安全，>2MB 不再 413 中断） | cleaner 单测覆盖 ✓ |
 | 登录安全加固（恒时口令比较 / 防爆破持久锁定 / 安全响应头） | 审计用例覆盖 ✓ |

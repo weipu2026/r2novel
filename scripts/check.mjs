@@ -247,3 +247,55 @@ if (problems) {
   process.exit(1);
 }
 console.log(`MODULE_OK · ${publicFiles.length} files`);
+
+/* ══════════════ ③ SW SHELL 清单一致性 ══════════════
+ * SHELL 是离线壳的预缓存清单，历来靠手写维护——「新增模块忘了加进 SHELL」与
+ * 「漏搬常量」同族（手写镜像必漂移），且离线用户只会表现为断网后打不开，平时毫无症状。
+ * 这里不做手写镜像，而是**双向比对**：
+ *   期望集合 = public/ 下全部可预缓存静态资源（js / css / manifest / icons / index.html；
+ *             排除 _headers —— CF 配置文件非页面资源；排除 sw.js —— SW 不预缓存自身）。
+ *   SW_MISSING：期望集合里有、SHELL 没有 → 离线壳缺文件（新模块上线离线不可用）
+ *   SW_UNKNOWN：SHELL 里有、public/ 没有 → 清单指向已删除/改名文件（404 白缓存）
+ * index.html 特例：'/' 与 '/index.html' 都算覆盖（现清单两者并存，不必二选一）。
+ */
+{
+  const swPath = path.join(PUBLIC, 'sw.js');
+  const m = fs.readFileSync(swPath, 'utf8').match(/const\s+SHELL\s*=\s*\[([\s\S]*?)\]/);
+  if (!m) {
+    say('SW SHELL', 'sw.js 里找不到 SHELL 数组定义');
+  } else {
+    const shell = [...m[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]);
+    const shellSet = new Set(shell);
+    if (shellSet.size !== shell.length) say('SW SHELL', `SHELL 存在重复条目：${shell.filter((v, i) => shell.indexOf(v) !== i).join(' ')}`);
+
+    // 期望集合：public/ 下静态资源（排除 _headers / sw.js）
+    const assets = [];
+    (function walkAssets(d) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walkAssets(p);
+        else {
+          const rel = '/' + path.relative(PUBLIC, p).split(path.sep).join('/');
+          if (rel === '/_headers' || rel === '/sw.js') continue;
+          if (/\.(js|css|webmanifest|png|svg|woff2?)$/.test(rel) || rel === '/index.html') assets.push(rel);
+        }
+      }
+    })(PUBLIC);
+
+    const covered = (asset) =>
+      asset === '/index.html' ? shellSet.has('/') || shellSet.has('/index.html') : shellSet.has(asset);
+    for (const a of assets) if (!covered(a)) say('SW MISSING', `静态资源 ${a} 不在 SHELL 预缓存清单（离线壳缺文件）`);
+
+    const expected = new Set(assets);
+    for (const s of shellSet) {
+      if (s === '/' || s === '/index.html') continue; // index.html 的两种写法都合法
+      if (!expected.has(s)) say('SW UNKNOWN', `SHELL 条目 ${s} 在 public/ 下不存在（404 白缓存，多为改名/删除后忘清）`);
+    }
+  }
+}
+
+if (problems) {
+  console.log(`\nCHECK_FAIL · total problems=${problems}`);
+  process.exit(1);
+}
+console.log(`SHELL_OK · ${problems === 0 ? '清单与 public/ 静态资源一致' : ''}`.trimEnd());

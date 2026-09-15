@@ -2,7 +2,7 @@
 
 > 本文档是**随仓库走的显性契约**：无论谁（另一台电脑的你、未来的你、AI 辅助）改这份代码，
 > 先读这一页。核心原则：**这里列的守卫与约束是历次实测踩坑换来的，改动时只许搬移、不许重写。**
-> 最后更新：2026-09-13（上传域拆分 6 步完成，commit 3e7d52e 之后）。
+> 最后更新：2026-09-15（索引 v2 分片 + SW 门禁 + 部署后核验落地之后）。
 
 ## 1. 全站地图
 
@@ -10,7 +10,8 @@
 （不要手动 `npm run deploy`，会让线上领先于 GitHub，下次 CI 会回滚你的改动）。
 
 ```
-src/router.js (1,976)   Workers 入口：~25 个 API 端点（apiXxx 函数 + 集中 dispatch）
+src/router.js (2,242)   Workers 入口：~25 个 API 端点（apiXxx 函数 + 集中 dispatch）；
+                        书架索引 v2 分片存储（openIndex/makeHandle/migrateV1/rebuildIdxRoot，见 §6）
 public/
   index.html (278)      单页多视图：shelf / upload / read / trash / login，视图切换走 showView()
   js/
@@ -35,8 +36,10 @@ public/
       rewash.js (28)      重洗确认 + 转交上传链路
   css/style.css (1,057) 设计令牌化完毕（--accent 等），断点两套：移动 / ≥900px 桌面
 scripts/dev-server.mjs  本地 :8088，自动读 .dev.vars；R2NOVEL_DATA=<不含斜杠的相对名> 换数据目录
-test/                   139 项单测；.ui-tests/（gitignored）多套 Playwright 回归
-数据布局（R2）: index.json + novels/<nid>.json + content/<nid>/<vid>.txt + raw/<nid> + _trash/
+scripts/verify-deploy.mjs 部署后核验：拉生产静态文件与仓库哈希比对（CI 最后一步自动跑）
+test/                   146 项单测（14 文件；index-shards.test.mjs = 分片专项）；.ui-tests/（gitignored）多套 Playwright 回归
+数据布局（R2）: meta/idx/{root,s<N>}.json(+.bak) 书架索引 v2 分片 + meta/<id>.json + meta/sec/st/<id> + text/<id>/<key>.txt
+                + raw/<id>.txt + progress/<id>.json + meta/trash.json + meta/index.json(v1 冻结快照)
 ```
 
 依赖方向单向、无环：
@@ -131,8 +134,8 @@ test/                   139 项单测；.ui-tests/（gitignored）多套 Playwri
 ## 4. 验证命令（改动后按此顺序，缺一不可）
 
 ```bash
-npm run check          # 门禁一次跑完两项，任一有问题即 MODULE_FAIL 且 RC=1
-#   ① 语法：全仓库 node --check（SYNTAX_OK · 40 files）
+npm run check          # 门禁一次跑完三项，任一有问题即 CHECK_FAIL 且 RC=1
+#   ① 语法：全仓库 node --check（SYNTAX_OK · 42 files）
 #      跳过 node_modules / data-* / .git / .ui-tests / .wrangler / shots
 #   ② 模块一致性（MODULE_OK · 20 files）：只查 public/**/*.js，补 ① 抓不到的运行时缺陷
 #      a) 命名 import / 再导出的名字在目标模块里不存在（rewash.js 漏 export 事故）；
@@ -141,14 +144,17 @@ npm run check          # 门禁一次跑完两项，任一有问题即 MODULE_FA
 #         判据 = 名字总长 ≥4 **或** 它在 public/ 里确实被 export 过（后半句才抓得到 2 字符的 IC）
 #      c) upload/ 里绕过 ctx.host() 裸调宿主能力（含 app.js 顶层函数）；宿主能力名单从
 #         app.js 的 `initUpload({...})` 实参**自动抽取**，不再手写镜像
-npm test               # 139 项单测
+#   ③ SW SHELL 双向比对（SHELL_OK）：public/ 全部静态资源必须在 SHELL 预缓存清单里
+#      （SW MISSING），SHELL 条目必须真实存在（SW UNKNOWN）——手写清单漂移在此被拦
+npm test               # 146 项单测（含 index-shards 分片专项 7 项）
 # UI 回归（每套独立数据目录、串行跑）：
 # verify-fix-3bugs(27) / audit-render-window(5) / verify-readstate / audit-marks(21)
 # audit-star-chip(10) / verify-iter3(33) / verify-batch(12) / verify-prelaunch(17)
 # verify-audit(14) / verify-audit4(12) / verify-review-fixes(11) / verify-0915-fixes(7)
 # feat-ui(18)* / ui-desktop(20)*
 # * 这两套要求空书架，各自单独用一个干净数据目录
-npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），35 项
+npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
+# CI 部署链：单测+门禁 → 建桶 → 部署 → 同步密钥 → 生产冒烟(55) → verify-deploy.mjs 哈希核验
 ```
 
 > 已知与重构无关的既有失败（用旧代码复跑基线同样红，别误判成回归）：`verify-publish` 12/13
@@ -158,8 +164,35 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），35 项
 > 悬空 `IC` 的真 BUG（见 §3，已修）。**「既有失败」必须先量出实际数值再定性**，否则会把真回归写进基线。
 
 发布：单 commit 一次 push（一次 push = 一次 CI run）；推前 `git ls-remote origin main` 确认快进；
-推后用 REST API `?head_sha=<sha>` 轮询 CI（total_count 必须=1）；线上验证加 cache-buster
-与本地剔除行尾 diff。
+推后用 REST API `?head_sha=<sha>` 轮询 CI（total_count 必须=1）；CI 末步自动跑
+`scripts/verify-deploy.mjs`（生产静态文件与仓库哈希比对，排除 sw.js——部署时会改写 CACHE 版本号），
+本地抽查仍可 cache-buster + 下载比对（行尾归一化后比）。
+
+## 6. 书架索引 v2 分片契约（2026-09-15 落地，改存储层前必读）
+
+**布局**：`meta/idx/root.json`（`{v:2, shards:n, map:{id:分片号}}`）+ `meta/idx/s<N>.json`
+（≤500 本/片，`{books:[摘要]}`），各带 `.bak`。**v1 的 `meta/index.json` 迁移后冻结**：
+不再读不再写，本体保留（旧代码回滚窗口）+ 原文另存 `meta/index.json.v1.bak` 双保险。
+
+**读写形态**（`openIndex(store, opts)`）：
+- full（默认）：root + 全部分片聚合，`GET /api/books`/publish 响应/opds/标签清单用——响应形状与 v1 完全一致
+- `{ id }` 单书模式：root + 该书所在片（热路径：进度镜像/PATCH/就地编辑同步/软删/恢复）
+- `{ ids }` 并集模式：批量治理用，只载目标所在片
+
+**预算纪律**（48 子请求软顶）：
+- 单书写 = root 1 读 + 1 片读 + 片写 + bak ≈ 4~5，永远安全
+- 批量/标签：`1 + 3k + 2N ≤ 48`（k=目标跨片数），超出**贪心裁剪**返回 rest/remaining 续调
+- diag/purgeOrphans：预算基数 = `2 + idx.shardCount`（root+分片+trash）
+
+**自愈链**（读路径只读回退，不在读时写盘）：root 坏 → root.bak → 由分片重建（`rebuildIdxRoot`）；
+分片坏 → 片 .bak → 双坏则该片按空处理且 **save() 拒绝写入**（`shardRaw===undefined` throw）——
+绝不允许把空片固化（v1 的真数据丢失路径）。书 meta 都在 R2，可经「检查残留→无主书→回收站→恢复」重建。
+
+**禁忌**：
+- **禁止再读写 `meta/index.json`**（测试也走 `_harness.mjs` 的 `readIdxBooks/writeIdxBooks`）
+- root 首次落盘（迁移/新库）**没有写前状态**，跳过 root bak——拿「空 root」当 bak 会伪造合法空布局
+- 迁移必须**均匀整块切**（500/片），不要逐本 append+拆分（会留 251/250 参差片）
+- 新增 API 的 index 读写一律走 `openIndex` 三种模式，别绕过 handle 直接拼 key
 
 ## 5. 何时拆分（触发条件，满足才动，不为整洁而整洁）
 

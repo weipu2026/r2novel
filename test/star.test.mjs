@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { KEY } from '../src/router.js';
-import { memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
 
 async function makeReadyBook(store, cookie, title, n) {
   const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));
@@ -84,10 +84,10 @@ test('星标：老书没有 star 字段 → 不报错、判定为未标星，且
   const cookie = await login(store);
   const id = await makeReadyBook(store, cookie, '老书兼容', 2);
 
-  // 手工抹掉 meta/index 里的 star，模拟加字段之前入库的书
-  const idx = JSON.parse(await store.getText('meta/index.json'));
-  for (const b of idx.books) delete b.star;
-  await store.putText('meta/index.json', JSON.stringify(idx));
+  // 手工抹掉索引分片里的 star，模拟加字段之前入库的书
+  const books = await readIdxBooks(store);
+  for (const b of books) delete b.star;
+  await writeIdxBooks(store, books);
   const meta = JSON.parse(await store.getText(KEY.book(id)));
   delete meta.star;
   await store.putText(KEY.book(id), JSON.stringify(meta));

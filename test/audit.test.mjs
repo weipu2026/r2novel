@@ -173,13 +173,13 @@ test('审计：replace 章节数变少 —— 孤儿正文先清一批、publish
   assert.ok(!('orphans' in r.data), 'bookMeta 响应不应暴露 orphans');
 });
 
-test('审计：进度镜像 —— 书不在架不写 index；位置无变化跳过全量重写', async () => {
+test('审计：进度镜像 —— 书不在架不写索引分片；位置无变化跳过分片重写', async () => {
   const writes = { index: 0 };
   const raw = memStore();
   const store = {
     ...raw,
     async putText(k, s) {
-      if (k === 'meta/index.json') writes.index++;
+      if (/^meta\/idx\/s\d+\.json$/.test(k)) writes.index++; // 只计分片本体（bak/root 另计）
       return raw.putText(k, s);
     },
   };

@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
 import { READ_DONE_RATIO } from '../public/js/shared-const.js';
 
 async function makeReadyBook(store, cookie, title, n) {
@@ -32,8 +32,9 @@ async function makeReadyBook(store, cookie, title, n) {
 
 /** 读 index 里该书的进度镜像（书架角标就是从这里取数的） */
 async function progOf(store, id) {
-  const idx = JSON.parse(await store.getText('meta/index.json'));
-  const b = (idx.books || []).find((x) => x.id === id);
+  const books = await readIdxBooks(store);
+  if (!books) return null;
+  const b = books.find((x) => x.id === id);
   return b ? b.prog : null;
 }
 
@@ -99,9 +100,8 @@ test('镜像：无章数的书不会被误判为已读完', async () => {
   const { id } = await makeReadyBook(store, cookie, '读完镜像D', 2);
 
   // 手工把 index 里的 chapterCount 抹成 0，模拟历史脏数据
-  const idx = JSON.parse(await store.getText('meta/index.json'));
-  const books = (idx.books || []).map((b) => (b.id === id ? { ...b, chapterCount: 0, prog: undefined } : b));
-  await store.putText('meta/index.json', JSON.stringify({ books }));
+  const books = (await readIdxBooks(store)).map((b) => (b.id === id ? { ...b, chapterCount: 0, prog: undefined } : b));
+  await writeIdxBooks(store, books);
 
   await put(store, cookie, id, 1, 1);
   const p = await progOf(store, id);
@@ -120,16 +120,16 @@ test('手动标记：PATCH readDone 同时落到 meta 与 index 镜像', async (
   assert.equal(r.status, 200);
   assert.equal((await progOf(store, id)), undefined, '标记不碰进度镜像');
 
-  let idx = JSON.parse(await store.getText('meta/index.json'));
-  assert.equal(idx.books.find((b) => b.id === id).readDone, true, 'index 镜像应带 readDone');
+  let idxBooks = await readIdxBooks(store);
+  assert.equal(idxBooks.find((b) => b.id === id).readDone, true, 'index 镜像应带 readDone');
 
   const meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
   assert.equal(meta.readDone, true, 'meta 侧也要写，否则后续从 meta 重建 index 会丢标记');
 
   // 摘掉标记（false 是「强制未读完」，不等于「没标过」）
   await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: false } }));
-  idx = JSON.parse(await store.getText('meta/index.json'));
-  assert.equal(idx.books.find((b) => b.id === id).readDone, false, 'false 必须显式保留（用于摘掉自动判定的标记）');
+  idxBooks = await readIdxBooks(store);
+  assert.equal(idxBooks.find((b) => b.id === id).readDone, false, 'false 必须显式保留（用于摘掉自动判定的标记）');
 });
 
 test('手动标记：无关的 patch 不会凭空写入 readDone（老书天然兼容）', async () => {
@@ -138,8 +138,8 @@ test('手动标记：无关的 patch 不会凭空写入 readDone（老书天然�
   const { id } = await makeReadyBook(store, cookie, '手动标记B', 2);
 
   await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { pinned: true } }));
-  const idx = JSON.parse(await store.getText('meta/index.json'));
-  const b = idx.books.find((x) => x.id === id);
+  const books = await readIdxBooks(store);
+  const b = books.find((x) => x.id === id);
   assert.equal(b.pinned, true);
   assert.equal('readDone' in b, false, '没标记过的书不该出现该字段——前端据此回落自动判定');
 });
@@ -149,8 +149,8 @@ test('手动标记：新建书的 index 条目不含 readDone（走自动判定�
   const cookie = await login(store);
   const { id } = await makeReadyBook(store, cookie, '手动标记C', 2);
 
-  const idx = JSON.parse(await store.getText('meta/index.json'));
-  const b = idx.books.find((x) => x.id === id);
+  const books = await readIdxBooks(store);
+  const b = books.find((x) => x.id === id);
   assert.equal('readDone' in b, false);
   assert.equal(b.finished, false, 'finished（书是否完结）是另一个维度，不该被牵连');
 });

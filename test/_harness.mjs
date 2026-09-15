@@ -100,3 +100,31 @@ export async function login(store) {
   assert.ok(m, '应下发 rn_session cookie');
   return 'rn_session=' + m[1];
 }
+
+/* ---------------- v2 分片索引读写助手（测试观察/造数用） ----------------
+ * v2 起 index 不再是单个 meta/index.json，而是 meta/idx/root.json + s<N>.json。
+ * 测试要「看一眼书架摘要」或「整体改写摘要造数」，统一走这两个助手，禁止再硬编码 v1 key。
+ * 注意：服务端首次 openIndex 才会触发 v1→v2 迁移；在迁移前 readIdxBooks 返回 null。 */
+
+export async function readIdxBooks(store) {
+  const rootRaw = await store.getText('meta/idx/root.json');
+  if (rootRaw == null) return null;
+  const root = JSON.parse(rootRaw);
+  const out = [];
+  for (let i = 0; i < root.shards; i++) {
+    const raw = await store.getText(`meta/idx/s${i}.json`);
+    if (raw == null) continue;
+    out.push(...JSON.parse(raw).books);
+  }
+  return out;
+}
+
+/** 整库覆盖为给定 books（单分片；测试造数，书数远小于 500 上限）。root/bak 一并写齐。 */
+export async function writeIdxBooks(store, books) {
+  const body = JSON.stringify({ books });
+  const root = JSON.stringify({ v: 2, shards: 1, map: Object.fromEntries(books.map((b) => [b.id, 0])) });
+  await store.putText('meta/idx/s0.json', body);
+  await store.putText('meta/idx/s0.json.bak', body);
+  await store.putText('meta/idx/root.json', root);
+  await store.putText('meta/idx/root.json.bak', root);
+}

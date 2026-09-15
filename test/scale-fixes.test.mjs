@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { memStore, req, call, login } from './_harness.mjs';
+import { memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
 
 function pagedStore(base, pageSize = 20) {
   return {
@@ -86,14 +86,14 @@ test('镜像：章内比例变动 >2% 不重写 index 镜像，换章才更新�
   const cookie = await login(store);
   const id = await makeReadyBook(store, cookie, '镜像书', 5);
   await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 3, ratio: 0.4 } }));
-  let b = JSON.parse(await store.getText('meta/index.json')).books.find((x) => x.id === id);
+  let b = (await readIdxBooks(store)).find((x) => x.id === id);
   assert.equal(b.prog.ch, 3);
   assert.ok(Math.abs(b.prog.ratio - 0.4) < 1e-6, '首次换章应建立镜像');
   const savedAt = b.prog.updatedAt;
 
   // 同章内滚到 0.95（变动远超旧 2% 阈值）→ 镜像不动
   await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 3, ratio: 0.95 } }));
-  b = JSON.parse(await store.getText('meta/index.json')).books.find((x) => x.id === id);
+  b = (await readIdxBooks(store)).find((x) => x.id === id);
   assert.ok(Math.abs(b.prog.ratio - 0.4) < 1e-6, '章内滚动不应重写 index 镜像');
   assert.equal(b.prog.updatedAt, savedAt, '镜像 updatedAt 不应变化');
 
@@ -103,7 +103,7 @@ test('镜像：章内比例变动 >2% 不重写 index 镜像，换章才更新�
 
   // 换章 → 镜像更新
   await call(store, req(`/api/progress/${id}`, { method: 'PUT', cookie, body: { ch: 4, ratio: 0.1 } }));
-  b = JSON.parse(await store.getText('meta/index.json')).books.find((x) => x.id === id);
+  b = (await readIdxBooks(store)).find((x) => x.id === id);
   assert.equal(b.prog.ch, 4, '换章应更新镜像章号');
   assert.ok(Math.abs(b.prog.ratio - 0.1) < 1e-6, '换章应更新镜像比例');
 });
@@ -183,7 +183,7 @@ test('opds：150 本书 → p1 恰 100 条 + rel next；p2 剩余 50 条 + rel p
   for (let i = 0; i < 150; i++) {
     books.push({ id: 'b' + String(i).padStart(3, '0'), title: '书' + i, author: 'a', tags: [], chapterCount: 1, wordCount: 1, createdAt: 1700000000000 + i, updatedAt: 1700000000000 + i });
   }
-  store._map.set('meta/index.json', JSON.stringify({ books }));
+  await writeIdxBooks(store, books);
   const auth = { headers: { authorization: basic('r', 'test-pass') } };
 
   const r1 = await call(store, req('/opds', auth));

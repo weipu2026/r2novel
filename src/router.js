@@ -4,8 +4,10 @@
  * 所有数据都走 /api/* + 会话 Cookie 鉴权；R2/文件系统只由外层适配。
  *
  * R2 key 布局：
- *   meta/index.json          书架摘要（在架书，含 pinned / 进度镜像 prog）
- *   meta/index.json.bak      发布/软删/恢复前自动备份
+ *   meta/idx/root.json       书架索引 v2 根：{ v:2, shards:n, map:{ id: 分片号 } }（含 .bak）
+ *   meta/idx/s<N>.json       书架摘要分片（≤500 本/片，含 .bak；条目含 pinned / 进度镜像 prog）
+ *   meta/index.json(.bak)    v1 单文件索引——迁移后**冻结不再读写**，留作旧代码回滚窗口的只读快照；
+ *                            迁移时另存 meta/index.json.v1.bak 双保险
  *   meta/trash.json          回收站（软删书，15 天惰性清理）
  *   meta/<bookId>.json       单书元数据（章节目录表）
  *   text/<bookId>/<key>.txt  清洗后正文章节
@@ -307,9 +309,41 @@ async function readJson(store, key, fallback) {
     return fallback;
   }
 }
-const readIndex = (store) => readJson(store, KEY.INDEX, { books: [] });
+/* ---------------- 书架索引：v2 分片存储（千本级写放大消除 + 损坏自愈） ----------------
+ * v1 是单文件 meta/index.json，任何一本书的任何改动都要全量重写（千本 ≈300KB/次），
+ * 且 readIndexRaw 解析失败会静默回落空书架、下一次写把空架固化 —— 真·数据丢失路径。
+ * v2 分片后：
+ *   写 = 只写脏分片（+片级 bak）+ 成员变化时的 root（+bak），写放大 O(全库)→O(分片)；
+ *   读 = root + 分片聚合，GET /api/books 响应形状不变（前端零改动）；
+ *   自愈 = root 坏→root.bak→由分片内容重建；分片坏→片.bak→仍坏则**按空片处理且拒绝写入**
+ *         （书在 R2 里的 meta 都还在，会以「无主书」出现在残留扫描，经回收站即可找回）。
+ * 迁移：首次 openIndex 发现 root 不存在 → 读 v1 index 切片写 root/分片，零手工、用户无感；
+ *       index.json 本体保留不动（回滚旧代码时仍有完整只读快照）。
+ */
+const IDX_SHARD_MAX = 500; // 单片书数上限；1000 本=2 片、5000 本=10 片，全量读 1+n 个子请求始终远低于 50
+const KEY_IDX = {
+  root: 'meta/idx/root.json',
+  rootBak: 'meta/idx/root.json.bak',
+  v1Bak: 'meta/index.json.v1.bak',
+  shard: (n) => `meta/idx/s${n}.json`,
+  shardBak: (n) => `meta/idx/s${n}.json.bak`,
+};
+const tryParseJson = (t) => {
+  try {
+    return t != null ? JSON.parse(t) : null;
+  } catch {
+    return null;
+  }
+};
+const looksRoot = (r) =>
+  !!r && r.v === 2 && Number.isInteger(r.shards) && r.shards >= 0 && r.map && typeof r.map === 'object';
+
+const readIndex = (store) => openIndex(store).then((h) => ({ books: h.books }));
+
 const readTrash = (store) => readJson(store, KEY.TRASH, { books: [] });
-/** 读 index 同时返回原文（raw）与解析结果（json）——备份要用原文、逻辑要用对象，一次读取两用 */
+const writeTrash = (store, trash) => store.putText(KEY.TRASH, JSON.stringify(trash));
+
+/** v1 单文件读取（迁移专用）：原文 + 解析一次拿两样 */
 async function readIndexRaw(store) {
   const t = await store.getText(KEY.INDEX);
   let json = { books: [] };
@@ -321,14 +355,230 @@ async function readIndexRaw(store) {
   return { json, raw: t };
 }
 
-/** index 结构变更前统一快照（publish / 软删 / 恢复）。
- * knownText：调用方手里已有 index 原文时直接传入，省一次 R2 重读（publish 热路径）。 */
-async function writeIndexBak(store, knownText) {
-  const t = knownText !== undefined ? knownText : await store.getText(KEY.INDEX);
-  if (t != null) await store.putText(KEY.INDEX_BAK, t);
+/** 书在架上的廉价判定：只读 root（1 次）。root 缺失/损坏时回落 openIndex（顺手迁移/自愈）。 */
+async function indexHas(store, id) {
+  const raw = await store.getText(KEY_IDX.root);
+  if (raw != null) {
+    const root = tryParseJson(raw);
+    if (looksRoot(root)) return Number.isInteger(root.map[id]);
+  }
+  const h = await openIndex(store);
+  return !!h.get(id);
 }
-const writeIndex = (store, index) => store.putText(KEY.INDEX, JSON.stringify(index));
-const writeTrash = (store, trash) => store.putText(KEY.TRASH, JSON.stringify(trash));
+
+function makeHandle(store, root, shards, opts = {}) {
+  const shardBooks = shards.map((s) => s.books);
+  const shardRaw = shards.map((s) => s.raw); // 各片原文（写 bak 用；null=新片）
+  const shardNo = shards.map((s) => s.n);
+  const dirty = new Set();
+  let rootDirty = false;
+  // root 当前原文（rootDirty 写 bak 的「写前状态」）。null=此前 root 不存在（迁移/新库），
+  // 此时没有可备份的旧布局——绝不能拿「空 root」当 bak（回退会得到合法但空的假布局），
+  // 跳过一次 root bak，自愈链会落到「由分片重建」。
+  let rootRaw = opts.rootRaw != null ? opts.rootRaw : null;
+
+  const siOfShardNo = (n) => shardNo.indexOf(n);
+
+  const h = {
+    shardCount: root.shards, // 全量分片数（diag 等预算敏感方核算子请求用）
+    root, // 预算敏感调用方（批量/标签）读 map 核算分片跨度用；勿直接改
+    single: opts.single || null, // 单书模式标记：books 禁用，防调用方误用拿到半份列表
+    get books() {
+      if (opts.single) throw new Error('单书模式无全量 books（应改用 full 模式）');
+      return shardBooks.flat();
+    },
+    get(id) {
+      const si = siOfShardNo(root.map[id]);
+      if (si < 0) return undefined;
+      return shardBooks[si].find((b) => b.id === id);
+    },
+    /** 原位替换/追加条目。已在架 → 保持原位（比 v1 的「删了再 push 到末尾」更稳定）；
+     * 新成员 → 追加到最后一片，满片对半拆（拆分保持片内顺序，全局顺序在拆分处重排——前端本来就要排序，无感） */
+    upsert(id, entry) {
+      let si = siOfShardNo(root.map[id]);
+      if (si >= 0) {
+        const arr = shardBooks[si];
+        const i = arr.findIndex((b) => b.id === id);
+        if (i >= 0) arr[i] = entry;
+        else arr.push(entry);
+        dirty.add(si);
+        return;
+      }
+      if (!shardBooks.length) {
+        shardNo.push(root.shards); // 首片
+        shardBooks.push([]);
+        shardRaw.push(null);
+        root.shards += 1;
+      }
+      const t = shardBooks.length - 1; // 最后一片
+      shardBooks[t].push(entry);
+      root.map[id] = shardNo[t];
+      dirty.add(t);
+      rootDirty = true;
+      if (shardBooks[t].length > IDX_SHARD_MAX) {
+        // 对半拆：尾半移入新片（文件号取 root.shards 顺延）
+        const arr = shardBooks[t];
+        const tail = arr.splice(Math.ceil(arr.length / 2));
+        const newN = root.shards;
+        shardNo.push(newN);
+        shardBooks.push(tail);
+        shardRaw.push(null);
+        for (const b of tail) root.map[b.id] = newN;
+        root.shards = newN + 1;
+        dirty.add(t);
+        dirty.add(shardNo.length - 1);
+      }
+    },
+    /** 原位打补丁（entry 对象由 patchFn 返回替换），书必须在已加载的片里 */
+    patch(id, patchFn) {
+      const b = h.get(id);
+      if (!b) throw new Error(`patch: 书 ${id} 不在已加载分片中`);
+      const si = siOfShardNo(root.map[id]);
+      shardBooks[si][shardBooks[si].findIndex((x) => x.id === id)] = patchFn(b);
+      dirty.add(si);
+      return shardBooks[si].find((x) => x.id === id);
+    },
+    remove(id) {
+      const si = siOfShardNo(root.map[id]);
+      if (si < 0) return false;
+      const arr = shardBooks[si];
+      const i = arr.findIndex((b) => b.id === id);
+      delete root.map[id];
+      rootDirty = true;
+      if (i < 0) return false;
+      arr.splice(i, 1);
+      dirty.add(si);
+      return true;
+    },
+    /** 落盘：只写脏分片（bak=该片写前原文）+ 成员变化时的 root（bak=写前原文）。
+     * bak:false 用于进度镜像这类高频小写（v1 语义：镜像不写 bak）。 */
+    async save({ bak = true } = {}) {
+      const writes = [];
+      for (const si of dirty) {
+        if (shardRaw[si] === undefined) throw new Error(`分片 ${shardNo[si]} 加载失败且无备份，拒绝覆盖（避免固化数据丢失）`);
+        const body = JSON.stringify({ books: shardBooks[si] });
+        if (bak) writes.push(store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body));
+        writes.push(store.putText(KEY_IDX.shard(shardNo[si]), body));
+        shardRaw[si] = body;
+      }
+      if (rootDirty) {
+        if (bak && rootRaw != null) writes.push(store.putText(KEY_IDX.rootBak, rootRaw));
+        rootRaw = JSON.stringify(root);
+        writes.push(store.putText(KEY_IDX.root, rootRaw));
+      }
+      dirty.clear();
+      rootDirty = false;
+      await Promise.all(writes);
+    },
+  };
+  return h;
+}
+
+/** 读单个分片（带 bak 回落）。两级都坏 → broken（raw=undefined）：调用方 save() 会拒绝覆盖，
+ * 书的 meta 本体仍在 R2，经「检查残留→无主书→移入回收站→恢复」可重建索引条目。 */
+async function loadIdxShard(store, n) {
+  const raw = await store.getText(KEY_IDX.shard(n));
+  const j = tryParseJson(raw);
+  if (j && Array.isArray(j.books)) return { n, raw, books: j.books };
+  const bakRaw = await store.getText(KEY_IDX.shardBak(n));
+  const jb = tryParseJson(bakRaw);
+  if (jb && Array.isArray(jb.books)) return { n, raw: bakRaw, books: jb.books };
+  return { n, raw: undefined, books: [] }; // broken：不落盘、不静默清空
+}
+
+/** v1 → v2 迁移 + 新库初始化（root 不存在时的唯一入口）。
+ * 迁移把 v1 books 按序**均匀整块**切片（500/片），v1 原文另存 v1Bak，index.json 本体冻结保留。
+ * 不走「逐本 append + 满片拆」——那会留下一串 251/250 的参差片；整块切布局确定、一次写齐。
+ * root 首次落盘没有「写前状态」→ 不写 root bak（自愈链有「由分片重建」兜底）。 */
+async function migrateV1(store) {
+  const { json: legacy, raw } = await readIndexRaw(store);
+  const books = (legacy.books || []).filter((b) => b && b.id);
+  const chunks = [];
+  for (let i = 0; i < books.length; i += IDX_SHARD_MAX) chunks.push(books.slice(i, i + IDX_SHARD_MAX));
+  const root = { v: 2, shards: chunks.length, map: {} };
+  chunks.forEach((arr, n) => {
+    for (const b of arr) root.map[b.id] = n;
+  });
+  const rootRaw = JSON.stringify(root);
+  const writes = [store.putText(KEY_IDX.root, rootRaw)];
+  if (raw != null) writes.push(store.putText(KEY_IDX.v1Bak, raw));
+  chunks.forEach((arr, n) => {
+    const body = JSON.stringify({ books: arr });
+    writes.push(store.putText(KEY_IDX.shard(n), body));
+    writes.push(store.putText(KEY_IDX.shardBak(n), body)); // 首份内容即 bak 基线
+  });
+  await Promise.all(writes);
+  return makeHandle(
+    store,
+    root,
+    chunks.map((arr, n) => ({ n, raw: JSON.stringify({ books: arr }), books: arr })),
+    { rootRaw: null }
+  );
+}
+
+/** root 与 root.bak 双坏（极罕见）：由分片内容重建 root。分片文件名即分片号，成员归属从片内容推导。 */
+async function rebuildIdxRoot(store) {
+  const l = await store.list('meta/idx/', 2);
+  const names = l.objects.map((o) => o.key).filter((k) => /^meta\/idx\/s\d+\.json$/.test(k)).sort();
+  const shards = [];
+  for (const k of names) {
+    const n = Number(k.slice('meta/idx/s'.length, -'.json'.length));
+    const raw = await store.getText(k);
+    const j = tryParseJson(raw);
+    shards.push({ n, raw, books: j && Array.isArray(j.books) ? j.books : [] });
+  }
+  shards.sort((a, b) => a.n - b.n);
+  const root = { v: 2, shards: shards.length, map: {} };
+  for (const s of shards) for (const b of s.books) root.map[b.id] = s.n;
+  const rootRaw = JSON.stringify(root);
+  await Promise.all([store.putText(KEY_IDX.root, rootRaw), store.putText(KEY_IDX.rootBak, rootRaw)]);
+  return makeHandle(store, root, shards, {});
+}
+
+/**
+ * 打开书架索引。默认全量（root + 全部分片）；{ id } 单书模式只读 root + 该书所在片
+ * （热路径：进度镜像/就地编辑/PATCH/软删/恢复——写只碰一片）；{ ids } 并集模式（批量治理）。
+ */
+async function openIndex(store, opts = {}) {
+  const rootRaw = await store.getText(KEY_IDX.root);
+  let root = rootRaw != null ? tryParseJson(rootRaw) : null;
+  let rootSrc = rootRaw;
+  if (!looksRoot(root)) {
+    const bakRaw = await store.getText(KEY_IDX.rootBak);
+    const rb = tryParseJson(bakRaw);
+    if (looksRoot(rb)) {
+      root = rb;
+      rootSrc = bakRaw;
+    }
+  }
+  if (!root) {
+    // root 缺失（新装 / v1）→ 迁移；root 与 bak 双坏 → 由分片重建
+    if (rootRaw == null) return migrateV1(store);
+    return rebuildIdxRoot(store);
+  }
+
+  if (opts.single) {
+    // 单书模式：书已 在片 → 该片；新书（恢复场景）→ 最后一片
+    const n = Number.isInteger(root.map[opts.single]) ? root.map[opts.single] : Math.max(0, root.shards - 1);
+    const shard = root.shards > 0 ? await loadIdxShard(store, n) : { n: 0, raw: null, books: [] };
+    if (root.shards === 0) {
+      root.shards = 1;
+      shard.n = 0;
+    }
+    return makeHandle(store, root, [shard], { single: opts.single, rootRaw: rootSrc });
+  }
+
+  if (opts.ids) {
+    const want = [...new Set(opts.ids.map((id) => root.map[id]).filter((n) => Number.isInteger(n) && n >= 0))];
+    const shards = await Promise.all(want.sort((a, b) => a - b).map((n) => loadIdxShard(store, n)));
+    return makeHandle(store, root, shards, { rootRaw: rootSrc });
+  }
+
+  const shardNums = Array.from({ length: root.shards }, (_, i) => i);
+  const shards = await Promise.all(shardNums.map((n) => loadIdxShard(store, n)));
+  return makeHandle(store, root, shards, { rootRaw: rootSrc });
+}
+
 
 async function readBook(store, id) {
   const raw = await store.getText(KEY.book(id));
@@ -509,8 +759,8 @@ const sweepTrashSafe = (store, env) => sweepTrash(store, env, 1).catch(() => {})
 
 /** 书架摘要（含置顶与进度镜像；排序由前端负责） */
 async function apiBooks(store) {
-  const index = await readIndex(store);
-  return json({ books: index.books || [] });
+  const idx = await openIndex(store);
+  return json({ books: idx.books });
 }
 
 /**
@@ -687,9 +937,7 @@ async function apiUpdateChapters(req, env, store, id) {
   const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
 
-  const index = await readIndex(store);
-  const inShelf = (index.books || []).some((b) => b.id === id);
-  if (!inShelf) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
+  if (!(await indexHas(store, id))) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
 
   const meta = await readBook(store, id);
   if (!meta) return json({ error: '书不存在' }, 404);
@@ -771,34 +1019,24 @@ async function apiPublish(req, env, store, id) {
   const tMeta = Date.now() - T0;
   const keys = meta.chapters.map((c) => c.key);
   const samples = [keys[0], keys[Math.floor(keys.length / 2)], keys[keys.length - 1]].filter((k, i, arr) => arr.indexOf(k) === i);
-  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + index 原文 + progress 镜像源
+  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（full，响应要回传整张书架）+ progress 镜像源
   const T1 = Date.now();
-  const [sampled, indexRaw, ptRaw] = await Promise.all([
+  const [sampled, idx, ptRaw] = await Promise.all([
     Promise.all(samples.map((k) => store.getText(KEY.text(id, k)))),
-    store.getText(KEY.INDEX),
+    openIndex(store),
     store.getText(KEY.progress(id)).catch(() => null),
   ]);
   const tVerify = Date.now() - T1;
   for (let i = 0; i < samples.length; i++) {
     if (sampled[i] == null) return json({ error: `章节 ${samples[i]} 未上传，发布中止` }, 409);
   }
-  let index;
-  try {
-    index = indexRaw != null ? JSON.parse(indexRaw) : { books: [] };
-  } catch {
-    index = { books: [] };
-  }
   meta.chapterCount = keys.length;
   meta.wordCount = Math.max(Number(meta.wordCount) || 0, 0);
   meta.status = 'ready';
   meta.updatedAt = Date.now();
   if (Array.isArray(meta.orphans) && meta.orphans.length) await sweepOrphans(store, meta);
-  // books 数组只依赖上面已解析的 index/meta/progress（纯内存计算），与四个写互不依赖——
-  // 提前算好，让 index 本体和状态副档 ∥ meta ∥ index 备份同一批并发落盘。
-  // 旧实现 writeIndex 单独排在并行写之后，多等一整轮 R2 往返（实测 ~0.9s/阶段）。
-  const books = (index.books || []).filter((b) => b.id !== id);
-  const old = (index.books || []).find((b) => b.id === id);
   // 书架角标镜像以 progress 文件当前值为准（rewash/replace 可能刚重置过进度）
+  const old = idx.get(id);
   let prog = old && old.prog;
   try {
     if (ptRaw) {
@@ -808,16 +1046,11 @@ async function apiPublish(req, env, store, id) {
   } catch {
     /* 读取失败沿用旧镜像 */
   }
-  books.push(indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
-  // 四个互不依赖的写并行：状态副档 ∥ meta ∥ index 备份 ∥ index 本体。
+  idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
+  // 三个互不依赖的写并行：状态副档 ∥ meta ∥ 索引（脏分片 + bak + root 如有成员变化）。
   // 任一写失败的后果与原「副档先行」分析同类：可读/409 短暂不一致，重试发布即愈合
   const T2 = Date.now();
-  await Promise.all([
-    putStatus(store, id, 'ready'),
-    store.putText(KEY.book(id), JSON.stringify(meta)),
-    writeIndexBak(store, indexRaw),
-    writeIndex(store, { books }),
-  ]);
+  await Promise.all([putStatus(store, id, 'ready'), store.putText(KEY.book(id), JSON.stringify(meta)), idx.save({ bak: true })]);
   const tWrite = Date.now() - T2;
   // books 快照随响应回传：前端入库后直接用这份新列表渲染书架，省一次 GET /api/books 往返；
   // t 为服务端分阶段耗时（meta 读 / 校验+读 / 写），供慢链路诊断
@@ -827,7 +1060,7 @@ async function apiPublish(req, env, store, id) {
     wordCount: meta.wordCount,
     chapterCount: meta.chapterCount,
     cleanVer: meta.cleanVer,
-    books,
+    books: idx.books,
     t: { meta: tMeta, verify: tVerify, write: tWrite, total: Date.now() - T0 },
   });
 }
@@ -845,11 +1078,11 @@ async function apiBookMeta(store, id) {
   return json(view);
 }
 
-/** 改元信息（书名/作者/标签/置顶）——PATCH，同步 index */
+/** 改元信息（书名/作者/标签/置顶）——PATCH，同步 index（单书模式：只碰该书所在分片） */
 async function apiPatchBook(req, store, id) {
   const body = await req.json().catch(() => ({}));
-  const { json: index, raw: indexRaw } = await readIndexRaw(store);
-  if (!(index.books || []).some((b) => b.id === id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
+  const idx = await openIndex(store, { id });
+  if (!idx.get(id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
   const meta = await readBook(store, id);
   if (!meta) return json({ error: '书不存在' }, 404);
   const patch = {};
@@ -895,22 +1128,18 @@ async function apiPatchBook(req, store, id) {
   patch.updatedAt = meta.updatedAt;
   await store.putText(KEY.book(id), JSON.stringify(meta));
 
-  await writeIndexBak(store, indexRaw);
-  const books = (index.books || []).map((b) => {
-    if (b.id !== id) return b;
-    return {
-      ...b,
-      title: patch.title !== undefined ? patch.title : b.title,
-      author: patch.author !== undefined ? patch.author : b.author,
-      tags: patch.tags !== undefined ? patch.tags : b.tags,
-      pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
-      finished: patch.finished !== undefined ? patch.finished : !!b.finished,
-      readDone: patch.readDone !== undefined ? patch.readDone : b.readDone,
-      star: patch.star !== undefined ? patch.star : !!b.star,
-      updatedAt: patch.updatedAt,
-    };
-  });
-  await writeIndex(store, { books });
+  idx.patch(id, (b) => ({
+    ...b,
+    title: patch.title !== undefined ? patch.title : b.title,
+    author: patch.author !== undefined ? patch.author : b.author,
+    tags: patch.tags !== undefined ? patch.tags : b.tags,
+    pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
+    finished: patch.finished !== undefined ? patch.finished : !!b.finished,
+    readDone: patch.readDone !== undefined ? patch.readDone : b.readDone,
+    star: patch.star !== undefined ? patch.star : !!b.star,
+    updatedAt: patch.updatedAt,
+  }));
+  await idx.save({ bak: true });
   return json({ ok: true });
 }
 
@@ -950,8 +1179,7 @@ function chIndex(meta, key) {
 
 /** 就地编辑前提：书在架 + 存在 + 已发布；返回 { meta } 或 { resp }（直接作为响应） */
 async function editableMeta(store, id) {
-  const index = await readIndex(store);
-  if (!(index.books || []).some((b) => b.id === id)) {
+  if (!(await indexHas(store, id))) {
     return { resp: json({ error: '书不在书架（可能已删除或未发布）' }, 404) };
   }
   const meta = await readBook(store, id);
@@ -960,11 +1188,11 @@ async function editableMeta(store, id) {
   return { meta };
 }
 
-/** 就地编辑后同步书架摘要：快照 → 重建该条目（章数/字数/更新时间 + 保留 pinned/进度镜像） */
+/** 就地编辑后同步书架摘要：单书模式打开（只碰该书分片）→ 重建该条目（章数/字数/更新时间 + 保留 pinned/进度镜像） */
 async function syncIndexAfterEdit(store, meta) {
-  // 首波两读并行（index 原文 + progress），第二波两写并行（bak 用手上原文 + index）——4 程 → 2 波
-  const [{ json: index, raw: indexRaw }, ptRaw] = await Promise.all([
-    readIndexRaw(store),
+  // 首波两读并行（该书分片 + progress），第二波两写并行（bak + 分片）——4 程 → 2 波
+  const [idx, ptRaw] = await Promise.all([
+    openIndex(store, { id: meta.id }),
     store.getText(KEY.progress(meta.id)).catch(() => null),
   ]);
   let prog;
@@ -976,10 +1204,8 @@ async function syncIndexAfterEdit(store, meta) {
   } catch {
     /* 无进度则沿用原镜像 */
   }
-  const books = (index.books || []).map((b) =>
-    b.id === meta.id ? { ...indexEntryFromMeta(meta), pinned: !!b.pinned, prog: prog || b.prog } : b
-  );
-  await Promise.all([writeIndexBak(store, indexRaw), writeIndex(store, { books })]);
+  idx.patch(meta.id, (b) => ({ ...indexEntryFromMeta(meta), pinned: !!b.pinned, prog: prog || b.prog }));
+  await idx.save({ bak: true });
 }
 
 /** 插入章后迁移进度：原进度章在插入位之后 → 章号 +1（章正文未变） */
@@ -1128,13 +1354,13 @@ async function apiProgressPut(req, store, id) {
   const data = { ch, ratio, updatedAt: Date.now() };
   await store.putText(KEY.progress(id), JSON.stringify(data));
 
-  // 书架进度角标镜像：只在「换章」时重写整个 index。章内滚动只写 progress 小文件（真值），
-  // 不再全量重写 index —— 消除写放大（千本规模 index≈300KB/次，长章滚几屏就是几十次），
-  // 同时收窄 index 读-改-写与 publish 并发时的覆盖窗口。
+  // 书架进度角标镜像：只在「换章」时写该书所在分片（单书模式）。章内滚动只写 progress 小文件（真值），
+  // 不再写镜像 —— 消除写放大（千本规模分片≈150KB/次，长章滚几屏就是几十次），
+  // 同时收窄分片读-改-写与 publish 并发时的覆盖窗口。
   // 代价：镜像百分比停留在最近一次换章时的值（书架角标「第几章」仍准确；恢复阅读读 progress 真值，不受影响）。
   try {
-    const index = await readIndex(store);
-    const book = (index.books || []).find((b) => b.id === id);
+    const idx = await openIndex(store, { id });
+    const book = idx.get(id);
     if (!book) return json({ ok: true });
     // 越界进度压回末章（镜像供书架角标直接显示，不能出现「读到 999/10 章」）
     // 恶意/异常客户端可能直接 PUT 超章数 ch；正常前端已 clamp，这里做服务端兜底。
@@ -1144,14 +1370,14 @@ async function apiProgressPut(req, store, id) {
     // 刷新条件＝「换章」或「读完状态翻转」。
     // 原实现只有前者：而读完一本书的典型动作是停在末章继续往下滚到底——章号不变、
     // 只有 ratio 变，原条件永远不成立 → 书架镜像的 ratio 停在旧值，角标「已读完」
-    // 在实践中几乎永远点不亮。补上状态翻转后：跨过阈值那一刻多写恰 1 次 index，
+    // 在实践中几乎永远点不亮。补上状态翻转后：跨过阈值那一刻多写恰 1 次镜像，
     // 已读完后继续滚动不再写，仍然不产生写放大（这正是当初只在换章时写的动机）。
     const isDone = cap > 0 && mch >= cap && ratio >= READ_DONE_RATIO;
     const curDone =
       !!cur && cap > 0 && Math.min(Number(cur.ch) || 0, cap) >= cap && (Number(cur.ratio) || 0) >= READ_DONE_RATIO;
     if (!cur || cur.ch !== mch || curDone !== isDone) {
-      const books = (index.books || []).map((b) => (b.id === id ? { ...b, prog: { ch: mch, ratio, updatedAt: data.updatedAt } } : b));
-      await writeIndex(store, { books });
+      idx.patch(id, (b) => ({ ...b, prog: { ch: mch, ratio, updatedAt: data.updatedAt } }));
+      await idx.save({ bak: false }); // 镜像写沿用 v1 语义：不写 bak（progress 真值文件才是权威）
     }
   } catch {
     /* ignore */
@@ -1159,11 +1385,7 @@ async function apiProgressPut(req, store, id) {
   return json({ ok: true });
 }
 
-/* ---------------- 批量操作 / 标签治理（书架百本量级的治理工具） ---------------- */
-
-/** 标签合并单请求上限：与书架批量同一预算模型（readIndex + N×(readBook+putText) + bak/write
- * ≈ 2N+4 ≤50），直接复用 shared-const 的 BATCH_BOOKS_MAX，杜绝两处数字各自漂移。 */
-const TAG_MERGE_MAX = BATCH_BOOKS_MAX;
+/* ---------------- 批量操作 / 标签治理（分片预算核账后裁剪，客户端 rest/remaining 续调） ---------------- */
 
 /**
  * 批量操作：一次请求改多本书（标签增删/整设、完结状态、软删）。
@@ -1189,11 +1411,37 @@ async function apiBatchBooks(req, store) {
   if (action === 'setFinished' && body.finished === undefined) return json({ error: '缺少 finished' }, 400);
 
   const batch = ids.slice(0, BATCH_BOOKS_MAX);
-  const { json: index, raw: indexRaw } = await readIndexRaw(store);
-  const inShelf = new Set((index.books || []).map((b) => b.id));
-  const targets = batch.filter((id) => inShelf.has(id));
+  // 分片版预算核算：先拿 root.map（1 读），把 targets 裁到子请求预算内再开索引。
+  // 非删除：1(root) + k 片读 + 2N(meta 读+写) + 2k(片写+bak) = 1+3k+2N ≤ 48
+  // 删除：  1(root) + k 片读 + 1(trash 读) + 2k(片写+bak) + 2(root 写+bak) + 1(trash 写) = 5+3k ≤ 48
+  // 超出即从尾部裁掉（rest 续调，客户端本来就支持）——v1 单文件时代 k 恒为 1 不用算，
+  // 分片后 18 本随机目标可能散在多片，必须把预算当一等公民核。
+  const rootInfo = await (async () => {
+    const raw = await store.getText(KEY_IDX.root);
+    let root = tryParseJson(raw);
+    if (looksRoot(root)) return { root, raw };
+    const bakRaw = await store.getText(KEY_IDX.rootBak);
+    const rb = tryParseJson(bakRaw);
+    if (looksRoot(rb)) return { root: rb, raw: bakRaw };
+    return { root: (await openIndex(store)).root, raw: null }; // 深度坏/缺失 → 自愈后取
+  })();
+  const shardNoOf = (id) => (Number.isInteger(rootInfo.root.map[id]) ? rootInfo.root.map[id] : null);
+  const shardSet = new Set();
+  const processed = [];
+  for (const id of batch) {
+    const n = shardNoOf(id);
+    if (n == null) continue; // 不在架（含回收站/半成品）——沿用 v1 语义由 inShelf 过滤，不占预算
+    const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
+    const est = action === 'delete' ? 5 + 3 * newS : 1 + 3 * newS + 2 * (processed.length + 1);
+    if (est > 48) break;
+    shardSet.add(n);
+    processed.push(id);
+  }
+  const idx = await openIndex(store, { ids: processed });
+  const inShelf = new Set((processed.length ? processed : []).filter((id) => !!idx.get(id)));
+  const targets = processed.filter((id) => inShelf.has(id));
 
-  if (action === 'delete') return batchSoftDelete(store, index, targets, indexRaw);
+  if (action === 'delete') return batchSoftDelete(store, idx, targets);
 
   // 读一波全并行（20 本 = 20 次并发 GET，替代逐本串行 20 程），meta 缺失的书跳过
   const metas = await Promise.all(targets.map((id) => readBook(store, id)));
@@ -1222,26 +1470,30 @@ async function apiBatchBooks(req, store) {
   if (writes.length) await Promise.all(writes);
 
   if (patches.size) {
-    await writeIndexBak(store, indexRaw);
-    const books = (index.books || []).map((b) => (patches.has(b.id) ? { ...b, ...patches.get(b.id) } : b));
-    await writeIndex(store, { books });
+    for (const [id, p] of patches) idx.patch(id, (b) => ({ ...b, ...p }));
+    await idx.save({ bak: true });
   }
-  return json({ ok: true, updated: patches.size, skipped: batch.length - targets.length, rest: Math.max(0, ids.length - batch.length) });
+  return json({ ok: true, updated: patches.size, skipped: batch.length - targets.length, rest: Math.max(0, ids.length - processed.length) });
 }
 
-/** 批量软删：index 一次摘除 + trash 一次写入（不读各书 meta，index 条目即摘要） */
-async function batchSoftDelete(store, index, targets, indexRaw) {
+/** 批量软删：索引分片摘除成员 + trash 一次写入（不读各书 meta，index 条目即摘要） */
+async function batchSoftDelete(store, idx, targets) {
   if (!targets.length) return json({ ok: true, updated: 0, skipped: 0, rest: 0 });
-  const gone = new Set(targets);
-  const books = (index.books || []).filter((b) => !gone.has(b.id));
-  // trash 读与「index 备份（用手上原文）+ index 写」互不依赖 → 并行
+  // 先取条目（remove 之后索引里就没有了；trash 条目 = index 摘要 + deletedAt）
+  const entries = new Map();
+  for (const id of targets) {
+    const e = idx.get(id);
+    if (e) entries.set(id, e);
+  }
+  // trash 读与「索引分片摘除」互不依赖；摘除纯内存，落盘与 trash 写分两波
   const trashP = readTrash(store);
-  await Promise.all([writeIndexBak(store, indexRaw), writeIndex(store, { books })]);
+  for (const id of targets) idx.remove(id);
+  await idx.save({ bak: true });
   const trash = await trashP;
   let n = 0;
   for (const id of targets) {
     if (trash.books.some((x) => x.id === id)) continue;
-    const entry = (index.books || []).find((b) => b.id === id);
+    const entry = entries.get(id);
     if (entry) {
       trash.books.push({ ...entry, deletedAt: Date.now() });
       n++;
@@ -1275,11 +1527,23 @@ async function apiTagsMerge(req, store) {
   if (!from) return json({ error: '请指定要处理的标签' }, 400);
   if (to && to === from) return json({ error: '源标签与目标相同' }, 400);
 
-  const { json: index, raw: indexRaw } = await readIndexRaw(store);
-  const hit = (index.books || []).filter((b) => (b.tags || []).includes(from));
+  const idx = await openIndex(store);
+  const hit = idx.books.filter((b) => (b.tags || []).includes(from));
   if (!hit.length) return json({ ok: true, updated: 0, remaining: 0 });
 
-  const targets = hit.slice(0, TAG_MERGE_MAX);
+  // 分片版预算：已花 1+K（root+全部分片，标签命中必须全库扫）；
+  // 每处理一本 +2（meta 读+写），每新增一个脏分片 +2（片写+bak）→ 1+K+2N+2k ≤ 48 贪心裁剪
+  const shardNoOf = (id) => (Number.isInteger(idx.root.map[id]) ? idx.root.map[id] : -1);
+  const shardSet = new Set();
+  const targets = [];
+  for (const b of hit) {
+    const n = shardNoOf(b.id);
+    const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
+    if (1 + idx.shardCount + 2 * (targets.length + 1) + 2 * newS > 48) break;
+    shardSet.add(n);
+    targets.push(b);
+  }
+  if (!targets.length) return json({ ok: true, updated: 0, remaining: hit.length });
   // 读一波全并行（替代逐本串行，同 apiBatchBooks）
   const metas = await Promise.all(targets.map((b) => readBook(store, b.id)));
   const now = Date.now();
@@ -1306,9 +1570,8 @@ async function apiTagsMerge(req, store) {
   if (writes.length) await Promise.all(writes);
 
   if (patches.size) {
-    await writeIndexBak(store, indexRaw);
-    const books = (index.books || []).map((b) => (patches.has(b.id) ? { ...b, ...patches.get(b.id) } : b));
-    await writeIndex(store, { books });
+    for (const [id, p] of patches) idx.patch(id, (x) => ({ ...x, ...p }));
+    await idx.save({ bak: true });
   }
   return json({ ok: true, updated: patches.size, remaining: Math.max(0, hit.length - targets.length) });
 }
@@ -1319,15 +1582,15 @@ async function apiTagsMerge(req, store) {
  * 也接纳「未上架的半成品书」（上传中途失败停在 creating、不在 index）：
  * 这类书若不能进回收站就永远删不掉、也看不见，只能留成孤儿数据。 */
 async function apiSoftDelete(store, id) {
-  const { json: index, raw: indexRaw } = await readIndexRaw(store);
-  const b = (index.books || []).find((x) => x.id === id);
+  const idx = await openIndex(store, { id }); // 单书模式：root + 该书所在片
+  const b = idx.get(id);
   const meta = b ? null : await readBook(store, id);
   if (!b && !meta) return json({ error: '书不存在或已删除' }, 404);
-  // 只在架书才需要从 index 摘除（半成品书本就不在 index，filter 结果不变，跳过两次无谓 R2 写）
+  // 只在架书才需要从索引摘除（半成品书本就不在索引，摘除无效果，跳过分片写）
   const trashP = readTrash(store);
   if (b) {
-    const books = (index.books || []).filter((x) => x.id !== id);
-    await Promise.all([writeIndexBak(store, indexRaw), writeIndex(store, { books })]);
+    idx.remove(id);
+    await idx.save({ bak: true });
   }
 
   const trash = await trashP;
@@ -1362,9 +1625,9 @@ async function apiTrashList(store, env) {
  * 也没有继续上传的入口，只会变成书架上一本点不开的孤儿。 */
 async function apiRestore(store, id) {
   const trash = await readTrash(store);
-  const idx = trash.books.findIndex((b) => b.id === id);
-  if (idx < 0) return json({ error: '回收站里没有这本书' }, 404);
-  const entry = trash.books[idx];
+  const trashIdx = trash.books.findIndex((b) => b.id === id);
+  if (trashIdx < 0) return json({ error: '回收站里没有这本书' }, 404);
+  const entry = trash.books[trashIdx];
   if (entry.purge) return json({ error: '该书的正文已部分清除，无法完整恢复' }, 409);
   // 软删自半成品（第三轮起可软删 creating 书）：trash 条目来自 indexEntryFromMeta，无 status 字段。
   // 一律以 meta 本体为准：只有已发布书恢复才有阅读/继续编辑入口，其余只会变书架孤儿。
@@ -1373,13 +1636,12 @@ async function apiRestore(store, id) {
   if (meta.status !== 'ready') {
     return json({ error: '该书尚未发布，无法恢复；如不再需要请在回收站中彻底删除' }, 409);
   }
-  trash.books.splice(idx, 1);
-  // index 读 + trash 写互不依赖 → 并行；bak 用手上原文
-  const [{ json: index, raw: indexRaw }] = await Promise.all([readIndexRaw(store), writeTrash(store, trash)]);
-  const books = (index.books || []).filter((b) => b.id !== id);
+  trash.books.splice(trashIdx, 1);
+  // index（单书模式：新书落最后一片）+ trash 写互不依赖 → 并行
+  const [idx] = await Promise.all([openIndex(store, { id }), writeTrash(store, trash)]);
   const { purge, deletedAt, ...rest } = entry;
-  books.push({ ...rest });
-  await Promise.all([writeIndexBak(store, indexRaw), writeIndex(store, { books })]);
+  idx.upsert(id, { ...rest }); // 已在架（重复恢复）则原位覆盖，语义与 v1 的去重 push 一致
+  await idx.save({ bak: true });
   return json({ ok: true });
 }
 
@@ -1410,7 +1672,9 @@ async function apiTrashClear(store) {
  * 子请求预算：Free 单请求 ≤50。逐书 readBook 与 list 分页都计入，预算将尽即标记 incomplete
  *   截断（宁漏勿错），避免大书库把「检查残留」点成 500。
  */
-const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH]);
+const DIAG_SYS_KEYS = new Set([KEY.INDEX, KEY.INDEX_BAK, KEY.TRASH, KEY_IDX.v1Bak]);
+// meta/idx/ 是书架索引 v2 的分片（root + s<N>），meta/index.json.v1.bak 是迁移留档——都不是书 meta
+const DIAG_SYS_PREFIXES = ['meta/idx/', 'meta/index.json'];
 // list 预算拆两类：meta/raw/progress 是「书数级」对象（每本各 1 个，千本 = 各 1 页）→ 给足预算保证完整；
 // text/ 是「章数级」大头（每章 1 个，千本 50 章 = 50 页）→ 只给部分页数，截断即 incomplete（宁漏勿错）
 const DIAG_META_PAGE_BUDGET = 3; // meta/raw/progress 各自翻页上限（每页 ≤1000 对象 → 覆盖约 3000 本）
@@ -1432,7 +1696,9 @@ async function apiDiagOrphans(url, store) {
 
 async function doDiagScan(store, textCursor = '') {
   const cont = !!textCursor; // 续扫窗：跳过 meta/raw/progress（书数级前缀，首页已完整），只扫 text/ 下一窗
-  const budget = { used: 2, incomplete: false }; // 2 = readIndex + readTrash（续扫窗同样需要 live 集合）
+  const idx = await openIndex(store); // 全量：root + K 个分片（K 计入预算）
+  const index = { books: idx.books };
+  const budget = { used: 2 + idx.shardCount, incomplete: false }; // root+分片读 + trash 读（续扫窗同样需要 live 集合）
   const bump = () => {
     if (budget.used >= DIAG_SUB_BUDGET) {
       budget.incomplete = true;
@@ -1441,7 +1707,6 @@ async function doDiagScan(store, textCursor = '') {
     budget.used++;
     return true;
   };
-  const index = await readIndex(store);
   const trash = await readTrash(store);
   const live = new Set();
   const titleOf = new Map();
@@ -1475,7 +1740,7 @@ async function doDiagScan(store, textCursor = '') {
   const orphanCands = [];
   const orphanSet = new Set();
   for (const o of lMeta.objects) {
-    if (DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/')) continue;
+    if (DIAG_SYS_KEYS.has(o.key) || o.key.startsWith('meta/sec/') || DIAG_SYS_PREFIXES.some((p) => o.key.startsWith(p))) continue;
     const id = o.key.slice(5, -5); // 去 'meta/' 前缀与 '.json' 后缀
     if (live.has(id)) continue;
     orphanSet.add(id);
@@ -1590,10 +1855,11 @@ async function apiPurgeOrphans(req, store) {
   const ok = keys.filter((k) => /^(?:text|raw|progress)\/[^/]/.test(k) && !/\.\./.test(k));
   if (!ok.length) return json({ error: '没有可删除的合法对象' }, 400);
 
-  const index = await readIndex(store);
+  const idx = await openIndex(store); // 全量：root + K 分片
+  const index = { books: idx.books };
   const trash = await readTrash(store);
   const live = new Set([...(index.books || []), ...(trash.books || [])].map((b) => b.id));
-  let used = 2; // 已读 index + trash
+  let used = 2 + idx.shardCount; // 已读 root+分片 + trash
   const metaCache = new Map(); // 同一本书多个删除 key 只回验一次
   const toDelete = [];
   for (const k of ok) {

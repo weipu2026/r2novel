@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRequest } from '../src/router.js';
-import { ENV, memStore, req, call, login } from './_harness.mjs';
+import { ENV, memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
 
 test('鉴权：未登录一律 401，口令错 401，口令对返回 cookie', async () => {
   const store = memStore();
@@ -80,11 +80,13 @@ test('全流程：建书 → 传章 → 传 raw → 发布 → 书架/目录/读
   assert.equal(r.data.ch, 2);
   assert.ok(Math.abs(r.data.ratio - 0.55) < 1e-6);
 
-  // index.bak：首次发布前无 index（无可备份），二次发布后才留下快照
-  assert.ok(!store._map.has('meta/index.json.bak'));
+  // 分片 bak：v2 语义 = 每个脏分片落盘前先存「写前原文」；新片首写以首份内容为 bak 基线。
+  // 这里验证：二次 publish 后 bak 恰好等于发布前的分片内容（即真正的「写前快照」）
+  const before = store._map.get('meta/idx/s0.json');
+  assert.ok(before, '首次 publish 后分片应已存在');
   await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
-  assert.ok(store._map.has('meta/index.json.bak'), '二次 publish 应留下 .bak 快照');
-  assert.equal(JSON.parse(store._map.get('meta/index.json.bak')).books.length, 1);
+  assert.equal(store._map.get('meta/idx/s0.json.bak'), before, '二次 publish 应把写前原文存进分片 bak');
+  assert.equal(JSON.parse(store._map.get('meta/idx/s0.json')).books.length, 1);
 
   // 退出后 401
   await call(store, req('/api/logout', { method: 'POST', cookie }));
@@ -153,14 +155,14 @@ test('OPDS：无凭据 401 + WWW-Authenticate；Basic 对口令 200；错口令 
 test('OPDS：feed 含书目 entry 与 acquisition 链接，XML 特殊字符全部转义', async () => {
   const { store } = await seedBook(memStore());
   const cookie = await login(store);
-  // & 会穿过 safeStr 入库；< > " ' 会被入库清洗剥掉——模拟"绕过清洗的历史脏数据"直接篡改 index，
+  // & 会穿过 safeStr 入库；< > " ' 会被入库清洗剥掉——模拟"绕过清洗的历史脏数据"直接篡改索引，
   // 验证 feed 层 escXml 兜底：无论库里的标题多脏，输出必须是合法 XML
-  const idx = JSON.parse(store._map.get('meta/index.json'));
-  const b = idx.books[0];
+  const books = await readIdxBooks(store);
+  const b = books[0];
   b.title = 'A<B>&"C\'';
   b.author = 'x<y';
   b.tags = ['t&1', 't<2'];
-  store._map.set('meta/index.json', JSON.stringify(idx));
+  await writeIdxBooks(store, books);
   const r = await call(store, req('/opds', { headers: { authorization: basic('r', 'test-pass') } }));
   assert.equal(r.status, 200);
   assert.ok(r.text.includes('A&lt;B&gt;&amp;&quot;C&apos;'), '书名特殊字符必须全部转义');

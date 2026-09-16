@@ -169,3 +169,26 @@ test('tags：merge 改名与删除；from/to 相同 400', async () => {
   r = await call(store, req('/api/tags', { method: 'POST', cookie, body: { from: 'a', to: 'a' } }));
   assert.equal(r.status, 400);
 });
+
+test('tags：merge 遇「index 声明 from、meta 已无 from」的残留书不误删 to（meta 写波成功、idx.save 失败后的重试态）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const id1 = await makeReadyBook(store, cookie, '书甲', ['乙', '丙']);
+  const id2 = await makeReadyBook(store, cookie, '书乙', ['乙']);
+  // 构造残留：meta 的 from 已被上一轮写波消掉，但 index 条目仍带 from（save 失败未同步）
+  const m1 = JSON.parse(await store.getText(`meta/${id1}.json`));
+  m1.tags = ['丙'];
+  await store.putText(`meta/${id1}.json`, JSON.stringify(m1));
+  // merge：index 说两本书都带「乙」→ 都进 targets
+  const r = await call(store, req('/api/tags', { method: 'POST', cookie, body: { from: '乙', to: '丙' } }));
+  assert.equal(r.status, 200);
+  // 残留书的 to「丙」必须原样保留（修复前会被清成 []）
+  const m1b = JSON.parse(await store.getText(`meta/${id1}.json`));
+  assert.deepEqual(m1b.tags, ['丙']);
+  // 正常改名路径不受影响
+  const m2b = JSON.parse(await store.getText(`meta/${id2}.json`));
+  assert.deepEqual(m2b.tags, ['丙']);
+  // index 镜像同步
+  const shelf1 = (await shelf(store, cookie)).find((b) => b.id === id1);
+  assert.deepEqual(shelf1.tags, ['丙']);
+});

@@ -630,7 +630,7 @@ async function resumeMigration(store) {
 }
 
 /**
- * 打开书架索引。默认全量（root + 全部分片）；{ id } 单书模式只读 root + 该书所在片
+ * 打开书架索引。默认全量（root + 全部分片）；{ single: id } 单书模式只读 root + 该书所在片
  * （热路径：进度镜像/就地编辑/PATCH/软删/恢复——写只碰一片）；{ ids } 并集模式（批量治理）。
  */
 async function openIndex(store, opts = {}) {
@@ -1701,7 +1701,9 @@ async function apiTagsMerge(req, store) {
         if (to && !out.includes(to)) out.push(to); // 改名/合并：落到目标标签（已存在则不重复）
         continue;
       }
-      if (to && t === to) continue; // 目标标签已出现过，去重
+      // to 不能在此无条件跳过：index 声明 from 但 meta 已无 from（meta 写波成功、idx.save
+      // 失败的残留态，重试必然命中）时，跳过会把书上的 to 清掉。去重由 includes 保证——
+      // from 分支 push to 前已查重、这里放行 to 也不会重复。
       if (!out.includes(t)) out.push(t);
     }
     meta.tags = out.slice(0, 10);

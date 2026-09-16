@@ -189,10 +189,10 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 
 **读写形态**（`openIndex(store, opts)`）：
 - full（默认）：root + 全部分片聚合，`GET /api/books`/publish 响应/opds/标签清单用——响应形状与 v1 完全一致
-- `{ id }` 单书模式：root + 该书所在片（热路径：进度镜像/PATCH/就地编辑同步/软删/恢复）
+- `{ single: id }` 单书模式：root + 该书所在片（热路径：进度镜像/PATCH/就地编辑同步/软删/恢复）
 - `{ ids }` 并集模式：批量治理用，只载目标所在片
 - `{ rootRaw }`：调用方已读过 root（批量接口核预算）→ 传进来复用，省 1 子请求（否则公式得算两次读）
-- `{ id }` / `{ ids }` 都是 **partial**（只加载部分分片）→ 对账只做「补/改 map」，不做死指针摘除
+- `{ single: id }` / `{ ids }` 都是 **partial**（只加载部分分片）→ 对账只做「补/改 map」，不做死指针摘除
 
 **预算纪律**（48 子请求软顶）：
 - 单书写 = root 1 读 + 1 片读 + 片写 + bak ≈ 4~5，永远安全

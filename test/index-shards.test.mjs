@@ -402,3 +402,103 @@ test('diag：索引分片与 v1 留档不进「无主书」清单', async () => 
   const ids = (r.data.orphanBooks || []).map((b) => b.id);
   assert.equal(ids.length, 0, '分片文件不应被当成无主书：' + ids.join(','));
 });
+
+/* ── 第四轮审计（2026-09-16）：两处 P1 的回归护栏 ──
+ * 两条都由「索引 v2 分片」引入、且都能被既有测试放过：
+ *   ① 单书模式选项名笔误（{id} vs {single:id}）→ 5 处热路径退化为全量读；写放大用例只断言写字节，读侧零覆盖
+ *   ② save() 并发写「指针+数据」→ 部分失败留下「数据新、指针旧」，reconcile ② 据此摘掉真书并固化
+ */
+
+test('单书模式：PATCH / 进度镜像 / 软删只读该书所在那一片（{id} 写成 {single:id} 会读全部）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const books = [mkBook(1), mkBook(2), mkBook(3)];
+  await seedV1(store, books);
+  await call(store, req('/api/books', { cookie })); // 迁移
+  // 重排成 3 片、每片一本：b0001→s0, b0002→s1, b0003→s2
+  for (let i = 0; i < 3; i++) {
+    const body = JSON.stringify({ books: [books[i]] });
+    await store.putText(shard(i), body);
+    await store.putText(shard(i) + '.bak', body);
+  }
+  await store.putText(ROOT, JSON.stringify({ v: 2, shards: 3, map: { b0001: 0, b0002: 1, b0003: 2 } }));
+  await store.putText(ROOT_BAK, store._map.get(ROOT));
+
+  const reads = [];
+  const orig = store.getText.bind(store);
+  store.getText = async (k) => {
+    reads.push(k);
+    return orig(k);
+  };
+  const shardReads = () => reads.filter((k) => /^meta\/idx\/s\d+\.json$/.test(k)).length;
+  try {
+    reads.length = 0;
+    await call(store, req('/api/books/b0002', { method: 'PATCH', cookie, body: { star: true } }));
+    assert.equal(shardReads(), 1, '单书 PATCH 只读该书所在分片（读到 3 = 退化成全量读）');
+
+    reads.length = 0;
+    await call(store, req('/api/progress/b0002', { method: 'PUT', cookie, body: { ch: 1, ratio: 0.5 } }));
+    assert.equal(shardReads(), 1, '进度镜像只读该书所在分片（这是每次换章都要走的路径）');
+
+    reads.length = 0;
+    await call(store, req('/api/books/b0002', { method: 'DELETE', cookie }));
+    assert.equal(shardReads(), 1, '软删只读该书所在分片');
+  } finally {
+    store.getText = orig;
+  }
+});
+
+test('save 写序：指针(root)先落、数据(分片)后落 —— 并发写会留下「数据新、指针旧」', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  await seedV1(store, [mkBook(1), mkBook(2)]);
+  await call(store, req('/api/books', { cookie })); // 迁移，两本都在 s0
+
+  const seq = [];
+  let inFlight = 0;
+  const atRootStart = [];
+  const orig = store.putText.bind(store);
+  store.putText = async (k, v) => {
+    seq.push(k);
+    inFlight++;
+    if (k === ROOT) atRootStart.push(inFlight);
+    await new Promise((r) => setTimeout(r, 1)); // 给出「并发写同时在途」的观察窗口
+    inFlight--;
+    return orig(k, v);
+  };
+  let r;
+  try {
+    r = await call(store, req('/api/books/b0001', { method: 'DELETE', cookie })); // remove → 分片脏 + rootDirty
+  } finally {
+    store.putText = orig;
+  }
+  assert.equal(r.status, 200);
+  const rootAt = seq.indexOf(ROOT);
+  const firstShard = seq.findIndex((k) => k === shard(0));
+  assert.ok(rootAt >= 0 && firstShard >= 0, 'root 与分片都应被写：' + seq.join(' '));
+  assert.ok(rootAt < firstShard, '指针必须先于数据落盘（并发写时 seq 里分片在前）：' + seq.join(' '));
+  assert.ok(atRootStart[0] <= 2, 'root 写开始时不得有分片写在途（旧写法并发 → 4）：' + String(atRootStart[0]));
+});
+
+test('指针落后一代（盘上分片数 > root.shards）→ 不摘真书、书全部可见', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const all = Array.from({ length: 501 }, (_, i) => mkBook(i));
+  await seedV1(store, all);
+  // 造「分片已按拆分后落盘、root 还是拆分前」的残留（save() 部分失败：数据新、指针旧）
+  const half = 251;
+  for (const pair of [[0, all.slice(0, half)], [1, all.slice(half)]]) {
+    const body = JSON.stringify({ books: pair[1] });
+    await store.putText(shard(pair[0]), body);
+    await store.putText(shard(pair[0]) + '.bak', body);
+  }
+  const stale = JSON.stringify({ v: 2, shards: 1, map: Object.fromEntries(all.map((b) => [b.id, 0])) });
+  await store.putText(ROOT, stale);
+  await store.putText(ROOT_BAK, stale);
+
+  const r = await call(store, req('/api/books', { cookie }));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.books.length, 501, '尾片里的 250 本不能被当死指针摘掉（修复前只剩 251）');
+  const map = JSON.parse(store._map.get(ROOT)).map;
+  assert.ok(map.b0251 !== undefined, '尾片第一本必须仍在索引里（修复前被摘除并落盘固化）');
+});

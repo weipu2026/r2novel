@@ -376,7 +376,7 @@ async function indexHas(store, id) {
  * 「读不到」而不是「确认没有」，据此摘除会误删真书；partial=true（单书/并集模式只加载了
  * 部分分片）时同样只做 ①。返回 map 是否有改动（调用方据此置 rootDirty）。
  * 副作用：多片重复的 id 会从后出现的片里摘掉并标记该片脏（下次 save 时顺手清干净）。 */
-function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial) {
+function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial, prunable = true) {
   let changed = false;
   const owner = new Set();
   for (let si = 0; si < shardBooks.length; si++) {
@@ -397,7 +397,11 @@ function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial) {
       }
     }
     if (keep.length !== arr.length) shardBooks[si] = keep;
-    if (partial || typeof shardRaw[si] !== 'string') continue;
+    // ② 的安全前提是「root.shards 覆盖了磁盘上全部分片」：若盘上还有未被加载的片，那么
+    // 「本片确凿读到却没有」的书很可能只是**住在那些没加载的片里**，据此摘除＝误删真书
+    // （实测：指针落后一代时 501 本被摘成 251 本）。prunable=false（调用方已查明盘上分片数
+    // 大于 root.shards）时整段跳过。
+    if (partial || !prunable || typeof shardRaw[si] !== 'string') continue;
     for (const id of Object.keys(root.map)) {
       if (root.map[id] === n && !owner.has(id)) {
         delete root.map[id];
@@ -425,7 +429,7 @@ function makeHandle(store, root, shards, opts = {}) {
   // 每次 save 落盘后按新 root 重算。
   const parsedRootRaw = rootRaw != null ? tryParseJson(rootRaw) : null;
   let rootBakUsable = !!looksRoot(parsedRootRaw) && parsedRootRaw.shards > 0;
-  if (reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, !!opts.partial)) rootDirty = true;
+  if (reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, !!opts.partial, opts.prunable !== false)) rootDirty = true;
 
   const siOfShardNo = (n) => shardNo.indexOf(n);
 
@@ -503,7 +507,14 @@ function makeHandle(store, root, shards, opts = {}) {
     /** 落盘：只写脏分片（bak=该片写前原文）+ 成员变化时的 root（bak=写前原文）。
      * bak:false 用于进度镜像这类高频小写（v1 语义：镜像不写 bak）。 */
     async save({ bak = true } = {}) {
-      const writes = [];
+      // 写序铁律（2026-09-16 审计修复）——**指针(root)先落、数据(分片)后落**。
+      // 这里是「更新」路径，与 migrateV1（首次创建）的写序**相反**，不要照抄那边：
+      //   · 数据先、指针后 + 指针写失败 → 磁盘「数据新、指针旧」。全量加载只到旧 shards，
+      //     而 reconcileIdx ② 会把「指针说在本片、本片确凿读到却没有」的书当死指针摘掉，
+      //     残缺指针随即被落盘固化（实测：501 本 → 251 本，分片文件还在但索引不认）。
+      //   · 指针先、数据后 + 数据写失败 → 指针指着的内容未更新，对账 ①/② 都能自愈、书不会消失，
+      //     最坏等于该次操作没生效（可重试）。
+      // ① 前置校验必须早于任何写：否则「root 已更新、某片因双坏被跳过」会把指针推到与新数据不一致的位置。
       for (const si of dirty) {
         // 片**双坏**（读到字节但解析不了）→ 拒绝覆盖，留人工抢救的余地；片与片 bak **都不存在**
         // （迁移半途/外部删除）→ 没有可丢的内容，允许重建写入，否则一个缺失的片文件会让全库
@@ -511,17 +522,24 @@ function makeHandle(store, root, shards, opts = {}) {
         if (shardRaw[si] === undefined && !shardMissing[si]) {
           throw new Error(`分片 ${shardNo[si]} 内容损坏且无备份，拒绝覆盖（避免固化数据丢失）`);
         }
+      }
+      // ② 指针先落（root 与 root.bak 并行，两者完成后才动数据）
+      if (rootDirty) {
+        const rw = [];
+        if (bak && rootBakUsable) rw.push(store.putText(KEY_IDX.rootBak, rootRaw));
+        rootRaw = JSON.stringify(root);
+        rootBakUsable = root.shards > 0; // 落盘后「写前状态」即新布局
+        rw.push(store.putText(KEY_IDX.root, rootRaw));
+        await Promise.all(rw);
+      }
+      // ③ 数据后落
+      const writes = [];
+      for (const si of dirty) {
         const body = JSON.stringify({ books: shardBooks[si] });
         if (bak) writes.push(store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body));
         writes.push(store.putText(KEY_IDX.shard(shardNo[si]), body));
         shardRaw[si] = body;
         shardMissing[si] = false;
-      }
-      if (rootDirty) {
-        if (bak && rootBakUsable) writes.push(store.putText(KEY_IDX.rootBak, rootRaw));
-        rootRaw = JSON.stringify(root);
-        rootBakUsable = root.shards > 0; // 落盘后「写前状态」即新布局
-        writes.push(store.putText(KEY_IDX.root, rootRaw));
       }
       dirty.clear();
       rootDirty = false;
@@ -636,18 +654,21 @@ async function openIndex(store, opts = {}) {
   }
 
   if (opts.single) {
-    // 单书模式：书已 在片 → 该片；新书（恢复场景）→ 最后一片
+    // 单书模式：书已在片 → 该片；新书（恢复场景）→ 最后一片
     const n = Number.isInteger(root.map[opts.single]) ? root.map[opts.single] : Math.max(0, root.shards - 1);
     const shard = root.shards > 0 ? await loadIdxShard(store, n) : { n: 0, raw: null, books: [] };
     if (root.shards === 0) {
       root.shards = 1;
       shard.n = 0;
     }
-    // 单书模式只加载一片 → 对账只做「补/改 map」，不做死指针摘除（看不到全局，会误删）
-    return makeHandle(store, root, [shard], { single: opts.single, rootRaw: rootSrc, partial: true });
-  }
-
-  if (opts.ids) {
+    if (shard.books.some((b) => b && b.id === opts.single)) {
+      // 单书模式只加载一片 → 对账只做「补/改 map」，不做死指针摘除（看不到全局，会误删）
+      return makeHandle(store, root, [shard], { single: opts.single, rootRaw: rootSrc, partial: true });
+    }
+    // 兜底：指针说「在 n 片」而 n 片里根本没有它（指针错位/落后一代）。单书模式看不到全局、
+    // 自己修不了它 —— 表现为书架看得见、点进去 404。这里**不返回**，落到下面的全量加载一次，
+    // 借构造期对账 ① 把 map 修齐（代价是这一次多读 K-1 片，且只在异常态发生）。
+  } else if (opts.ids) {
     const want = [...new Set(opts.ids.map((id) => root.map[id]).filter((n) => Number.isInteger(n) && n >= 0))];
     const shards = await Promise.all(want.sort((a, b) => a - b).map((n) => loadIdxShard(store, n)));
     return makeHandle(store, root, shards, { rootRaw: rootSrc, partial: true });
@@ -660,8 +681,30 @@ async function openIndex(store, opts = {}) {
     const resumed = await resumeMigration(store);
     if (resumed) return resumed;
   }
+  // 死指针摘除（reconcileIdx ②）的安全前提：root.shards 覆盖了**磁盘上全部分片**。盘上若还有
+  // 未被加载的片（指针落后一代 / 半写残留），「本片确凿读到却没有」的书其实住在那些片里，摘除
+  // 就是误删。这里只做**廉价预筛**（纯内存）：map 条目数 vs 已加载片的书数 —— 只有前者更大
+  // （确实存在「map 说有、已加载片里没有」的条目）时才多花 1 次 list 去数盘上分片数；
+  // 正常路径（两者相等）零额外开销。
+  let prunable = true;
+  const loadedBooks = shards.reduce((n, x) => n + x.books.length, 0);
+  if (Object.keys(root.map).length > loadedBooks) {
+    try {
+      const l = await store.list('meta/idx/', 2);
+      const onDisk = l.objects.filter((o) => /^meta\/idx\/s\d+\.json$/.test(o.key)).length;
+      if (!l.truncated && onDisk > root.shards) {
+        // 盘上分片数**多于** root.shards：指针落后一代（半写残留 / 旧 bak 回落）。此时高号片里的书
+        // 既看不见也点不动（加载哪些片由 root.shards 决定），map 里虽还留着它们却永远不会被读。
+        // 直接按盘上文件重建一次 root（幂等：rebuildIdxRoot 以文件名推导 shards 与各片归属）。
+        return rebuildIdxRoot(store);
+      }
+      prunable = !l.truncated && onDisk <= root.shards;
+    } catch {
+      prunable = false; // 数不出来就不摘（保守优先）
+    }
+  }
   // full 模式覆盖全部分片 → 对账可做完整（含死指针摘除），且 root 原文复用不再重读
-  return makeHandle(store, root, shards, { rootRaw: rootSrc });
+  return makeHandle(store, root, shards, { rootRaw: rootSrc, prunable });
 }
 
 
@@ -1166,7 +1209,7 @@ async function apiBookMeta(store, id) {
 /** 改元信息（书名/作者/标签/置顶）——PATCH，同步 index（单书模式：只碰该书所在分片） */
 async function apiPatchBook(req, store, id) {
   const body = await req.json().catch(() => ({}));
-  const idx = await openIndex(store, { id });
+  const idx = await openIndex(store, { single: id });
   if (!idx.get(id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
   const meta = await readBook(store, id);
   if (!meta) return json({ error: '书不存在' }, 404);
@@ -1277,7 +1320,7 @@ async function editableMeta(store, id) {
 async function syncIndexAfterEdit(store, meta) {
   // 首波两读并行（该书分片 + progress），第二波两写并行（bak + 分片）——4 程 → 2 波
   const [idx, ptRaw] = await Promise.all([
-    openIndex(store, { id: meta.id }),
+    openIndex(store, { single: meta.id }),
     store.getText(KEY.progress(meta.id)).catch(() => null),
   ]);
   let prog;
@@ -1444,7 +1487,7 @@ async function apiProgressPut(req, store, id) {
   // 同时收窄分片读-改-写与 publish 并发时的覆盖窗口。
   // 代价：镜像百分比停留在最近一次换章时的值（书架角标「第几章」仍准确；恢复阅读读 progress 真值，不受影响）。
   try {
-    const idx = await openIndex(store, { id });
+    const idx = await openIndex(store, { single: id });
     const book = idx.get(id);
     if (!book) return json({ ok: true });
     // 越界进度压回末章（镜像供书架角标直接显示，不能出现「读到 999/10 章」）
@@ -1681,7 +1724,7 @@ async function apiTagsMerge(req, store) {
  * 也接纳「未上架的半成品书」（上传中途失败停在 creating、不在 index）：
  * 这类书若不能进回收站就永远删不掉、也看不见，只能留成孤儿数据。 */
 async function apiSoftDelete(store, id) {
-  const idx = await openIndex(store, { id }); // 单书模式：root + 该书所在片
+  const idx = await openIndex(store, { single: id }); // 单书模式：root + 该书所在片
   const b = idx.get(id);
   const meta = b ? null : await readBook(store, id);
   if (!b && !meta) return json({ error: '书不存在或已删除' }, 404);
@@ -1737,7 +1780,7 @@ async function apiRestore(store, id) {
   }
   trash.books.splice(trashIdx, 1);
   // index（单书模式：新书落最后一片）+ trash 写互不依赖 → 并行
-  const [idx] = await Promise.all([openIndex(store, { id }), writeTrash(store, trash)]);
+  const [idx] = await Promise.all([openIndex(store, { single: id }), writeTrash(store, trash)]);
   const { purge, deletedAt, ...rest } = entry;
   idx.upsert(id, { ...rest }); // 已在架（重复恢复）则原位覆盖，语义与 v1 的去重 push 一致
   await idx.save({ bak: true });

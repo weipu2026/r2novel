@@ -8,7 +8,7 @@
  *
  * 离线能用的真正保障来自离线整本下载（IndexedDB），SW 只是「静态壳可缓存」。
  */
-const CACHE = 'r2novel-shell-v13';
+const CACHE = 'r2novel-shell-v14';
 const SHELL = [
   '/',
   '/index.html',
@@ -33,6 +33,7 @@ const SHELL = [
   '/js/ui.js',
   '/js/exporter.js',
   '/js/shared-const.js',
+  '/js/batch-queue.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/maskable-512.png',

@@ -298,4 +298,4 @@ if (problems) {
   console.log(`\nCHECK_FAIL · total problems=${problems}`);
   process.exit(1);
 }
-console.log(`SHELL_OK · ${problems === 0 ? '清单与 public/ 静态资源一致' : ''}`.trimEnd());
+console.log('SHELL_OK · 清单与 public/ 静态资源一致');

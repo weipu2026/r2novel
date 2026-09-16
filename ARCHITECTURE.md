@@ -168,32 +168,6 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 `scripts/verify-deploy.mjs`（生产静态文件与仓库哈希比对，排除 sw.js——部署时会改写 CACHE 版本号），
 本地抽查仍可 cache-buster + 下载比对（行尾归一化后比）。
 
-## 6. 书架索引 v2 分片契约（2026-09-15 落地，改存储层前必读）
-
-**布局**：`meta/idx/root.json`（`{v:2, shards:n, map:{id:分片号}}`）+ `meta/idx/s<N>.json`
-（≤500 本/片，`{books:[摘要]}`），各带 `.bak`。**v1 的 `meta/index.json` 迁移后冻结**：
-不再读不再写，本体保留（旧代码回滚窗口）+ 原文另存 `meta/index.json.v1.bak` 双保险。
-
-**读写形态**（`openIndex(store, opts)`）：
-- full（默认）：root + 全部分片聚合，`GET /api/books`/publish 响应/opds/标签清单用——响应形状与 v1 完全一致
-- `{ id }` 单书模式：root + 该书所在片（热路径：进度镜像/PATCH/就地编辑同步/软删/恢复）
-- `{ ids }` 并集模式：批量治理用，只载目标所在片
-
-**预算纪律**（48 子请求软顶）：
-- 单书写 = root 1 读 + 1 片读 + 片写 + bak ≈ 4~5，永远安全
-- 批量/标签：`1 + 3k + 2N ≤ 48`（k=目标跨片数），超出**贪心裁剪**返回 rest/remaining 续调
-- diag/purgeOrphans：预算基数 = `2 + idx.shardCount`（root+分片+trash）
-
-**自愈链**（读路径只读回退，不在读时写盘）：root 坏 → root.bak → 由分片重建（`rebuildIdxRoot`）；
-分片坏 → 片 .bak → 双坏则该片按空处理且 **save() 拒绝写入**（`shardRaw===undefined` throw）——
-绝不允许把空片固化（v1 的真数据丢失路径）。书 meta 都在 R2，可经「检查残留→无主书→回收站→恢复」重建。
-
-**禁忌**：
-- **禁止再读写 `meta/index.json`**（测试也走 `_harness.mjs` 的 `readIdxBooks/writeIdxBooks`）
-- root 首次落盘（迁移/新库）**没有写前状态**，跳过 root bak——拿「空 root」当 bak 会伪造合法空布局
-- 迁移必须**均匀整块切**（500/片），不要逐本 append+拆分（会留 251/250 参差片）
-- 新增 API 的 index 读写一律走 `openIndex` 三种模式，别绕过 handle 直接拼 key
-
 ## 5. 何时拆分（触发条件，满足才动，不为整洁而整洁）
 
 - **上传域已于 2026-09-13 拆出**（触发条件 ② 命中：上传竞态反复出事）。6 步、每步一个独立
@@ -206,3 +180,46 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 - 不动：cleaner.js（纯函数语义冻结）、store/offline/sw（稳定薄层）、CSS（刚令牌化）
 - 拆分纪律：函数+注释**整体搬家**、一个 commit 只搬一个域、每步跑 §4 全量回归后才推；
   **搬完先跑 §4 的 `npm run check`（1 秒出结果，含模块一致性检查）再跑 UI 套件**（十几分钟）
+
+## 6. 书架索引 v2 分片契约（2026-09-15 落地，改存储层前必读）
+
+**布局**：`meta/idx/root.json`（`{v:2, shards:n, map:{书id:分片号}}`）+ `meta/idx/s<N>.json`
+（≤500 本/片，`{books:[摘要]}`），各带 `.bak`。**v1 的 `meta/index.json` 迁移后冻结**：
+不再读不再写，本体保留（旧代码回滚窗口）+ 原文另存 `meta/index.json.v1.bak` 双保险。
+
+**读写形态**（`openIndex(store, opts)`）：
+- full（默认）：root + 全部分片聚合，`GET /api/books`/publish 响应/opds/标签清单用——响应形状与 v1 完全一致
+- `{ id }` 单书模式：root + 该书所在片（热路径：进度镜像/PATCH/就地编辑同步/软删/恢复）
+- `{ ids }` 并集模式：批量治理用，只载目标所在片
+- `{ rootRaw }`：调用方已读过 root（批量接口核预算）→ 传进来复用，省 1 子请求（否则公式得算两次读）
+- `{ id }` / `{ ids }` 都是 **partial**（只加载部分分片）→ 对账只做「补/改 map」，不做死指针摘除
+
+**预算纪律**（48 子请求软顶）：
+- 单书写 = root 1 读 + 1 片读 + 片写 + bak ≈ 4~5，永远安全
+- 批量/标签：`1 + 3k + 2N ≤ 48`（k=目标跨片数），超出贪心裁剪，**被裁的 id 必须原样回传**
+  （`deferred`，客户端 `public/js/batch-queue.js` 排回队列续调）；标签治理用 `remaining`，同款语义。
+  「只回传数量、前端不消费」＝静默丢书（v2 实测：书库 ≥1501 本时 18 本散在 5 片只处理 16 本，
+  且前端把 2 本计成「失败（可能是半成品书）」→ 用户不会重试）
+- diag/purgeOrphans：预算基数 = `2 + idx.shardCount`（root+分片+trash）
+
+**自愈链**（读路径只读回退，不在读时写盘）：root 坏 → root.bak → 由分片重建（`rebuildIdxRoot`）；
+分片坏 → 片 .bak → 双坏则该片按空处理且 **save() 拒绝写入**（`shardRaw===undefined` throw）——
+绝不允许把空片固化（v1 的真数据丢失路径）。书 meta 都在 R2，可经「检查残留→无主书→回收站→恢复」重建。
+片与片 bak **都不存在**（missing，迁移半途/被外部删除）→ **允许重建写入**：没有可丢的内容，
+否则一个缺失的片文件会让全库永久无法发布（save 一律 throw）。此时全量模式还会尝试 `resumeMigration`。
+
+**构造期对账**（`reconcileIdx`，makeHandle 构造时跑）：分片内容与 `root.map` 是**两处真相**
+（bak 回落、写盘半途失败都会让二者错位），错位即「书架看得见、点进去 404」，下一次成员变更还会
+把错位 map 固化。以「已读到的片内容」为准：① 片里有、map 缺失或指错片 → 补/改（同 id 多片副本以
+片号最小者为准，其余摘除）；② map 里有、但该片内容确凿读到却没这本书 → 摘除死指针
+（片缺失/双坏时跳过：那是「读不到」，不是「确认没有」）。
+
+**禁忌**：
+- **禁止再读写 `meta/index.json`**（测试也走 `_harness.mjs` 的 `readIdxBooks/writeIdxBooks`）
+- root bak 只在「写前 root 是有效布局且 `shards>0`」时写：迁移首写、以及**迁移空库后发布第一本书**
+  （root 存在但 shards:0）都没有可备份的旧状态——拿空布局当 bak 会伪造「合法但空」的书架
+  （回退即清空书架 + 再发布覆盖首片，已实测）
+- 迁移必须**均匀整块切**（500/片），不要逐本 append+拆分（会留 251/250 参差片）
+- 迁移写序：分片（含片 bak）与 v1 留档先落，**root 最后提交**（并发写中断会留下「root 说有 N 片、
+  分片一个都没落」，而 root 看着合法 → 自愈链永不重迁 → 书架永久为空且发布必 500）
+- 新增 API 的 index 读写一律走 `openIndex` 三种模式，别绕过 handle 直接拼 key

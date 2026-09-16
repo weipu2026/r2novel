@@ -153,7 +153,9 @@ R2 桶（私有；无公开读、无直链）
 
 | Key | 内容 |
 |---|---|
-| `meta/index.json`（+.bak） | 书架摘要；变更前自动快照到 `.bak` |
+| `meta/idx/root.json`（+.bak） | 书架索引布局：`{v:2, shards:n, map:{书id:分片号}}`；成员变化才写 |
+| `meta/idx/s<N>.json`（+.bak） | 书架摘要分片（≤500 本/片）；写只碰脏分片，改动前快照到片 `.bak` |
+| `meta/index.json`（+.bak） | **迁移后冻结保留**（旧代码回滚窗口）；原文另存 `meta/index.json.v1.bak` |
 | `meta/trash.json` | 回收站（含分批清理进度） |
 | `meta/sec/brute.json` | 防爆破计数状态（IP 只存 SHA-256 哈希前缀，不落明文） |
 | `meta/<bookId>.json` | 单书元数据（章节表/作者/备注/标签/置顶/完结/星标/已读完/cleanVer/孤儿章节表） |

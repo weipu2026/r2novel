@@ -5,6 +5,7 @@ import * as reader from './reader.js';
 import { bindBusy, bindToast, busy, busyDone, toast } from './ui.js';
 import { exportBookTxt } from './exporter.js';
 import { els, $, $$, esc, normTitle, IC } from './dom.js';
+import { runBatched } from './batch-queue.js';
 import { init as initUpload, openUpload, rewashConfirm, openChapterEditor } from './upload/index.js';
 
 const PAGE = 60; // 书库分页
@@ -1023,7 +1024,9 @@ function syncBatchBar() {
   for (const b of [els.bbTags, els.bbDone, els.bbOngoing, els.bbDelete]) b.disabled = dis;
 }
 
-/** 批量执行：分批调用批量 API（每批 BATCH_PAGE 本 = BATCH_BOOKS_MAX），busy 进度反馈；完成后刷新书架 */
+/** 批量执行：分批调用批量 API（每批 BATCH_PAGE 本 = BATCH_BOOKS_MAX），busy 进度反馈；完成后刷新书架。
+ * 队列推进（含后端「48 子请求预算」裁剪后的 deferred 续调）在 batch-queue.js 里：纯逻辑、可单测，
+ * 这里只管确认框 / 忙碌层 / 收尾刷新。**必须消费 deferred**——否则被裁掉的目标静默丢失（见该模块注释）。 */
 async function batchRun(action, payload, confirmText) {
   if (!selected.size) return;
   const ids = Array.from(selected);
@@ -1032,17 +1035,14 @@ async function batchRun(action, payload, confirmText) {
   let ok = 0;
   let fail = 0;
   try {
-    for (let i = 0; i < ids.length; i += BATCH_PAGE) {
-      const batch = ids.slice(i, i + BATCH_PAGE);
-      try {
-        const r = await api.batchBooks(batch, action, payload);
-        ok += r.updated || 0;
-        fail += batch.length - (r.updated || 0);
-      } catch {
-        fail += batch.length;
-      }
-      busy(Math.min(i + BATCH_PAGE, ids.length) / ids.length, `批量操作中… ${Math.min(i + BATCH_PAGE, ids.length)}/${ids.length}`);
-    }
+    const r = await runBatched(
+      ids,
+      BATCH_PAGE,
+      (batch) => api.batchBooks(batch, action, payload),
+      (done, total) => busy(done / total, `批量操作中… ${done}/${total}`)
+    );
+    ok = r.ok;
+    fail = r.fail;
   } finally {
     busyDone();
   }

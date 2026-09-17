@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
+import { memStore, req, call, login, readIdxBooks, writeIdxBooks, writeIdxShards, countStore } from './_harness.mjs';
 
 function pagedStore(base, pageSize = 20) {
   return {
@@ -204,28 +204,57 @@ test('opds：150 本书 → p1 恰 100 条 + rel next；p2 剩余 50 条 + rel p
 
 /* ---------------- ⑤ 上传链路提速（2026-09-08） ---------------- */
 
-test('publish 响应回传发布后的 books 快照（前端免二次 GET /api/books）', async () => {
-  const store = memStore();
-  const cookie = await login(store);
-  const chapters = ['第一章 a', '第二章 b', '第三章 c'];
-  let r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '快照书', chapters, wordCount: 30 } }));
-  const id = r.data.id;
-  await call(store, req(`/api/books/${id}/chapters/bulk`, { method: 'POST', cookie, body: { chapters: [{ key: '1', text: 'a' }, { key: '2', text: 'b' }, { key: '3', text: 'c' }] } }));
+test('publish 不回传 books 快照、索引只开一片 —— 开销与书库规模无关（P2-5）', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  // 5 片布局（2001 本）：旧实现发布按 full 打开索引（1+K 个子请求）只为在响应里回传整张快照
+  const mk = (i) => ({
+    id: 'q' + String(i).padStart(4, '0'),
+    title: '书' + i,
+    author: '',
+    tags: [],
+    chapterCount: 1,
+    wordCount: 10,
+    finished: false,
+    cleanVer: 1,
+    updatedAt: 1700000000000 + i,
+  });
+  const groups = [];
+  for (let s = 0; s < 4; s++) groups.push(Array.from({ length: 500 }, (_, j) => mk(s * 500 + j)));
+  groups.push([mk(2000)]);
+  await writeIdxShards(base, groups);
 
+  const chapters = ['第一章 a', '第二章 b', '第三章 c'];
+  let r = await call(base, req('/api/books', { method: 'POST', cookie, body: { title: '快照书', chapters, wordCount: 30 } }));
+  const id = r.data.id;
+  await call(
+    base,
+    req(`/api/books/${id}/chapters/bulk`, {
+      method: 'POST',
+      cookie,
+      body: { chapters: [{ key: '1', text: 'a' }, { key: '2', text: 'b' }, { key: '3', text: 'c' }] },
+    })
+  );
+
+  const store = countStore(base);
   r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.books, undefined, 'publish 不再回传快照（前端 loadShelf() 兜底；旧实现为凑快照做全量读）');
+  assert.ok(r.data.t && typeof r.data.t.total === 'number', '应含分阶段耗时 t（诊断字段不变）');
+  // 读取 = meta 1 + 抽样 3 + root 1 + 末片 1 + progress 1 = 7，与分片数无关（旧实现 11）
+  assert.ok(store._count.get <= 8, `发布读取子请求必须恒定在个位数（实测 ${store._count.get}）`);
+  store._count.get = 0;
+  store._count.put = 0;
+  r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie })); // 二次发布（已在架路径）
   assert.equal(r.status, 200);
-  assert.ok(Array.isArray(r.data.books), '响应应含 books 快照');
-  assert.equal(r.data.books.length, 1, '快照应含刚发布的书');
-  assert.equal(r.data.books[0].id, id);
-  assert.equal(r.data.books[0].chapterCount, 3);
-  assert.equal(r.data.books[0].wordCount, 30);
-  // 快照与 GET /api/books 结构一致（前端 loadShelf({books}) 等价于旧刷新路径）。
-  // updatedAt 归一后再比：两次请求落在不同毫秒属正常，不能作为差异
-  const norm = (arr) => JSON.parse(JSON.stringify(arr)).map((b) => ({ ...b, updatedAt: 0 }));
-  r = await call(store, req('/api/books', { cookie }));
-  const get1 = norm(r.data.books);
-  const pub2 = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
-  assert.deepEqual(norm(pub2.data.books), get1, '快照应与书架 GET 一致');
-  // t 分阶段耗时存在（诊断字段）
-  assert.ok(pub2.data.t && typeof pub2.data.t.total === 'number', '应含分阶段耗时 t');
+  assert.ok(store._count.get <= 8, `重复发布读取量同样恒定（实测 ${store._count.get}）`);
+  assert.ok(store._count.put <= 8, `发布写入子请求同样有界（实测 ${store._count.put}）`);
+
+  // 前端兜底路径：GET /api/books 能看到刚发布的书，摘要正确
+  r = await call(base, req('/api/books', { cookie }));
+  assert.equal(r.data.books.length, 2002);
+  const found = r.data.books.find((b) => b.id === id);
+  assert.ok(found, '发布后应在书架上');
+  assert.equal(found.chapterCount, 3);
+  assert.equal(found.wordCount, 30);
 });

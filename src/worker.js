@@ -12,12 +12,37 @@ export function r2Store(bucket) {
       const o = await bucket.get(key);
       return o ? o.text() : null;
     },
+    /** 读原文 + 版本号（乐观锁用）。R2 的 etag 对普通 put 是内容 MD5，故 etag 变化 ⟺ 内容变化。
+     *  一次 get 同时拿到 body 与 etag，不多花子请求（getText 自己会丢掉 etag）。
+     *  注意 R2 语义：onlyIf 未通过时 get 返回的 R2Object 的 body 是 undefined —— 这里当不存在处理。 */
+    async getTextWithEtag(key) {
+      const o = await bucket.get(key);
+      if (!o || !o.body) return null;
+      return { text: await o.text(), etag: o.etag };
+    },
     async getBytes(key) {
       const o = await bucket.get(key);
       return o ? new Uint8Array(await o.arrayBuffer()) : null;
     },
     async putText(key, str) {
       await bucket.put(key, str);
+    },
+    /** 条件写。三种语义（与 router.js 的 store 契约一致）：
+     *   · etag 是字符串 → CAS：仅当对象当前 etag 与之相等才写（onlyIf.etagMatches）；
+     *   · etag 为 null  → 「不存在才写」：onlyIf 传 Headers 的 If-None-Match:*（R2 官方支持条件头，
+     *                     S3 兼容的 If-None-Match:* 即「对象不存在才落盘」）；
+     *   · etag 为 undefined → 无条件写。
+     *  条件未满足时 R2 返回 null（官方语义，不抛错）→ 这里也返回 null，调用方据此重读重放。
+     *  成功回传新 etag：调用方下次 CAS 要用它。R2 普通 put 的 etag 是内容 MD5 → 内容不变则 etag 不变。 */
+    async putTextIf(key, str, etag) {
+      const opts =
+        etag === null
+          ? { onlyIf: new Headers({ 'If-None-Match': '*' }) } // 不存在才写
+          : typeof etag === 'string'
+            ? { onlyIf: { etagMatches: etag } } // CAS
+            : undefined; // 无条件写
+      const res = await bucket.put(key, str, opts);
+      return res ? { etag: res.etag } : null;
     },
     async putBytes(key, bytes) {
       await bucket.put(key, bytes);

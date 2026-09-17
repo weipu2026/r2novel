@@ -254,3 +254,34 @@ test('安全：防爆破（连错锁定 / 锁定期正确口令也 429 / 状态�
   const bf3 = JSON.parse(store2._map.get('meta/sec/brute.json') || '{"ips":{}}');
   assert.equal(Object.keys(bf3.ips).length, 0, '成功登录应清掉失败记录');
 });
+
+/* ── M2（2026-09-17 外部审计）：防爆破计数器的并发丢失更新 ─────────────────────
+ * brute.json 的「读—改—写」不重读状态，N 个并发失败各自从同一快照累加后整文件覆盖
+ * → 一波并发只让计数 +1，爆破预算被放大 N 倍（README 宣称的「不给逐位试探的机会」不成立）。
+ * 修复：updateBrute 走 CAS 乐观锁（每轮重读最新值再叠自己这一次失败）。
+ * 这里用「读 brute.json 时多等 2ms」把并发窗口撑开，让所有请求都读到同一份旧快照。 */
+test('M2：并发失败登录不得互相覆盖（brute.json 读—改—写走 CAS 重放）', async () => {
+  const BRUTE = 'meta/sec/brute.json';
+  const base = memStore();
+  const slam = {
+    ...base,
+    async getText(k) {
+      const t = await base.getText(k);
+      if (k === BRUTE) await new Promise((r) => setTimeout(r, 2)); // 撑开读—改—写窗口
+      return t;
+    },
+  };
+  const bad = () => call(slam, req('/api/login', { method: 'POST', body: { password: 'wrong' } }));
+  const rs = await Promise.all([bad(), bad(), bad()]);
+  assert.deepEqual(
+    rs.map((r) => r.status),
+    [401, 401, 401],
+    '三次都应是口令错误（BRUTE_LIMIT=100，不会触发锁定）'
+  );
+  const rec = Object.values(JSON.parse(base._map.get(BRUTE)).ips)[0];
+  assert.equal(
+    rec.fail,
+    3,
+    '3 次并发失败必须记满 3 次（旧实现各自从同一快照写回 → 只留 1 次，爆破预算放大 3 倍）'
+  );
+});

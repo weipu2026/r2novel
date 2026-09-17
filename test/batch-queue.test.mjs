@@ -108,6 +108,28 @@ test('零进展（整批被退回）→ 立即收手，不空转', async () => {
   assert.equal(calls, 1, '整批退回＝零进展，再试也是同样结果');
 });
 
+test('自愈轮：后端 retry=true 的零进展允许重发一次，再零进展即收手', async () => {
+  const ids = ['a', 'b', 'c'];
+  let calls = 0;
+  const r = await runBatched(ids, PAGE, async (batch) => {
+    calls++;
+    // 第一轮：后端 root 深度坏 → 预算全花在重建索引上，一本没动但盘面已修好
+    if (calls === 1) return { updated: 0, deferred: batch, retry: true };
+    return { updated: batch.length, deferred: [] };
+  });
+  assert.deepEqual(r, { ok: 3, fail: 0 }, 'retry 一次后整批应做完');
+  assert.equal(calls, 2);
+
+  // 后端每轮都回 retry：只容忍一次，第二次零进展立即收手（不空转）
+  let calls2 = 0;
+  const r2 = await runBatched(ids, PAGE, async (batch) => {
+    calls2++;
+    return { updated: 0, deferred: batch, retry: true };
+  });
+  assert.deepEqual(r2, { ok: 0, fail: 3 });
+  assert.equal(calls2, 2, 'retry 只容忍一次，不会无限重发');
+});
+
 test('单批失败：该批计失败，队列继续（不吞掉后面的书）', async () => {
   const ids = Array.from({ length: 40 }, (_, i) => 'x' + i);
   let calls = 0;

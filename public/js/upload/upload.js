@@ -74,7 +74,8 @@ export async function onConfirm() {
     upSession.clear();
     els.upFile.value = '';
     host().showView('shelf');
-    // publish 响应已带回发布后的 books 快照 → 直接渲染书架，省一次 GET /api/books（慢链路 ≈2s）
+    // 服务端为让发布开销与书库规模无关，已不再回传 books 快照（P2-5）→ 走下面的 loadShelf() 兜底；
+    // 分支保留：旧版 worker 仍会回传快照，此时省一次 GET /api/books（慢链路 ≈2s）
     if (pub && pub.books) await host().loadShelf({ books: pub.books }).catch(() => {});
     else await host().loadShelf().catch(() => {}); // 兜底：旧版 worker 无 books 字段时走原刷新路径
   } catch (e) {

@@ -610,3 +610,38 @@ test('M2：F22 就地删除末章后云端进度压回章数内（书架角标�
   r = await call(store, req(`/api/progress/${id}`, { cookie }));
   assert.equal(r.data.ch, 1, '删前章进度前移');
 });
+
+/* ── trash 并发写（2026-09-17 审计修复期发现的同类缺陷）────────────────────────
+ * meta/trash.json 原先是**无条件整文件覆盖写**：两个并发请求各自「读 → 改 → 写回」时后写者
+ * 把前者刚加的条目整份吃掉 —— 被吃掉的那本书既不在索引也不在回收站，UI 里彻底消失
+ * （meta/正文还在 R2，只能靠「检查残留」找回）。触发面：双标签页同时删两本、删除撞上惰性清理。
+ * 修复：updateTrash 走 CAS 乐观锁 + 冲突重放。这里用「读 trash 时多等 2ms」撑开并发窗口。 */
+test('trash 并发软删不得互相覆盖（meta/trash.json 走 CAS 重放）', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  const a = await makeReadyBook(base, cookie, '并行甲', 1);
+  const b = await makeReadyBook(base, cookie, '并行乙', 1);
+  const slam = {
+    ...base,
+    async getText(k) {
+      const t = await base.getText(k);
+      if (k === 'meta/trash.json') await new Promise((r) => setTimeout(r, 2)); // 撑开读—改—写窗口
+      return t;
+    },
+  };
+  const [ra, rb] = await Promise.all([
+    call(slam, req(`/api/books/${a.id}`, { method: 'DELETE', cookie })),
+    call(slam, req(`/api/books/${b.id}`, { method: 'DELETE', cookie })),
+  ]);
+  assert.equal(ra.status, 200);
+  assert.equal(rb.status, 200);
+  const r = await call(base, req('/api/trash', { cookie }));
+  const ids = r.data.books.map((x) => x.id);
+  assert.ok(
+    ids.includes(a.id) && ids.includes(b.id),
+    '两本都必须进回收站（旧实现后写者整文件覆盖 → 有一本彻底消失）：' + ids.join(',')
+  );
+  // 反向：两本都不该还留在书架
+  const shelf = await call(base, req('/api/books', { cookie }));
+  assert.equal(shelf.data.books.length, 0, '两本都已下架');
+});

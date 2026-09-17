@@ -154,6 +154,33 @@ function clientIp(req) {
   return req.headers.get('CF-Connecting-IP') || req.headers.get('x-forwarded-for') || 'unknown';
 }
 
+/* ---------------- store 乐观锁原语（2026-09-17 外部审计 P2-6 / M2） ----------------
+ * 病根：R2 没有事务，而「读—改—写」遍布索引与计数文件。两个并发请求各自「读旧值 → 改 →
+ * 整文件写回」时，后写者会静默吃掉前者的改动（实测：两个标签页同时发布 → 其中一本从书架消失）。
+ * store 契约（三端一致：worker R2 / dev-server fs / 测试 memStore）：
+ *   · getTextWithEtag(key) → { text, etag } | null    读原文 + 版本号（一次 get 拿两样，不多花子请求）
+ *   · putTextIf(key, text, etag) → { etag } | null     带 etag → 仅当当前版本相等才写（CAS）；
+ *                                                      etag 为 null → 仅当对象不存在才写；
+ *                                                      etag 为 undefined → 无条件写。失败返回 null。
+ * etag 是**内容相关**的（R2 普通 put = 内容 MD5；fs/memStore = 内容 sha1）：内容不变则 etag 不变。
+ * CAS 是**可选能力**：老 store / 外部探针没实现时退化为无条件写（行为等于旧版），
+ * 所以本文件不用到处写 `if (store.putTextIf)`。
+ * 为什么不是「自增版本号」当 etag：测试/脚本会直接改存储造数，内容派生的 etag 才不会被绕过。 */
+async function getWithEtag(store, key) {
+  if (store.getTextWithEtag) return await store.getTextWithEtag(key);
+  const t = await store.getText(key);
+  return t == null ? null : { text: t, etag: undefined };
+}
+/** 条件写：返回 { ok, etag }；ok=false 表示版本已变（或该存在的还不存在）→ 调用方重读重放 */
+async function putIf(store, key, text, etag) {
+  if (!store.putTextIf) {
+    await store.putText(key, text);
+    return { ok: true, etag: undefined };
+  }
+  const r = await store.putTextIf(key, text, etag);
+  return r ? { ok: true, etag: r.etag } : { ok: false, etag: null };
+}
+
 /* ---------------- 防爆破（R2 持久化：跨 isolate/重启有效；指数退避防长期锁死） ----------------
  * 计数按客户端 IP 的 SHA-256 前缀（不存明文 IP）。
  * fail 计数带 15 分钟滑动窗口：隔了一刻钟再试，重新计次，不累积冤枉。
@@ -175,12 +202,11 @@ async function ipHash(req) {
   return [...new Uint8Array(d)].slice(0, 10).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** 读取爆破状态（顺手清掉过期条目 + 按数量截断，文件保持极小） */
-async function readBrute(store) {
-  const b = await readJson(store, KEY.BRUTE, { ips: {} });
+/** 归一变体：清掉过期条目 + 按数量截断（文件保持极小）。缺失/损坏 → 空表。 */
+function normalizeBrute(b) {
   const now = Date.now();
   const ips = {};
-  for (const [k, rec] of Object.entries(b.ips || {})) {
+  for (const [k, rec] of Object.entries((b && b.ips) || {})) {
     if ((rec.until || 0) > now || (rec.updatedAt || 0) > now - BRUTE_FAIL_WINDOW) ips[k] = rec;
   }
   // 上限保护：超量时按最近活跃裁掉最旧的（防御分布式伪造 IP 让 brute.json 无限膨胀）
@@ -191,7 +217,33 @@ async function readBrute(store) {
   }
   return { ips };
 }
-const writeBrute = (store, b) => store.putText(KEY.BRUTE, JSON.stringify(b));
+
+/** 读取爆破状态（顺手清掉过期条目 + 按数量截断，文件保持极小） */
+async function readBrute(store) {
+  return normalizeBrute(await readJson(store, KEY.BRUTE, { ips: {} }));
+}
+
+/** brute.json 的「读—改—写」：CAS 乐观锁 + 冲突重放（M2）。
+ * 原实现拿 bruteCheck 读到的旧快照整文件覆盖：N 个并发失败各自数到 1、互相覆盖，实际只记 1 次
+ * —— 爆破预算被放大 N 倍（外部审计探针复现）。这里每轮重读最新状态，再叠自己这一次失败。
+ * mutate(b) 就地改 b，返回 { out, dirty }：dirty=false 表示「无需写」（如本来就没有记录）。 */
+async function updateBrute(store, mutate, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    const cur = await getWithEtag(store, KEY.BRUTE);
+    const b = normalizeBrute(cur && tryParseJson(cur.text));
+    const r = mutate(b);
+    if (r.dirty === false) return r.out;
+    // cur === null → 「不存在才写」：并发的首次失败只有一个落盘，其余重试时读到对手的结果再叠加
+    const w = await putIf(store, KEY.BRUTE, JSON.stringify(b), cur ? cur.etag : null);
+    if (w.ok) return r.out;
+  }
+  // 重试耗尽（极端抖动）：无条件写一次——limiter 的失效方向必须偏保守（宁可多记也不放过）
+  const cur = await getWithEtag(store, KEY.BRUTE);
+  const b = normalizeBrute(cur && tryParseJson(cur.text));
+  const r = mutate(b);
+  await store.putText(KEY.BRUTE, JSON.stringify(b));
+  return r.out;
+}
 
 /** 登录前检查：是否被锁。返回 { locked, retryAfterMs, b } */
 async function bruteCheck(req, env, store) {
@@ -202,37 +254,40 @@ async function bruteCheck(req, env, store) {
 }
 
 /** 记一次失败：达标即锁，时长指数翻倍 */
-async function bruteFail(req, env, store, state) {
+async function bruteFail(req, env, store) {
   const cfg = bruteCfg(env);
   const now = Date.now();
   const h = await ipHash(req);
-  const rec = state.b.ips[h] || { fail: 0, until: 0, strikes: 0 };
-  if (rec.until > 0 && rec.until <= now) {
-    rec.fail = 0;
-    rec.until = 0;
-  }
-  if (now - (rec.updatedAt || 0) > BRUTE_FAIL_WINDOW) rec.fail = 0; // 滑动窗口：隔久了重新计次
-  rec.fail += 1;
-  rec.updatedAt = now;
-  let locked = false;
-  if (rec.fail >= cfg.limit) {
-    rec.strikes = (rec.strikes || 0) + 1;
-    const lock = Math.min(cfg.lockMs * 2 ** (rec.strikes - 1), cfg.lockMaxMs);
-    rec.until = now + lock;
-    rec.fail = 0;
-    locked = true;
-  }
-  state.b.ips[h] = rec;
-  await writeBrute(store, state.b);
-  return { locked, retryAfterMs: rec.until > now ? rec.until - now : 0 };
+  return updateBrute(store, (b) => {
+    const rec = b.ips[h] || { fail: 0, until: 0, strikes: 0 };
+    if (rec.until > 0 && rec.until <= now) {
+      rec.fail = 0;
+      rec.until = 0;
+    }
+    if (now - (rec.updatedAt || 0) > BRUTE_FAIL_WINDOW) rec.fail = 0; // 滑动窗口：隔久了重新计次
+    rec.fail += 1;
+    rec.updatedAt = now;
+    let locked = false;
+    if (rec.fail >= cfg.limit) {
+      rec.strikes = (rec.strikes || 0) + 1;
+      const lock = Math.min(cfg.lockMs * 2 ** (rec.strikes - 1), cfg.lockMaxMs);
+      rec.until = now + lock;
+      rec.fail = 0;
+      locked = true;
+    }
+    b.ips[h] = rec;
+    return { out: { locked, retryAfterMs: rec.until > now ? rec.until - now : 0 } };
+  });
 }
 
-/** 登录成功：清掉该 IP 的失败记录（无记录则不写） */
-async function bruteClear(req, store, state) {
+/** 登录成功：清掉该 IP 的失败记录（无记录则不写——成功登录是热路径，不白花一次写） */
+async function bruteClear(req, store) {
   const h = await ipHash(req);
-  if (!state.b.ips[h]) return;
-  delete state.b.ips[h];
-  await writeBrute(store, state.b);
+  await updateBrute(store, (b) => {
+    if (!b.ips[h]) return { out: null, dirty: false };
+    delete b.ips[h];
+    return { out: null };
+  });
 }
 
 /* ---------------- 会话鉴权（HMAC 无状态 Cookie，参照 r2book） ---------------- */
@@ -341,7 +396,40 @@ const looksRoot = (r) =>
 const readIndex = (store) => openIndex(store).then((h) => ({ books: h.books }));
 
 const readTrash = (store) => readJson(store, KEY.TRASH, { books: [] });
-const writeTrash = (store, trash) => store.putText(KEY.TRASH, JSON.stringify(trash));
+
+/** trash 原文 → { books: [...] }（缺失/损坏/结构不对一律当空表，与 readJson 同判据） */
+const parseTrash = (t) => {
+  const j = t != null ? tryParseJson(t) : null;
+  return j && Array.isArray(j.books) ? j : { books: [] };
+};
+
+/**
+ * trash.json 的「读—改—写」（CAS 乐观锁 + 冲突重放）。与 updateBrute 同源：整文件无条件覆盖写
+ * 会让并发的两次「摘条目」互相吃掉对方 —— 被吃掉的那本书既不在索引也不在回收站，UI 里彻底消失
+ * （meta/正文还在 R2，只能靠「检查残留」找回）。软删 / 批量软删 / 恢复 / 彻底删除都会碰它。
+ * mutate(t) 就地改 t 并返回 { out, dirty }；dirty === false 表示无需落盘。
+ * ⚠️ mutate **可能被重放多次**：结果必须每次都从 t 重新推导，外层计数要累加就先清零。
+ * pre：调用方已经读过一次（恢复要先按 id 找到条目）→ 传进来复用，省一次子请求；冲突重试时重新读。
+ */
+async function updateTrash(store, mutate, tries = 3, pre = null) {
+  let snapshot = pre;
+  for (let i = 0; i < tries; i++) {
+    const cur = snapshot || (await getWithEtag(store, KEY.TRASH));
+    snapshot = null;
+    const t = parseTrash(cur && cur.text);
+    const r = mutate(t);
+    if (r.dirty === false) return r.out;
+    const w = await putIf(store, KEY.TRASH, JSON.stringify(t), cur ? cur.etag : null);
+    if (w.ok) return r.out;
+  }
+  // 重试耗尽（极端抖动）：再读一次最新状态叠加后无条件写。这里的失效方向必须偏保守 ——
+  // 宁可多留一条可恢复记录，也不能把用户刚删的书从回收站里静默抹掉，所以不像索引那样直接抛错。
+  const cur = await getWithEtag(store, KEY.TRASH);
+  const t = parseTrash(cur && cur.text);
+  const r = mutate(t);
+  if (r.dirty !== false) await store.putText(KEY.TRASH, JSON.stringify(t));
+  return r.out;
+}
 
 /** v1 单文件读取（迁移专用）：原文 + 解析一次拿两样 */
 async function readIndexRaw(store) {
@@ -417,12 +505,24 @@ function makeHandle(store, root, shards, opts = {}) {
   const shardRaw = shards.map((s) => s.raw); // 各片原文（写 bak 用；null=新片）
   const shardMissing = shards.map((s) => !!s.missing); // 片与片 bak 都不存在（≠损坏：没有可丢的内容）
   const shardNo = shards.map((s) => s.n);
+  // 各片主文件的版本号（CAS 用）。判据：**只有拿到了真实版本号的片才加条件**——新建片（拆片/首片）
+  // 与「片文件本来就不存在」都没有可对号的旧版本，无条件写才会收敛：否则上次失败留下的孤儿片
+  // （写成了但没进 root）会让重试永远撞「版本已变」，把一次瞬时冲突变成持续 500。
+  const shardEtag = shards.map((s) => (typeof s.mainEtag === 'string' && s.mainEtag ? s.mainEtag : undefined));
   const dirty = new Set();
   let rootDirty = false;
+  // 改动意图日志：save() 撞上 CAS 冲突时，用它在新盘面上重放这一轮的改动（见 save / saveOnce）。
+  // 三条写方法各记一条，且必须**幂等**——upsert（已在架即原位覆盖）、patch（由 patchFn 重算）、
+  // remove（删两次等价）。重放而不是把重试交给调用方：调用方只关心「最终索引里有哪些书」，
+  // 不关心中途撞了几次冲突；做在 save() 里也意味着 7 个 mutate+save 调用点一次全覆盖。
+  const opLog = [];
   // root 当前原文（rootDirty 写 bak 的「写前状态」）。null=此前 root 不存在（迁移/新库），
   // 此时没有可备份的旧布局——绝不能拿「空 root」当 bak（回退会得到合法但空的假布局），
   // 跳过一次 root bak，自愈链会落到「由分片重建」。
   let rootRaw = opts.rootRaw != null ? opts.rootRaw : null;
+  // root 的版本号（openIndex 读 root 时拿到；migrate/rebuild 自己写完 root 后拿到新值）。
+  // 非字符串 → 不做条件（理由同 shardEtag：没有可对号的旧版本）。
+  let rootEtag = typeof opts.rootEtag === 'string' && opts.rootEtag ? opts.rootEtag : undefined;
   // 上面那条禁忌的**另一半**：root 存在但 shards:0（迁移空库后发布第一本书时正是这状态）
   // 同样没有值得备份的旧布局。实测过：拿它当 bak，一次 root 损坏就回落到「合法空书架」——
   // 书架 0 本，再发布还会覆盖首片，首书条目永久消失。判据＝「写前 root 是有效布局且至少 1 片」；
@@ -432,6 +532,15 @@ function makeHandle(store, root, shards, opts = {}) {
   if (reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, !!opts.partial, opts.prunable !== false)) rootDirty = true;
 
   const siOfShardNo = (n) => shardNo.indexOf(n);
+
+  // 冲突重试时用哪套「打开参数」重读盘面：与首次调用**同模式**（single 保持 single，不让单书
+  // 热路径在重试时退化成全量读），但必须丢掉 rootRaw/rootEtag —— 那是上一轮的快照，带着它
+  // 重试＝拿旧状态重放，必然再撞一次冲突。
+  const reopenOpts = () => {
+    if (opts.single) return { single: opts.single, append: !!opts.append };
+    if (opts.ids) return { ids: opts.ids };
+    return {};
+  };
 
   const h = {
     shardCount: root.shards, // 全量分片数（diag 等预算敏感方核算子请求用）
@@ -448,6 +557,7 @@ function makeHandle(store, root, shards, opts = {}) {
     /** 原位替换/追加条目。已在架 → 保持原位（比 v1 的「删了再 push 到末尾」更稳定）；
      * 新成员 → 追加到最后一片，满片对半拆（拆分保持片内顺序，全局顺序在拆分处重排——前端本来就要排序，无感） */
     upsert(id, entry) {
+      opLog.push({ op: 'upsert', id, entry });
       let si = siOfShardNo(root.map[id]);
       if (si >= 0) {
         const arr = shardBooks[si];
@@ -461,6 +571,7 @@ function makeHandle(store, root, shards, opts = {}) {
         shardNo.push(root.shards); // 首片
         shardBooks.push([]);
         shardRaw.push(null);
+        shardEtag.push(undefined); // 新片：盘上还没有 → 无条件写（不必 CAS，也无从 CAS）
         shardMissing.push(false); // 新片：文件还不存在，但里面没有可丢的内容（≠坏片的读不到）
         root.shards += 1;
       }
@@ -477,6 +588,7 @@ function makeHandle(store, root, shards, opts = {}) {
         shardNo.push(newN);
         shardBooks.push(tail);
         shardRaw.push(null);
+        shardEtag.push(undefined); // 新片（无条件写，理由同上）
         for (const b of tail) root.map[b.id] = newN;
         root.shards = newN + 1;
         dirty.add(t);
@@ -485,6 +597,7 @@ function makeHandle(store, root, shards, opts = {}) {
     },
     /** 原位打补丁（entry 对象由 patchFn 返回替换），书必须在已加载的片里 */
     patch(id, patchFn) {
+      opLog.push({ op: 'patch', id, fn: patchFn });
       const b = h.get(id);
       if (!b) throw new Error(`patch: 书 ${id} 不在已加载分片中`);
       const si = siOfShardNo(root.map[id]);
@@ -493,6 +606,7 @@ function makeHandle(store, root, shards, opts = {}) {
       return shardBooks[si].find((x) => x.id === id);
     },
     remove(id) {
+      opLog.push({ op: 'remove', id });
       const si = siOfShardNo(root.map[id]);
       if (si < 0) return false;
       const arr = shardBooks[si];
@@ -506,7 +620,32 @@ function makeHandle(store, root, shards, opts = {}) {
     },
     /** 落盘：只写脏分片（bak=该片写前原文）+ 成员变化时的 root（bak=写前原文）。
      * bak:false 用于进度镜像这类高频小写（v1 语义：镜像不写 bak）。 */
-    async save({ bak = true } = {}) {
+    async save({ bak = true, attempt = 0 } = {}) {
+      try {
+        await saveOnce(bak);
+        return;
+      } catch (e) {
+        // 索引 CAS 冲突（盘面被别人改过，P2-6：两个标签页同时发布 → 后写者整文件覆盖前者）：
+        // 重开索引拿新盘面 → 按 opLog 重放本轮的改动 → 再写一次。attempt 是内部计数，调用方别传。
+        if (!isIdxConflict(e) || attempt + 1 >= IDX_SAVE_TRIES) throw e;
+        const again = await openIndex(store, reopenOpts());
+        for (const o of opLog) {
+          if (o.op === 'upsert') again.upsert(o.id, o.entry);
+          else if (o.op === 'patch') again.patch(o.id, o.fn);
+          else again.remove(o.id);
+        }
+        await again.save({ bak, attempt: attempt + 1 });
+        // 本 handle 的待落盘改动已由 again 那份落盘 → 清空，免得再次 save 拿旧内存态覆盖回去
+        dirty.clear();
+        rootDirty = false;
+      }
+    },
+  };
+  return h;
+
+  /** 真正的落盘（原 save 主体）。被 save 包在 try 里以处理 CAS 冲突重放；单独拿出来是因为
+   * 函数声明会提升，可以写在 return 之后，把「冲突重放」与「写序铁律」两件事分开表述。 */
+  async function saveOnce(bak) {
       // 写序铁律（2026-09-16 审计修复）——**指针(root)先落、数据(分片)后落**。
       // 这里是「更新」路径，与 migrateV1（首次创建）的写序**相反**，不要照抄那边：
       //   · 数据先、指针后 + 指针写失败 → 磁盘「数据新、指针旧」。全量加载只到旧 shards，
@@ -523,51 +662,90 @@ function makeHandle(store, root, shards, opts = {}) {
           throw new Error(`分片 ${shardNo[si]} 内容损坏且无备份，拒绝覆盖（避免固化数据丢失）`);
         }
       }
-      // ② 指针先落（root 与 root.bak 并行，两者完成后才动数据）
-      if (rootDirty) {
-        const rw = [];
-        if (bak && rootBakUsable) rw.push(store.putText(KEY_IDX.rootBak, rootRaw));
-        rootRaw = JSON.stringify(root);
+      // ② 写序（2026-09-17 审计补完）：判据不是「直觉上哪个更稳」，而是**失败后落在哪一侧**：
+      //   · 指针领先于盘（root.shards > 盘上分片数）→ **无人能修**：resumeMigration 要求全部分片
+      //     缺失、预筛的 onDisk > root.shards 是反方向、对账 ② 又刻意跳过「读不到」的片。实测 501 本
+      //     的库拆片时 s1 写失败 → 重启只剩 251 本可见，且下一次 save 把僵尸指针固化。
+      //   · 指针落后于盘（盘上分片数 > root.shards）→ 有覆盖：预筛走 rebuildIdxRoot 按盘重建 ✓
+      //   · 只改既有片（shards 不变）→ 指针先落是对的：数据写失败时指针指着的内容没变，等于本次没生效
+      // 因此：**本次新建了分片（首片/拆片）时，顺序必须是「新片 → 既有片 → root」**，让任何一种
+      // 单点失败都落在「等于本次没发生」或「有人管」的一侧；没有新片时沿用「root 先、数据后」。
+      const fresh = [...dirty].filter((si) => shardRaw[si] === null); // null = 本次新建、盘上还没有
+      const writeRoot = async () => {
+        if (!rootDirty) return;
+        const next = JSON.stringify(root);
+        // root 走 CAS（P2-6 的关键一步）：两个并发发布都会改 root，谁后写谁吃掉对方 —— 版本号一变
+        // 就报冲突，由 withIdxRetry 重读重放。bak 是「写前状态」的快照（内容就是旧 root），不做 CAS。
+        const jobs = [putIf(store, KEY_IDX.root, next, rootEtag)];
+        if (bak && rootBakUsable) jobs.push(store.putText(KEY_IDX.rootBak, rootRaw));
+        const [res] = await Promise.all(jobs);
+        if (!res.ok) throw idxConflict('root');
+        rootRaw = next;
+        rootEtag = res.etag;
         rootBakUsable = root.shards > 0; // 落盘后「写前状态」即新布局
-        rw.push(store.putText(KEY_IDX.root, rootRaw));
-        await Promise.all(rw);
+        rootDirty = false;
+      };
+      const writeShards = async (list) => {
+        const jobs = [];
+        for (const si of list) {
+          const body = JSON.stringify({ books: shardBooks[si] });
+          // 分片也走 CAS：同一片被两个请求并发读—改—写时，后写者会吃掉前者的书条目。
+          const bakP = bak ? store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body) : null;
+          jobs.push(
+            putIf(store, KEY_IDX.shard(shardNo[si]), body, shardEtag[si]).then(async (res) => {
+              if (!res.ok) throw idxConflict('shard ' + shardNo[si]);
+              if (bakP) await bakP;
+              shardEtag[si] = res.etag;
+              shardRaw[si] = body;
+              shardMissing[si] = false;
+              dirty.delete(si);
+            })
+          );
+        }
+        await Promise.all(jobs);
+      };
+      if (fresh.length) {
+        await writeShards(fresh); // 新片先落：失败 ⇒ root 与既有片都没动，等于本次没发生
+        await writeShards([...dirty]); // 既有片（放 root 之前：root 落后于盘有自愈覆盖）
+        await writeRoot();
+      } else {
+        await writeRoot(); // 指针先落（既有片路径，第四轮审计的结论）
+        await writeShards([...dirty]);
       }
-      // ③ 数据后落
-      const writes = [];
-      for (const si of dirty) {
-        const body = JSON.stringify({ books: shardBooks[si] });
-        if (bak) writes.push(store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body));
-        writes.push(store.putText(KEY_IDX.shard(shardNo[si]), body));
-        shardRaw[si] = body;
-        shardMissing[si] = false;
-      }
-      dirty.clear();
-      rootDirty = false;
-      await Promise.all(writes);
-    },
-  };
-  return h;
+  }
 }
 
 /** 读单个分片（带 bak 回落）。两级都坏 → broken（raw=undefined）：调用方 save() 会拒绝覆盖，
  * 书的 meta 本体仍在 R2，经「检查残留→无主书→移入回收站→恢复」可重建索引条目。
  * 两级**都不存在**（missing）→ 同样 raw=undefined，但语义是「没有内容可丢」，允许重新写入。 */
+/** 索引并发冲突：CAS 版本已变（有人先写了）。必须由 withIdxRetry 捕获后重读重放，不该冒到 HTTP 层。 */
+const idxConflict = (what) => Object.assign(new Error('索引并发冲突（' + what + '）'), { code: 'IDX_CONFLICT' });
+const isIdxConflict = (e) => !!e && e.code === 'IDX_CONFLICT';
+/** save() 因 CAS 冲突最多重放几次（含首次）。正常一次就成，第二次兜住并发，第三次只对极端抖动。 */
+const IDX_SAVE_TRIES = 3;
+
+/* 并发重放：原 withIdxRetry 已删除 —— 它需要每个调用点自己把 mutate 包成闭包，7 处漏一处就等于
+ * 那一处并发丢更新照旧。现在重放做在 makeHandle.save() 内部（opLog），调用点零改动且新增端点自动覆盖。 */
+
 async function loadIdxShard(store, n) {
-  const raw = await store.getText(KEY_IDX.shard(n));
-  const j = tryParseJson(raw);
-  if (j && Array.isArray(j.books)) return { n, raw, books: j.books };
-  const bakRaw = await store.getText(KEY_IDX.shardBak(n));
-  const jb = tryParseJson(bakRaw);
-  if (jb && Array.isArray(jb.books)) return { n, raw: bakRaw, books: jb.books };
+  const main = await getWithEtag(store, KEY_IDX.shard(n));
+  const j = main ? tryParseJson(main.text) : null;
+  // mainEtag：主片文件的版本号（写盘 CAS 用）。注意它只代表**主片当时**的状态——即便下文回落到
+  // 片 bak，CAS 目标仍是主片（把 bak 内容写回主片时，必须先确认主片没被别人改过）。
+  const mainEtag = main ? main.etag : null;
+  if (j && Array.isArray(j.books)) return { n, raw: main.text, books: j.books, mainEtag };
+  const bak = await getWithEtag(store, KEY_IDX.shardBak(n));
+  const jb = bak ? tryParseJson(bak.text) : null;
+  if (jb && Array.isArray(jb.books)) return { n, raw: bak.text, books: jb.books, mainEtag };
   // broken：不落盘、不静默清空；missing：片与片 bak 都不存在（迁移中断/被外部删除）
-  return { n, raw: undefined, books: [], missing: raw == null && bakRaw == null };
+  return { n, raw: undefined, books: [], mainEtag, missing: main == null && bak == null };
 }
 
 /** v1 → v2 迁移 + 新库初始化（root 不存在时的唯一入口）。
  * 迁移把 v1 books 按序**均匀整块**切片（500/片），v1 原文另存 v1Bak，index.json 本体冻结保留。
  * 不走「逐本 append + 满片拆」——那会留下一串 251/250 的参差片；整块切布局确定、一次写齐。
  * root 首次落盘没有「写前状态」→ 不写 root bak（自愈链有「由分片重建」兜底）。 */
-async function migrateV1(store) {
+async function migrateV1(store, { rootEtag = null } = {}) {
   const { json: legacy, raw } = await readIndexRaw(store);
   const books = (legacy.books || []).filter((b) => b && b.id);
   const chunks = [];
@@ -582,69 +760,109 @@ async function migrateV1(store) {
   // 现在的顺序下最坏只是白写一遍分片：下次 openIndex 见 root 缺失，重跑一次迁移（幂等）。
   const pre = [];
   if (raw != null) pre.push(store.putText(KEY_IDX.v1Bak, raw));
-  chunks.forEach((arr, n) => {
-    const body = JSON.stringify({ books: arr });
-    pre.push(store.putText(KEY_IDX.shard(n), body));
-    pre.push(store.putText(KEY_IDX.shardBak(n), body)); // 首份内容即 bak 基线
-  });
+  // 分片带版本号落盘（putIf 无条件写，只是把新版本号收下来给紧随其后的那次写用）
+  const etags = await Promise.all(
+    chunks.map(async (arr, n) => {
+      const body = JSON.stringify({ books: arr });
+      const res = await putIf(store, KEY_IDX.shard(n), body, undefined);
+      await store.putText(KEY_IDX.shardBak(n), body); // 首份内容即 bak 基线
+      return res.etag;
+    })
+  );
   await Promise.all(pre);
-  await store.putText(KEY_IDX.root, JSON.stringify(root));
+  // root 的条件写按调用场景区分（这点由 fix8b 才真正生效——此前「null」被三端 store 当成无条件写）：
+  //   · rootEtag === null（首次迁移/新库，盘上没有 root）→ 「不存在才写」：两个请求同时触发迁移
+  //     只有一个落盘，输的那个读回落盘的那份（迁移幂等）；
+  //   · rootEtag 是字符串（resumeMigration 续传，盘上那个不完整的 root 就在那儿）→ CAS 覆盖它。
+  //     这里**不能**用「不存在才写」：写入会直接失败，盘上 root 仍是「shards 虚高」的旧布局，
+  //     而分片已按 v1 重切 —— 指针领先于盘，是 save() 注释里那个「无人能修」的状态。
+  let w = await putIf(store, KEY_IDX.root, JSON.stringify(root), rootEtag);
+  if (!w.ok) {
+    const again = await getWithEtag(store, KEY_IDX.root);
+    w = { ok: true, etag: again ? again.etag : undefined };
+  }
   return makeHandle(
     store,
     root,
-    chunks.map((arr, n) => ({ n, raw: JSON.stringify({ books: arr }), books: arr })),
-    { rootRaw: null }
+    chunks.map((arr, n) => ({ n, raw: JSON.stringify({ books: arr }), books: arr, mainEtag: etags[n] })),
+    { rootRaw: null, rootEtag: w.etag }
   );
 }
 
-/** root 与 root.bak 双坏（极罕见）：由分片内容重建 root。分片文件名即分片号，成员归属从片内容推导。 */
+/** root 与 root.bak 双坏（极罕见）：由分片内容重建 root。分片文件名即分片号，成员归属从片内容推导。
+ * 每片都经 loadIdxShard（含片 bak 回落）——重建是最后一环，不能比常规读更容易丢字节。 */
 async function rebuildIdxRoot(store) {
   const l = await store.list('meta/idx/', 2);
-  const names = l.objects.map((o) => o.key).filter((k) => /^meta\/idx\/s\d+\.json$/.test(k)).sort();
-  const shards = [];
-  for (const k of names) {
-    const n = Number(k.slice('meta/idx/s'.length, -'.json'.length));
-    const raw = await store.getText(k);
-    const j = tryParseJson(raw);
-    shards.push({ n, raw, books: j && Array.isArray(j.books) ? j.books : [] });
+  // 片号从「主片名」与「片 bak 名」两处一起收集：主片被外部删掉而片 bak 还在时，只认主片名会把
+  // 那一整片从 map 里抹掉——本来可救的字节被重建动作自己丢掉。
+  const nums = new Set();
+  for (const o of l.objects) {
+    const m = /^meta\/idx\/s(\d+)\.json(?:\.bak)?$/.exec(o.key);
+    if (m) nums.add(Number(m[1]));
   }
+  // 逐片走 loadIdxShard（主片 → 片 bak 回落），不再自己 getText/parse：重建路径必须与常规读共用
+  // 同一套自愈判据，否则「主片坏、片 bak 好」时重建会拿空数组覆盖真相（P2-2）。
+  // 主片与片 bak 都读不出的片 → books:[]：其书在 R2 的 meta/正文仍在，会以「无主书」出现在残留
+  // 扫描里、经回收站找回；片号本身保留（不把「读不到」当成「确认没有」）。
+  const shards = await Promise.all([...nums].sort((a, b) => a - b).map((n) => loadIdxShard(store, n)));
+  // 片号有空洞（主片与片 bak 都被外部删掉）时补空占位片：重建后 root.shards 必须 = 最大片号+1，
+  // 而全量加载是按 0..root.shards-1 逐个读的——少一格就会让高号片（内容完好）永远读不到。
+  const hasN = new Set(shards.map((s) => s.n));
+  const topN = shards.length ? shards[shards.length - 1].n : -1;
+  for (let n = 0; n <= topN; n++) if (!hasN.has(n)) shards.push({ n, raw: undefined, books: [], missing: true });
   shards.sort((a, b) => a.n - b.n);
   const root = { v: 2, shards: shards.length, map: {} };
   for (const s of shards) for (const b of s.books) root.map[b.id] = s.n;
   const rootRaw = JSON.stringify(root);
-  const writes = [store.putText(KEY_IDX.root, rootRaw)];
+  // 重建是最后一环：无条件写（上面已经确定性读出了全部片），但要把新版本号收下来交给 handle
+  const writes = [putIf(store, KEY_IDX.root, rootRaw, undefined)];
   if (shards.length) writes.push(store.putText(KEY_IDX.rootBak, rootRaw)); // 空恢复结果同样不留 bak（见 makeHandle）
-  await Promise.all(writes);
-  return makeHandle(store, root, shards, { rootRaw: shards.length ? rootRaw : null });
+  const [w] = await Promise.all(writes);
+  return makeHandle(store, root, shards, { rootRaw: shards.length ? rootRaw : null, rootEtag: w.etag });
 }
 
 /** 迁移续传：root 声称有分片、但 meta/idx/ 下**一个 s*.json 对象都不存在**，且 v1 快照里有书
  * → 认定「分片一次都没写成的半途迁移」（旧版把 root 与分片并发写，root 可能先落），重跑一次。
  * 只在确认没有任何分片对象时才动：存在任何分片对象就交给自愈链，绝不覆盖可能可抢救的字节。 */
-async function resumeMigration(store) {
+async function resumeMigration(store, rootEtag = null) {
   const l = await store.list('meta/idx/', 2);
   if (l.objects.some((o) => /^meta\/idx\/s\d+\.json/.test(o.key))) return null;
   const { json: legacy } = await readIndexRaw(store);
   if (!(legacy.books || []).some((b) => b && b.id)) return null;
-  return migrateV1(store);
+  // 续传时盘上 root 已存在（就是不完整的那份）→ 把它的版本号带下去做 CAS 覆盖（见 migrateV1）
+  return migrateV1(store, { rootEtag });
 }
 
 /**
  * 打开书架索引。默认全量（root + 全部分片）；{ single: id } 单书模式只读 root + 该书所在片
  * （热路径：进度镜像/就地编辑/PATCH/软删/恢复——写只碰一片）；{ ids } 并集模式（批量治理）。
+ * { single: id, append: true } 追加模式：调用方保证该书不在索引里（发布新书 / 回收站恢复），
+ * 片里没有它时**不再退化成全量加载**——一片就够写，让这两个端点的开销与书库规模无关（P2-5）。
  */
 async function openIndex(store, opts = {}) {
   // opts.rootRaw：调用方（批量接口）已经读过一次 root 用来核预算，传进来复用，省 1 子请求；
   // 显式传 undefined（而不是 null）才重新读——null 表示「root 确实不存在」，语义不同。
-  const rootRaw = opts.rootRaw !== undefined ? opts.rootRaw : await store.getText(KEY_IDX.root);
+  // opts.rootEtag：与 rootRaw 配套的版本号（批量接口复用那次读时一起传进来）。
+  // 注意：即使下面的 root 内容实际来自 root.bak，CAS 目标仍是**主 root 对象**，所以这里记的是
+  // 主对象的版本（不存在 → null，表示「不存在才写」；老 store 无版本 → undefined，不加条件）。
+  let rootRaw;
+  let rootEtag;
+  if (opts.rootRaw !== undefined) {
+    rootRaw = opts.rootRaw;
+    rootEtag = opts.rootEtag;
+  } else {
+    const o = await getWithEtag(store, KEY_IDX.root);
+    rootRaw = o ? o.text : null;
+    rootEtag = o ? o.etag : null;
+  }
   let root = rootRaw != null ? tryParseJson(rootRaw) : null;
   let rootSrc = rootRaw;
   if (!looksRoot(root)) {
-    const bakRaw = await store.getText(KEY_IDX.rootBak);
-    const rb = tryParseJson(bakRaw);
+    const bak = await getWithEtag(store, KEY_IDX.rootBak);
+    const rb = bak ? tryParseJson(bak.text) : null;
     if (looksRoot(rb)) {
       root = rb;
-      rootSrc = bakRaw;
+      rootSrc = bak.text;
     }
   }
   if (!root) {
@@ -661,9 +879,13 @@ async function openIndex(store, opts = {}) {
       root.shards = 1;
       shard.n = 0;
     }
-    if (shard.books.some((b) => b && b.id === opts.single)) {
-      // 单书模式只加载一片 → 对账只做「补/改 map」，不做死指针摘除（看不到全局，会误删）
-      return makeHandle(store, root, [shard], { single: opts.single, rootRaw: rootSrc, partial: true });
+    if (shard.books.some((b) => b && b.id === opts.single) || opts.append) {
+      // 单书模式只加载一片 → 对账只做「补/改 map」，不做死指针摘除（看不到全局，会误删）。
+      // opts.append：调用方已保证这个 id 不在索引里（发布新书 / 回收站恢复），要的是「能写进一片」；
+      // 没有它时缺书会落到下面的全量加载（1+K 子请求）——2 万本/40 片下逼近 50 硬顶（P2-5）。
+      // map 里有指针却在该片找不到（指针错位）时，append 让 upsert 往那片补条目，比全量加载
+      // 更贴合「让 map 与分片内容自洽」，也不会多出一条同 id 记录。
+      return makeHandle(store, root, [shard], { single: opts.single, rootRaw: rootSrc, rootEtag, partial: true });
     }
     // 兜底：指针说「在 n 片」而 n 片里根本没有它（指针错位/落后一代）。单书模式看不到全局、
     // 自己修不了它 —— 表现为书架看得见、点进去 404。这里**不返回**，落到下面的全量加载一次，
@@ -671,14 +893,14 @@ async function openIndex(store, opts = {}) {
   } else if (opts.ids) {
     const want = [...new Set(opts.ids.map((id) => root.map[id]).filter((n) => Number.isInteger(n) && n >= 0))];
     const shards = await Promise.all(want.sort((a, b) => a - b).map((n) => loadIdxShard(store, n)));
-    return makeHandle(store, root, shards, { rootRaw: rootSrc, partial: true });
+    return makeHandle(store, root, shards, { rootRaw: rootSrc, rootEtag, partial: true });
   }
 
   const shardNums = Array.from({ length: root.shards }, (_, i) => i);
   const shards = await Promise.all(shardNums.map((n) => loadIdxShard(store, n)));
   // 半途迁移的续传（只在全量模式下判定，且分片**一个都不存在**才算，见 resumeMigration）
   if (shards.length && shards.every((s) => s.missing)) {
-    const resumed = await resumeMigration(store);
+    const resumed = await resumeMigration(store, rootEtag); // 复用上面那次 root 读的版本号
     if (resumed) return resumed;
   }
   // 死指针摘除（reconcileIdx ②）的安全前提：root.shards 覆盖了**磁盘上全部分片**。盘上若还有
@@ -704,7 +926,7 @@ async function openIndex(store, opts = {}) {
     }
   }
   // full 模式覆盖全部分片 → 对账可做完整（含死指针摘除），且 root 原文复用不再重读
-  return makeHandle(store, root, shards, { rootRaw: rootSrc, prunable });
+  return makeHandle(store, root, shards, { rootRaw: rootSrc, rootEtag, prunable });
 }
 
 
@@ -764,10 +986,10 @@ async function apiLogin(req, env, store) {
   const pass = String(body.password || '');
   const admin = env.ADMIN_PASSWORD;
   if (!admin || !safeEqual(pass, admin)) {
-    if (admin) await bruteFail(req, env, store, st);
+    if (admin) await bruteFail(req, env, store);
     return json({ error: '口令错误' }, 401);
   }
-  await bruteClear(req, store, st);
+  await bruteClear(req, store);
   const days = Number(env.SESSION_DAYS || 30) || 30;
   const payload = b64urlEncode(JSON.stringify({ exp: Date.now() + days * 86400000 }));
   const sig = await hmac(env.SESSION_SECRET || admin, payload);
@@ -788,6 +1010,9 @@ const ORPHAN_BATCH = 24; // replace 遗留孤儿惰性清理单批（publish/更
 /**
  * 对 trash 里一本书执行一批彻底删除。返回 { entry(更新后), deleted, done, remaining }。
  * remaining>0 表示还需续调（章节太多分批）。
+ * ⚠️ 只**读** trash 参数，不再改动它（条目摘除与 purge 续传标记都走 updateTrash，落在最新的
+ * 那一份上）。调用方要判断「这本书删完没有」请看返回的 done，**别**去看自己那份 books.length
+ * ——旧实现靠这里 splice 的副作用，CAS 化之后那个副作用就没有了。
  */
 async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
   const idx = trash.books.findIndex((b) => b.id === id);
@@ -815,13 +1040,21 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
   let done = false;
   if (left.length) {
     entry = { ...entry, purge: left };
-    trash.books[idx] = entry;
-    await writeTrash(store, trash);
+    await updateTrash(store, (t) => {
+      const i = t.books.findIndex((b) => b.id === id);
+      if (i < 0) return { dirty: false }; // 并发已把它清掉
+      t.books[i] = { ...t.books[i], purge: left };
+      return {};
+    });
   } else {
     done = true;
     await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id)), store.delete(KEY.st(id))]);
-    trash.books.splice(idx, 1);
-    await writeTrash(store, trash);
+    await updateTrash(store, (t) => {
+      const i = t.books.findIndex((b) => b.id === id);
+      if (i < 0) return { dirty: false };
+      t.books.splice(i, 1);
+      return {};
+    });
   }
   return { entry, deleted, done, remaining: left.length };
 }
@@ -1147,11 +1380,14 @@ async function apiPublish(req, env, store, id) {
   const tMeta = Date.now() - T0;
   const keys = meta.chapters.map((c) => c.key);
   const samples = [keys[0], keys[Math.floor(keys.length / 2)], keys[keys.length - 1]].filter((k, i, arr) => arr.indexOf(k) === i);
-  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（full，响应要回传整张书架）+ progress 镜像源
+  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（single+append：root + 1 片）+ progress 镜像源。
+  // 发布是导入链路里最高频的写，索引原来按 full 打开只为顺带在响应里回传整张 books 快照 → 2 万本/40 片
+  // 实测 52 个子请求，越过 Cloudflare 的 50 硬顶（P2-5）。改为「新书追加到最后一片」，发布开销与书库
+  // 规模**无关**；代价是上传收尾多一次 GET /api/books（前端两处都已有兜底分支）。
   const T1 = Date.now();
   const [sampled, idx, ptRaw] = await Promise.all([
     Promise.all(samples.map((k) => store.getText(KEY.text(id, k)))),
-    openIndex(store),
+    openIndex(store, { single: id, append: true }),
     store.getText(KEY.progress(id)).catch(() => null),
   ]);
   const tVerify = Date.now() - T1;
@@ -1180,7 +1416,8 @@ async function apiPublish(req, env, store, id) {
   const T2 = Date.now();
   await Promise.all([putStatus(store, id, 'ready'), store.putText(KEY.book(id), JSON.stringify(meta)), idx.save({ bak: true })]);
   const tWrite = Date.now() - T2;
-  // books 快照随响应回传：前端入库后直接用这份新列表渲染书架，省一次 GET /api/books 往返；
+  // 不再回传 books 快照（见上：为它做全量读会在 2 万本量级撞 50 子请求硬顶）。前端 upload.js /
+  // upload/files.js 两处都有 `if (pub.books) … else loadShelf()` 兜底，新旧前后端任意组合都安全。
   // t 为服务端分阶段耗时（meta 读 / 校验+读 / 写），供慢链路诊断
   return json({
     ok: true,
@@ -1188,7 +1425,6 @@ async function apiPublish(req, env, store, id) {
     wordCount: meta.wordCount,
     chapterCount: meta.chapterCount,
     cleanVer: meta.cleanVer,
-    books: idx.books,
     t: { meta: tMeta, verify: tVerify, write: tWrite, total: Date.now() - T0 },
   });
 }
@@ -1546,16 +1782,31 @@ async function apiBatchBooks(req, store) {
   // 被裁掉的 id 必须**原样回传**（deferred）让客户端排回队列续调——v1 单文件时代 k 恒为 1 用不着算，
   // 分片后 18 本随机目标可能散在多片；「裁掉却不告诉客户端」＝静默丢书（v2 实测：18 本散 5 片只处理 16 本）。
   // 不在架（回收站/半成品）的书既不占预算也不进 deferred：重试多少次都不在架，会死循环。
+  //
+  // 廉价预筛的前提是「root.map 就是可信的在架名单」。它有两个失效态：
+  //   · map 缺条目（P2-3）——root 从 .bak 回落后要等对账 ① 才补上，或盘上分片比 root.shards 多。
+  //     此时确实在架的书会被判 offShelf：既不处理也不 deferred，前端把它计成「失败（可能是半成品
+  //     书）」且不重试，标签/完结状态永远改不动。
+  //   · root 深度坏（P2-4）——自愈（rebuildIdxRoot 的 list + 逐片读 + root 写）也吃子请求，
+  //     原公式当成 0，实测越过 50 硬顶。
+  // 两种都改为先做一次**全量打开**（含自愈与对账）拿到真相，并把该 handle 复用到本批操作（不再
+  // 第二次开索引）；这次多花的子请求从预算里预扣。正常态（map 覆盖全部目标）仍只读 1 次 root。
   const rootInfo = await (async () => {
-    const raw = await store.getText(KEY_IDX.root);
-    let root = tryParseJson(raw);
-    if (looksRoot(root)) return { root, raw };
-    const bakRaw = await store.getText(KEY_IDX.rootBak);
-    const rb = tryParseJson(bakRaw);
-    if (looksRoot(rb)) return { root: rb, raw: bakRaw };
-    return { root: (await openIndex(store)).root, raw: null }; // 深度坏/缺失 → 自愈后取
+    const cur = await getWithEtag(store, KEY_IDX.root);
+    const raw = cur ? cur.text : null;
+    const rootEtag = cur ? cur.etag : null;
+    const root = tryParseJson(raw);
+    if (looksRoot(root) && batch.every((id) => Number.isInteger(root.map[id]))) {
+      return { root, raw, rootEtag, extra: 0, handle: null }; // 廉价路径：map 覆盖了全部目标，可当在架名单用
+    }
+    // 全量打开（rootRaw/rootEtag 复用上面那次读，省 1 读）：root 不可解析时顺带走 root.bak → 由分片重建。
+    const h = await openIndex(store, { rootRaw: raw, rootEtag });
+    // 预扣已花的子请求：1（root 读）+ K（全量片读）+ 不可解析时 1（root.bak）+ 重建 1（list）+ 2（root/root.bak 写）
+    const extra = 1 + h.shardCount + (looksRoot(root) ? 0 : 4);
+    return { root: h.root, raw: null, rootEtag: null, extra, handle: h };
   })();
   const shardNoOf = (id) => (Number.isInteger(rootInfo.root.map[id]) ? rootInfo.root.map[id] : null);
+  const budget = Math.max(0, 48 - rootInfo.extra); // 预扣掉的（自愈/全量读）不再给本批用
   const shardSet = new Set();
   const processed = [];
   const offShelf = new Set();
@@ -1567,21 +1818,26 @@ async function apiBatchBooks(req, store) {
     }
     const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
     const est = action === 'delete' ? 5 + 3 * newS : 1 + 3 * newS + 2 * (processed.length + 1);
-    if (est > 48) break;
+    if (est > budget) break;
     shardSet.add(n);
     processed.push(id);
   }
   const processedSet = new Set(processed);
   const deferredInBatch = batch.filter((id) => !processedSet.has(id) && !offShelf.has(id));
   const deferred = deferredInBatch.concat(ids.slice(BATCH_BOOKS_MAX)); // 预算裁掉的 + 超单批上限的尾巴
-  const idx = await openIndex(store, { ids: processed, ...(rootInfo.raw != null ? { rootRaw: rootInfo.raw } : {}) });
+  // 自愈轮：本批的预算全花在修 root 上了（大库下预扣直接吃光）→ 一本没动，但盘面已修好。
+  // 明确告诉客户端「这一批退回不是死局，再发一次」，否则 runBatched 会把整批退回当零进展收手（P2-4）。
+  const retry = rootInfo.extra > 0 && processed.length === 0;
+  // 已经全量打开的 handle 直接复用（是 { ids } 模式的超集），绝不第二次开索引
+  const openOpts = { ids: processed, ...(rootInfo.raw != null ? { rootRaw: rootInfo.raw, rootEtag: rootInfo.rootEtag } : {}) };
+  const idx = rootInfo.handle || (await openIndex(store, openOpts));
   const inShelf = new Set(processed.filter((id) => !!idx.get(id)));
   const targets = processed.filter((id) => inShelf.has(id));
   const remain = batch.length - deferredInBatch.length; // 本批「该处理」的本数（不含被裁/超限）
 
   if (action === 'delete') {
     const n = await batchSoftDelete(store, idx, targets);
-    return json({ ok: true, updated: n, skipped: remain - n, deferred });
+    return json({ ok: true, updated: n, skipped: remain - n, deferred, ...(retry ? { retry: true } : {}) });
   }
 
   // 读一波全并行（20 本 = 20 次并发 GET，替代逐本串行 20 程），meta 缺失的书跳过
@@ -1614,7 +1870,7 @@ async function apiBatchBooks(req, store) {
     for (const [id, p] of patches) idx.patch(id, (b) => ({ ...b, ...p }));
     await idx.save({ bak: true });
   }
-  return json({ ok: true, updated: patches.size, skipped: remain - patches.size, deferred });
+  return json({ ok: true, updated: patches.size, skipped: remain - patches.size, deferred, ...(retry ? { retry: true } : {}) });
 }
 
 /** 批量软删：索引分片摘除成员 + trash 一次写入（不读各书 meta，index 条目即摘要）。
@@ -1627,21 +1883,22 @@ async function batchSoftDelete(store, idx, targets) {
     const e = idx.get(id);
     if (e) entries.set(id, e);
   }
-  // trash 读与「索引分片摘除」互不依赖；摘除纯内存，落盘与 trash 写分两波
-  const trashP = readTrash(store);
   for (const id of targets) idx.remove(id);
   await idx.save({ bak: true });
-  const trash = await trashP;
+  // trash 走 CAS（见 updateTrash）：并发的另一次软删不会把这一批条目吃掉
   let n = 0;
-  for (const id of targets) {
-    if (trash.books.some((x) => x.id === id)) continue;
-    const entry = entries.get(id);
-    if (entry) {
-      trash.books.push({ ...entry, deletedAt: Date.now() });
-      n++;
+  await updateTrash(store, (t) => {
+    n = 0; // mutate 可能被重放 → 计数每次从零重算，绝不累加
+    for (const id of targets) {
+      if (t.books.some((x) => x.id === id)) continue;
+      const entry = entries.get(id);
+      if (entry) {
+        t.books.push({ ...entry, deletedAt: Date.now() });
+        n++;
+      }
     }
-  }
-  if (n) await writeTrash(store, trash);
+    return { dirty: n > 0 };
+  });
   return n;
 }
 
@@ -1731,17 +1988,16 @@ async function apiSoftDelete(store, id) {
   const meta = b ? null : await readBook(store, id);
   if (!b && !meta) return json({ error: '书不存在或已删除' }, 404);
   // 只在架书才需要从索引摘除（半成品书本就不在索引，摘除无效果，跳过分片写）
-  const trashP = readTrash(store);
   if (b) {
     idx.remove(id);
     await idx.save({ bak: true });
   }
-
-  const trash = await trashP;
-  if (!trash.books.some((x) => x.id === id)) {
-    trash.books.push({ ...(b || indexEntryFromMeta(meta)), deletedAt: Date.now() });
-    await writeTrash(store, trash);
-  }
+  // trash 走 CAS（见 updateTrash）：并发的两次软删不会互相覆盖（否则有本书会彻底消失）
+  await updateTrash(store, (t) => {
+    if (t.books.some((x) => x.id === id)) return { dirty: false };
+    t.books.push({ ...(b || indexEntryFromMeta(meta)), deletedAt: Date.now() });
+    return {};
+  });
   return json({ ok: true });
 }
 
@@ -1768,7 +2024,9 @@ async function apiTrashList(store, env) {
  * 只放行已发布（status='ready'）的书：半成品/更新中的书恢复回书架后既读不了（bookMeta 409）
  * 也没有继续上传的入口，只会变成书架上一本点不开的孤儿。 */
 async function apiRestore(store, id) {
-  const trash = await readTrash(store);
+  // 读一次连版本号一起拿（下面写回走 CAS 用得上；复用这份快照不再多读一次，读取量守住 P2-5 的个位数）
+  const trashCur = await getWithEtag(store, KEY.TRASH);
+  const trash = parseTrash(trashCur && trashCur.text);
   const trashIdx = trash.books.findIndex((b) => b.id === id);
   if (trashIdx < 0) return json({ error: '回收站里没有这本书' }, 404);
   const entry = trash.books[trashIdx];
@@ -1780,12 +2038,28 @@ async function apiRestore(store, id) {
   if (meta.status !== 'ready') {
     return json({ error: '该书尚未发布，无法恢复；如不再需要请在回收站中彻底删除' }, 409);
   }
-  trash.books.splice(trashIdx, 1);
-  // index（单书模式：新书落最后一片）+ trash 写互不依赖 → 并行
-  const [idx] = await Promise.all([openIndex(store, { single: id }), writeTrash(store, trash)]);
+  // 写序（P2-7）：**索引先落，trash 摘条目后落**。反过来的话 idx.save() 失败时书已经从 trash 摘掉、
+  // 又没进索引 → 书架与回收站同时看不到它（用户本意是「找回」，结果唯一记录也被删；meta/正文虽在，
+  // 只能走「检查残留」）。与 apiSoftDelete 的「索引先落」同一判据：让失败落在「trash 条目还在、可重试」
+  // 的一侧。
+  // append: id 来自回收站 ⇒ 索引里必定没有它（软删先摘索引后写 trash）→ 不必全量加载，只读 root + 末片；
+  // 原实现（single 缺书 → 全量加载）在 2 万本/40 片下是 1+K 个子请求，逼近 50 硬顶（P2-5）。
+  const idx = await openIndex(store, { single: id, append: true });
   const { purge, deletedAt, ...rest } = entry;
   idx.upsert(id, { ...rest }); // 已在架（重复恢复）则原位覆盖，语义与 v1 的去重 push 一致
   await idx.save({ bak: true });
+  // 入口那次读的版本号带下来复用（pre）：冲突时 updateTrash 自己重读重放，不会多花一次读
+  await updateTrash(
+    store,
+    (t) => {
+      const i = t.books.findIndex((b) => b.id === id);
+      if (i < 0) return { dirty: false };
+      t.books.splice(i, 1);
+      return {};
+    },
+    3,
+    trashCur
+  );
   return json({ ok: true });
 }
 
@@ -1798,13 +2072,15 @@ async function apiTrashPurge(store, id) {
 }
 
 /** 清空回收站（每请求推进 1 本，客户端按 remaining 续调直至 0）
- * 只处理 1 本：彻底删除的固定开销（readBook + raw/meta/progress 删除 + writeTrash）会叠在
+ * 只处理 1 本：彻底删除的固定开销（readBook + raw/meta/progress 删除 + updateTrash）会叠在
  * 章删除之上，逐本累积轻松超 Free 50 子请求红线；一本一本清最稳。 */
 async function apiTrashClear(store) {
   const trash = await readTrash(store);
   if (!trash.books.length) return json({ ok: true, deleted: 0, remaining: 0 });
   const r = await purgeOnce(store, trash, trash.books[0].id, PURGE_BATCH);
-  return json({ ok: true, deleted: r.deleted, remaining: trash.books.length });
+  // 剩余数自己算：purgeOnce 不再改调用方的副本（见其文档注释）→ done=true 即「这本已彻底删完、条目已摘」
+  const remaining = r.done ? trash.books.length - 1 : trash.books.length;
+  return json({ ok: true, deleted: r.deleted, remaining });
 }
 
 /* ---------------- 残留诊断 / 孤儿清理（书架「检查残留」） ----------------
@@ -2066,10 +2342,10 @@ async function opdsAuth(req, env, store) {
     const pass = pair.slice(pair.indexOf(':') + 1); // 用户名任意（含空），只认冒号后的口令
     const admin = env.ADMIN_PASSWORD;
     if (!admin || !safeEqual(pass, admin)) {
-      if (admin) await bruteFail(req, env, store, st);
+      if (admin) await bruteFail(req, env, store);
       return { ok: false, status: 401 };
     }
-    await bruteClear(req, store, st);
+    await bruteClear(req, store);
     return { ok: true };
   }
   return { ok: false, status: 401 };

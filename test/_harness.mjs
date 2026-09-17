@@ -7,6 +7,7 @@
  * 当作测试文件执行。
  */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { handleRequest } from '../src/router.js';
 
 export const BASE = 'http://r2novel.test';
@@ -41,6 +42,29 @@ export function memStore() {
     },
     async putText(k, s) {
       m.set(k, s);
+    },
+    /** etag = 内容 sha1（与 R2/ dev-server 同语义）；直接改 _map 造数也不会让 etag 失真。
+     * 实现刻意**建在 getText / putText 之上**（this.*）：测试里对这两个方法的探针（写入计数、
+     * 制造「并发写在途」窗口）与故障注入因此**天然覆盖 CAS 路径**——否则每个用例都得记得再包一层
+     * putTextIf/getTextWithEtag，漏一个就静默漏计（实测：CAS 化后 6 个用例齐挂，全是探针漏看）。 */
+    async getTextWithEtag(k) {
+      const text = await this.getText(k);
+      if (text == null) return null;
+      return { text, etag: createHash('sha1').update(Buffer.from(text, 'utf8')).digest('hex') };
+    },
+    async putTextIf(k, s, etag) {
+      // 前置条件直接看 m（不经 this.getText）：CAS 的条件判定在 R2 是 onlyIf 由服务端求值，
+      // **不额外产生读子请求**；若从 this.getText 走，读计数用例会把这一次内部判定也算进去。
+      // 三种语义与 router.js 的 store 契约一致：undefined=无条件写、null=不存在才写、字符串=CAS
+      const cur = m.get(k);
+      if (etag === null && cur !== undefined) return null; // 不存在才写，但已经有了
+      if (typeof etag === 'string') {
+        if (cur === undefined) return null;
+        const text = typeof cur === 'string' ? cur : new TextDecoder().decode(cur);
+        if (createHash('sha1').update(Buffer.from(text, 'utf8')).digest('hex') !== etag) return null;
+      }
+      await this.putText(k, s); // 走 this.* → 写入探针与故障注入可见
+      return { etag: createHash('sha1').update(Buffer.from(s, 'utf8')).digest('hex') };
     },
     async putBytes(k, b) {
       m.set(k, b);
@@ -119,6 +143,21 @@ export async function readIdxBooks(store) {
   return out;
 }
 
+/** 多分片布局造数：groups=[[书…],[书…]] → n 号片写 s<n>.json + .bak，root/bak 一并写齐。
+ * writeIdxBooks 是它的单片特例；「分片分散/规模化」类用例（预算裁剪、只读一片、自愈成本）用它造数。 */
+export async function writeIdxShards(store, groups) {
+  const map = {};
+  for (let n = 0; n < groups.length; n++) {
+    const body = JSON.stringify({ books: groups[n] });
+    await store.putText(`meta/idx/s${n}.json`, body);
+    await store.putText(`meta/idx/s${n}.json.bak`, body);
+    for (const b of groups[n]) map[b.id] = n;
+  }
+  const root = JSON.stringify({ v: 2, shards: groups.length, map });
+  await store.putText('meta/idx/root.json', root);
+  await store.putText('meta/idx/root.json.bak', root);
+}
+
 /** 整库覆盖为给定 books（单分片；测试造数，书数远小于 500 上限）。root/bak 一并写齐。 */
 export async function writeIdxBooks(store, books) {
   const body = JSON.stringify({ books });
@@ -127,4 +166,17 @@ export async function writeIdxBooks(store, books) {
   await store.putText('meta/idx/s0.json.bak', body);
   await store.putText('meta/idx/root.json', root);
   await store.putText('meta/idx/root.json.bak', root);
+}
+
+/** 子请求计数器：包一层 store，统计 get/put/list 次数。
+ * Cloudflare 单请求 50 子请求硬顶是结构性约束，只有**数**才能证明「开销与书库规模无关」。 */
+export function countStore(base) {
+  const c = { get: 0, put: 0, list: 0 };
+  return {
+    ...base,
+    getText: (k) => { c.get++; return base.getText(k); },
+    putText: (k, v) => { c.put++; return base.putText(k, v); },
+    list: (p, m, cur) => { c.list++; return base.list(p, m, cur); },
+    _count: c,
+  };
 }

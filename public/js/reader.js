@@ -220,7 +220,11 @@ export async function openBook(id) {
 }
 
 async function renderChapter(idx, restoreRatio) {
-  if (!state.book) return; // 已被 closeReader 关闭：迟到的渲染请求直接作废
+  // 令牌：本次渲染归属哪本书。守卫必须同时比「书」与「章」——只比章号时，甲书第 5 章的迟到
+  // 响应会在「已切到乙书、且乙书恰好也停在第 5 章」时穿透：甲的正文渲染进乙，随后按甲正文的
+  // 滚动量写乙的进度；失败的那一路更糟——把 failedIdx 置成乙的当前章，之后彻底停写乙的进度。
+  const book = state.book;
+  if (!book) return; // 已被 closeReader 关闭：迟到的渲染请求直接作废
   if (idx < 0 || idx >= state.chapters.length) return;
   state.cur = idx;
   state.failedIdx = null; // 新一次渲染先按「会成功」处理，失败路径再标记
@@ -235,8 +239,8 @@ async function renderChapter(idx, restoreRatio) {
       showTip('会话过期，请重新登录', 2000);
       throw e;
     }
-    // 等待期间用户已翻到别的章：本次失败作废（否则重试提示会盖在新章正文上）
-    if (!state.book || state.cur !== idx) return;
+    // 等待期间用户已翻到别的章 / 换了书：本次失败作废（否则重试提示会盖在新章正文上）
+    if (state.book !== book || state.cur !== idx) return;
     // 失败章标记：saveProgress 见到「当前章＝失败章」一律跳过——否则切后台会把
     // 进度写成「读到该章 0%」，覆盖掉此前的真实位置（跨设备继续阅读会跳错章）
     state.failedIdx = idx;
@@ -254,7 +258,7 @@ async function renderChapter(idx, restoreRatio) {
   // 加载是异步的：若等待期间用户已翻到别的章（快速连点「下一章」/目录连点），
   // 本次结果直接作废——否则会出现「显示的是旧章正文，而 state.cur 与随后落盘的
   // 进度却记的是新章」，既错位又会把云端进度写坏。
-  if (!state.book || state.cur !== idx) return;
+  if (state.book !== book || state.cur !== idx) return;
   const docFrag = renderParas(text, els.art, makeChHead(idx));
   els.art.replaceChildren(docFrag);
   // 翻章淡入：消除内容瞬间替换的生硬感（重排触发重播动画；系统减动效时 CSS 侧自动关闭）
@@ -279,35 +283,42 @@ async function renderChapter(idx, restoreRatio) {
 }
 
 async function loadChapter(idx) {
+  // 令牌：本请求归属哪本书。缓存与在途表都按「书 + 章」隔离——章节 key 是位置序（'1'..'N'）
+  // 跨书同名，只按 ch.key 索引时：甲书在途的请求会被乙书同章号直接搭上（拿到甲的正文），
+  // 甲请求 await 回来还会把自己的正文 cachePut 进乙的内存缓存。离线缓存的 bookId 同理必须在
+  // await **之前**取定，否则写进去的是「此刻的书」——甲书正文落进乙书的 IndexedDB 且不自愈。
+  const book = state.book;
+  if (!book) throw new Error('未打开书籍');
   const ch = state.chapters[idx];
-  const hit = state.cache.get(ch.key);
+  const ck = book.id + '#' + ch.key;
+  const hit = state.cache.get(ck);
   if (hit !== undefined) return hit;
   // 同一章的并发请求合并为一次（翻章/目录跳转撞上后台预取时，直接搭同一请求）
-  const pending = state.inflight.get(ch.key);
+  const pending = state.inflight.get(ck);
   if (pending) return pending;
   const task = (async () => {
     try {
-      const t = await api.chapter(state.book.id, ch.key, state.book.cleanVer || 1);
-      cachePut(ch.key, t);
-      // 若该书已整本离线，顺带更新缓存
-      offline.cacheChapterIfDownloaded(state.book.id, ch.key, t).catch(() => {});
+      const t = await api.chapter(book.id, ch.key, book.cleanVer || 1);
+      cachePut(ck, t);
+      // 若该书已整本离线，顺带更新缓存（用捕获的 book.id，不用 await 之后的 state.book.id）
+      offline.cacheChapterIfDownloaded(book.id, ch.key, t).catch(() => {});
       return t;
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) throw e;
       // 网络失败 → 离线缓存兜底
-      const off = await offline.getChapter(state.book.id, ch.key).catch(() => null);
+      const off = await offline.getChapter(book.id, ch.key).catch(() => null);
       if (off != null) {
-        cachePut(ch.key, off);
+        cachePut(ck, off);
         return off;
       }
       throw e;
     }
   })();
-  state.inflight.set(ch.key, task);
+  state.inflight.set(ck, task);
   try {
     return await task;
   } finally {
-    state.inflight.delete(ch.key);
+    state.inflight.delete(ck);
   }
 }
 

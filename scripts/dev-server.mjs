@@ -12,6 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { handleRequest } from '../src/router.js';
 import { MAX_CHAPTER_BYTES, MAX_UPLOAD_BYTES } from '../public/js/shared-const.js';
 
@@ -67,6 +68,39 @@ const fsStore = {
     const tmp = p + '.tmp';
     fs.writeFileSync(tmp, str, 'utf8');
     fs.renameSync(tmp, p);
+  },
+  /** 读原文 + 版本号：etag 取内容 sha1 —— 与生产 R2（普通 put 的 etag = 内容 MD5）**同语义**：
+   *  内容不变则 etag 不变。不能改成「自增版本号」：测试/脚本会直接改文件造数，那会让 etag 失真。 */
+  async getTextWithEtag(key) {
+    let buf;
+    try {
+      buf = fs.readFileSync(keyPath(key));
+    } catch {
+      return null;
+    }
+    return { text: buf.toString('utf8'), etag: createHash('sha1').update(buf).digest('hex') };
+  },
+  /** 条件写。三种语义（与 router.js 的 store 契约一致）：
+   *   · etag 是字符串 → CAS：当前内容 etag 不等则不写、返回 null；
+   *   · etag 为 null  → 「不存在才写」：文件已存在则返回 null；
+   *   · etag 为 undefined → 无条件写。
+   *  检查与写入之间**不得有 await**（dev-server 单进程、Node 单线程 → 这段同步代码不可被打断，
+   *  等价于原子）；写入沿用 tmp+rename（崩溃不留半截文件）。 */
+  async putTextIf(key, str, etag) {
+    const p = keyPath(key);
+    let cur = null;
+    try {
+      cur = createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+    } catch {
+      cur = null;
+    }
+    if (etag === null && cur !== null) return null; // 不存在才写，但盘上已经有了
+    if (typeof etag === 'string' && cur !== etag) return null; // CAS 版本不匹配
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tmp = p + '.tmp';
+    fs.writeFileSync(tmp, str, 'utf8');
+    fs.renameSync(tmp, p);
+    return { etag: createHash('sha1').update(Buffer.from(str, 'utf8')).digest('hex') };
   },
   async putBytes(key, bytes) {
     const p = keyPath(key);

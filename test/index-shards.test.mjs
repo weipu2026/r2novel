@@ -17,15 +17,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { KEY } from '../src/router.js';
-import { memStore, req, call, login, readIdxBooks, writeIdxBooks } from './_harness.mjs';
+import { memStore, req, call, login, readIdxBooks, writeIdxBooks, writeIdxShards, countStore } from './_harness.mjs';
+import { runBatched } from '../public/js/batch-queue.js';
 
 const ROOT = 'meta/idx/root.json';
 const ROOT_BAK = 'meta/idx/root.json.bak';
 const shard = (n) => `meta/idx/s${n}.json`;
 
-/** 直接种一份 v1 单文件索引 + 对应 meta（books 条目字段须够 apiBooks/批量用） */
-async function seedV1(store, books) {
-  store._map.set('meta/index.json', JSON.stringify({ books }));
+/** 只种各书 meta（v2 布局造数共用；索引交给 writeIdxBooks / writeIdxShards） */
+async function seedMetas(store, books) {
   for (const b of books) {
     store._map.set(
       KEY.book(b.id),
@@ -43,6 +43,12 @@ async function seedV1(store, books) {
       })
     );
   }
+}
+
+/** 直接种一份 v1 单文件索引 + 对应 meta（books 条目字段须够 apiBooks/批量用） */
+async function seedV1(store, books) {
+  store._map.set('meta/index.json', JSON.stringify({ books }));
+  await seedMetas(store, books);
 }
 
 const mkBook = (i) => ({
@@ -501,4 +507,240 @@ test('指针落后一代（盘上分片数 > root.shards）→ 不摘真书、�
   assert.equal(r.data.books.length, 501, '尾片里的 250 本不能被当死指针摘掉（修复前只剩 251）');
   const map = JSON.parse(store._map.get(ROOT)).map;
   assert.ok(map.b0251 !== undefined, '尾片第一本必须仍在索引里（修复前被摘除并落盘固化）');
+});
+
+test('save 写序：拆片（新建分片）必须「新片→既有片→root」——新片写失败不得留下领先指针', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  // 造 500 本满片（直接种索引，省 500 次 publish）
+  const entries = Array.from({ length: 500 }, (_, i) => ({
+    id: 'n_full' + String(i).padStart(3, '0'),
+    title: '满片书' + i,
+    author: '',
+    tags: [],
+    chapterCount: 2,
+    wordCount: 20,
+    status: 'ready',
+    finished: false,
+    cleanVer: 1,
+  }));
+  await writeIdxBooks(base, entries);
+  // 注入：新分片 s1（及其 bak）写失败
+  const store = {
+    ...base,
+    putText: (k, v) => {
+      if (k === shard(1) || k === shard(1) + '.bak') throw new Error('inject fail: ' + k);
+      return base.putText(k, v);
+    },
+  };
+  // 发第 501 本 → 满片对半拆（500 → 251 + 250）
+  let r = await call(store, req('/api/books', { method: 'POST', cookie, body: { title: '第501本', chapters: ['第1章 甲', '第2章 乙'], wordCount: 20, cleanVer: 1 } }));
+  assert.equal(r.status, 200);
+  const id = r.data.id;
+  for (const i of [1, 2]) await call(store, req(`/api/books/${id}/chapters/${i}`, { method: 'PUT', cookie, body: '正文' + i }));
+  // 故障注入是同步抛错（真实 R2 put 失败也是 reject）——必须断言「请求确实失败」而不是静默成功
+  await assert.rejects(
+    () => call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie })),
+    /inject fail/,
+    '新片写失败必须报错，不能静默成功'
+  );
+
+  // ① 盘上必须等于「什么都没发生」——指针绝不能领先于盘（那是无自愈覆盖的一侧）
+  const root = JSON.parse(base._map.get(ROOT));
+  assert.equal(root.shards, 1, 'root.shards 不得先于新分片提交（旧写序：先落指针 → 250 本永久不可见）');
+  assert.equal(Object.keys(root.map).length, 500, 'map 不得出现指向缺失分片的僵尸条目');
+  assert.equal(JSON.parse(base._map.get(shard(0))).books.length, 500, '既有分片不得被提前改写');
+  assert.equal(base._map.get(shard(1)), undefined, 's1 不该存在');
+
+  // ② 书架不得腰斩（旧写序下这里只剩 251）
+  r = await call(base, req('/api/books', { cookie }));
+  assert.equal(r.data.books.length, 500, '不允许出现「指针领先于盘」的静默腰斩');
+
+  // ③ 去掉注入后重试一次即恢复
+  r = await call(base, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, '重试应成功：' + JSON.stringify(r.data));
+  assert.equal(JSON.parse(base._map.get(ROOT)).shards, 2);
+  r = await call(base, req('/api/books', { cookie }));
+  assert.equal(r.data.books.length, 501, '重试后 501 本都在');
+});
+
+/* ---------------- 存储 P2 组（2026-09-17 外部审计 P2-7 / P2-2 / P2-3 / P2-4 / P2-5） ----------------
+ * 共同病根：**把失败留在了没有自愈覆盖的那一侧**（写序、重建判据、在架名单的来源）。 */
+
+test('P2-2：root 双坏时由分片重建 —— 片主坏/片 bak 好必须回落，不得拿空数组覆盖真相', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const books = [mkBook(1), mkBook(2), mkBook(3)];
+  await seedMetas(store, books);
+  await writeIdxShards(store, [[books[0], books[1]], [books[2]]]);
+  // root 与 root.bak 双坏 + s0 主片坏（片 bak 完好）
+  await store._map.set(ROOT, '{corrupt');
+  await store._map.set(ROOT_BAK, '{corrupt');
+  await store._map.set(shard(0), '{corrupt');
+
+  const r = await call(store, req('/api/books', { cookie }));
+  assert.equal(r.status, 200);
+  assert.deepEqual(
+    r.data.books.map((b) => b.id).sort(),
+    books.map((b) => b.id).sort(),
+    's0 的书必须从片 bak 找回（旧实现按主片内容重建 → 只剩 s1 的 1 本）'
+  );
+  const root = JSON.parse(store._map.get(ROOT));
+  assert.equal(root.shards, 2);
+  assert.equal(Object.keys(root.map).length, 3, 'map 也要补全：indexHas 等只读 map 的端点否则全误报 404');
+  const one = await call(store, req(`/api/books/${books[0].id}`, { cookie }));
+  assert.equal(one.status, 200, '重建后单书目录仍可读：' + JSON.stringify(one.data));
+});
+
+test('P2-7 + P2-5：恢复先落索引后摘 trash（失败可重试），读取量与分片数无关', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  const groups = [];
+  for (let s = 0; s < 4; s++) groups.push(Array.from({ length: 500 }, (_, j) => mkBook(s * 500 + j)));
+  groups.push([mkBook(2000)]);
+  const all = groups.flat();
+  await seedMetas(base, all);
+  await writeIdxShards(base, groups); // 5 片
+
+  let r = await call(base, req(`/api/books/${all[0].id}`, { method: 'DELETE', cookie }));
+  assert.equal(r.status, 200);
+  assert.ok(JSON.parse(base._map.get('meta/trash.json')).books.some((b) => b.id === all[0].id), '软删应入回收站');
+
+  // 故障注入：末片写失败 → 恢复必须报错，且 trash 条目**保留**（旧写序下书架与回收站同时看不到这本书）
+  const faulty = {
+    ...base,
+    putText: (k, v) => {
+      if (k === shard(4)) throw new Error('inject fail: ' + k);
+      return base.putText(k, v);
+    },
+  };
+  await assert.rejects(
+    () => call(faulty, req(`/api/books/${all[0].id}/restore`, { method: 'POST', cookie })),
+    /inject fail/,
+    '索引写失败必须报错，不能静默成功'
+  );
+  assert.ok(
+    JSON.parse(base._map.get('meta/trash.json')).books.some((b) => b.id === all[0].id),
+    'P2-7：恢复失败必须保留 trash 条目供重试'
+  );
+
+  // 去掉注入 → 重试成功；读取量 = trash 1 + meta 1 + root 1 + 末片 1（旧实现走全量加载 = 1+K）
+  const store = countStore(base);
+  r = await call(store, req(`/api/books/${all[0].id}/restore`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(store._count.get <= 5, `恢复读取应恒定在个位数（实测 ${store._count.get}，旧实现 8）`);
+  r = await call(base, req('/api/books', { cookie }));
+  assert.equal(r.data.books.length, 2001, '恢复后总数不变');
+  assert.equal(r.data.books.filter((b) => b.id === all[0].id).length, 1, '不得出现同 id 两条目');
+});
+
+test('P2-3：root.map 缺条目时，批量操作不得把在架书判 offShelf 静默跳过', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const books = [mkBook(1), mkBook(2), mkBook(3)];
+  await seedMetas(store, books);
+  await writeIdxShards(store, [books]);
+  // 模拟「root 从旧 .bak 回落 / 指针落后」：map 少了最后一本，片内容里还有它
+  const root = JSON.parse(store._map.get(ROOT));
+  delete root.map[books[2].id];
+  store._map.set(ROOT, JSON.stringify(root));
+
+  const r = await call(
+    store,
+    req('/api/books/batch', {
+      method: 'POST',
+      cookie,
+      body: { ids: books.map((b) => b.id), action: 'setFinished', finished: true },
+    })
+  );
+  assert.equal(r.status, 200);
+  assert.equal(r.data.updated, 3, '在架书一本都不能被静默跳过（旧实现判成 offShelf → updated 2 / skipped 1）');
+  assert.equal(r.data.skipped, 0);
+  assert.deepEqual(r.data.deferred, []);
+  assert.equal(JSON.parse(store._map.get(KEY.book(books[2].id))).finished, true, 'meta 必须落库');
+  assert.equal(JSON.parse(store._map.get(ROOT)).map[books[2].id], 0, '顺带由对账 ① 把 map 补回');
+});
+
+test('P2-4：root 双坏 + 大库 → 批量不越 50 子请求，回传 retry 让客户端续调至收敛', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  // 40 片：自愈成本 1(root)+1(root.bak)+1(list)+40(片读)+2(root/bak 写) 已把预算吃光
+  const groups = Array.from({ length: 40 }, (_, s) => [mkBook(s * 2), mkBook(s * 2 + 1)]);
+  const all = groups.flat();
+  await seedMetas(base, all);
+  await writeIdxShards(base, groups);
+  await base._map.set(ROOT, '{corrupt');
+  await base._map.set(ROOT_BAK, '{corrupt');
+  const ids = Array.from({ length: 18 }, (_, i) => all[i * 4].id); // 18 本，两两间隔 4 本 → 散在 18 个不同分片
+  const send = async (batch) => {
+    const r = await call(
+      base,
+      req('/api/books/batch', { method: 'POST', cookie, body: { ids: batch, action: 'setFinished', finished: true } })
+    );
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    return r.data;
+  };
+
+  const store = countStore(base);
+  let r = await call(
+    store,
+    req('/api/books/batch', { method: 'POST', cookie, body: { ids, action: 'setFinished', finished: true } })
+  );
+  const used = store._count.get + store._count.put + store._count.list;
+  assert.ok(used <= 50, `单请求子请求必须 ≤ 50（实测 ${used}；旧实现预筛 + 两次全量加载实测 90+）`);
+  assert.deepEqual(r.data.deferred, ids, '自愈轮一本没动 → 全部原样退回');
+  assert.equal(r.data.retry, true, '必须回传 retry，否则 runBatched 把整批退回当零进展收手');
+
+  // 客户端视角的完整闭环：自愈轮的 retry + 预算裁剪的 deferred 一起收敛到「一本不落」
+  const q = await runBatched(ids, 18, send);
+  assert.deepEqual(q, { ok: 18, fail: 0 }, '自愈后重试一次 + 续调应把 18 本全部处理完');
+  for (const id of ids) assert.equal(JSON.parse(base._map.get(KEY.book(id))).finished, true, id + ' 应已落库');
+});
+
+/* ── P2-6（2026-09-17 外部审计，子代理探针）：并发 publish 丢更新 ────────────────
+ * 同一分片内两个请求并发 openIndex→upsert→save，最后写者胜：两次 publish 都返回 200，
+ * 但其中一本**完全不在书架**（meta.status=ready 已落盘，只能靠「检查残留」找回）。
+ * 单用户双标签页即可触发。修复：索引写走 CAS + 冲突时按 opLog 在新盘面上重放。
+ * 这里把两本的 create/上传都做完、只留 publish 并发，并放大索引读窗口让两次读重叠。 */
+test('P2-6：并发发布两本书不得互相覆盖（索引 CAS + 冲突重放）', async () => {
+  const base = memStore();
+  const cookie = await login(base);
+  await seedV1(base, [mkBook(1), mkBook(2)]);
+  await call(base, req('/api/books', { cookie })); // 迁移 → 两本同在 s0
+  const pending = async (title) => {
+    const r = await call(
+      base,
+      req('/api/books', { method: 'POST', cookie, body: { title, chapters: ['第1章 章1'], wordCount: 10, cleanVer: 1 } })
+    );
+    assert.equal(r.status, 200, 'create: ' + JSON.stringify(r.data));
+    const id = r.data.id;
+    await call(base, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '第1章 章1正文' }));
+    await call(base, req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: new TextEncoder().encode('raw-' + title) }));
+    return id;
+  };
+  const idA = await pending('并发甲');
+  const idB = await pending('并发乙');
+  const slam = {
+    ...base,
+    async getText(k) {
+      const t = await base.getText(k);
+      if (k.startsWith('meta/idx/')) await new Promise((r) => setTimeout(r, 3)); // 撑开索引读窗口
+      return t;
+    },
+  };
+  const [ra, rb] = await Promise.all([
+    call(slam, req(`/api/books/${idA}/publish`, { method: 'POST', cookie })),
+    call(slam, req(`/api/books/${idB}/publish`, { method: 'POST', cookie })),
+  ]);
+  assert.equal(ra.status, 200, '甲 publish: ' + JSON.stringify(ra.data));
+  assert.equal(rb.status, 200, '乙 publish: ' + JSON.stringify(rb.data));
+  const r = await call(base, req('/api/books', { cookie }));
+  const ids = r.data.books.map((b) => b.id);
+  assert.ok(
+    ids.includes(idA) && ids.includes(idB),
+    '两本都必须进书架（旧实现后写者整文件覆盖 → 有一本永久丢失）：' + ids.join(',')
+  );
+  assert.equal(r.data.books.length, 4, '总数 = 2 旧 + 2 新');
+  const map = JSON.parse(base._map.get(ROOT)).map;
+  assert.ok(map[idA] !== undefined && map[idB] !== undefined, 'root.map 里两本都要有指针');
 });

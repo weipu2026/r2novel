@@ -13,7 +13,7 @@
  * 分批调用 send 直到全部处理完（含后端预算裁剪的续调）。
  * @param {string[]} ids 全部目标 id
  * @param {number} pageSize 单批上限（= BATCH_BOOKS_MAX，后端也只认这么多）
- * @param {(batch: string[]) => Promise<{updated?: number, deferred?: string[]}>} send 单批请求
+ * @param {(batch: string[]) => Promise<{updated?: number, deferred?: string[], retry?: boolean}>} send 单批请求
  * @param {(done: number, total: number) => void} [onProgress] 进度回调（done=已出队数量）
  * @returns {Promise<{ok: number, fail: number}>} ok=后端 updated 之和（真正落库的本数），
  *          fail=选了但没落库的本数（不在架/半成品/被裁后仍失败）
@@ -24,6 +24,7 @@ export async function runBatched(ids, pageSize, send, onProgress) {
   let queue = ids.slice();
   let ok = 0;
   let rounds = 0;
+  let retried = false; // 自愈轮只容忍一次（见下）
   // 防御性上限：正常每轮至少推进 1 本（单本预算 est=6，永远进得了 48 的顶），total*2 纯属兜底，
   // 防止「后端行为诡异 + 每轮只退 1 本」把页面卡在忙碌层里出不来。
   const maxRounds = total * 2 + 8;
@@ -39,7 +40,13 @@ export async function runBatched(ids, pageSize, send, onProgress) {
     ok += Number(resp && resp.updated) || 0;
     // 只认「本轮真的发出去的 id」里回传的 deferred：后端回传别的东西也不会污染队列
     const deferred = resp && Array.isArray(resp.deferred) ? resp.deferred.filter((id) => batch.includes(id)) : [];
-    if (deferred.length >= batch.length) break; // 整批被退回＝零进展，再试还是同样结果，收手
+    if (deferred.length >= batch.length) {
+      // 整批退回＝本轮零进展（再试通常还是同样结果 → 收手）。唯一例外：后端**自愈轮**——root 深度坏时
+      // 预算全花在重建索引上，一本没动但盘面已修好，此时回传 retry:true 让客户端再发一次。
+      // 只容忍一次：后端若一直回 retry 也不会空转（maxRounds 之外再加一道保险）。
+      if (resp && resp.retry && !retried) retried = true;
+      else break;
+    }
     queue = deferred.concat(rest);
     if (onProgress) onProgress(total - queue.length, total);
   }

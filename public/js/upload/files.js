@@ -145,7 +145,7 @@ async function importBatch(files) {
         }
         upSession.setCreatedId(created.id);
         const pub = await uploadChapters(created.id, created.chapterKeys, keepRaw, sess);
-        if (pub && pub.books) lastBooks = pub.books; // 每本 publish 后的 index 快照，最后一份即全量
+        if (pub && pub.books) lastBooks = pub.books; // 旧版 worker 才回传快照；新版不回传 → 收尾统一 loadShelf()
         upSession.setCreatedId(null);
         ok++;
         if (pub && pub.rawFailed) rawFail++; // raw 失败不算失败：书已入库，仅重洗不可用

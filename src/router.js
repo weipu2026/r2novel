@@ -621,29 +621,45 @@ function makeHandle(store, root, shards, opts = {}) {
       return true;
     },
     /** 落盘：只写脏分片（bak=该片写前原文）+ 成员变化时的 root（bak=写前原文）。
-     * bak:false 用于进度镜像这类高频小写（v1 语义：镜像不写 bak）。 */
-    async save({ bak = true, attempt = 0 } = {}) {
+     * bak:false 用于进度镜像这类高频小写（v1 语义：镜像不写 bak）。
+     * replay:false → 撞 CAS 冲突不自己重放，直接抛给调用方（全量模式端点用，见 apiTagsMerge）。
+     * replay: 数字 → 最多自己重放几次（预算敏感端点用，见 apiBatchBooks）。默认 2 次；重放次数
+     *   直接决定子请求上界，所以预留了重放开销的调用方必须把它限死，预留才是精确值。
+     * 返回 { skipped:[id...] }：重放时被跳过（书已被并发删除）的 patch id，供调用方修正计数。 */
+    async save({ bak = true, replay = true, attempt = 0 } = {}) {
       try {
         await saveOnce(bak);
-        return;
       } catch (e) {
         // 索引 CAS 冲突（盘面被别人改过，P2-6：两个标签页同时发布 → 后写者整文件覆盖前者）：
         // 重开索引拿新盘面 → 按 opLog 重放本轮的改动 → 再写一次。attempt 是内部计数，调用方别传。
-        if (!isIdxConflict(e) || attempt + 1 >= IDX_SAVE_TRIES) throw e;
+        const maxReplay = replay === false ? 0 : typeof replay === 'number' ? replay : IDX_SAVE_TRIES - 1;
+        if (!isIdxConflict(e) || attempt + 1 > maxReplay) throw e;
         const again = await openIndex(store, reopenOpts());
+        const skipped = [];
         for (const o of opLog) {
           if (o.op === 'upsert') again.upsert(o.id, o.entry);
           else if (o.op === 'patch') {
             // 重放时书可能已被并发软删（新盘面的 map 里没有它）——patch 对不在架的书会抛
             // 非冲突错误 → 500。软删语义已吸收这次改动，跳过即可（2026-09-17 复查 F2）。
             if (again.get(o.id)) again.patch(o.id, o.fn);
+            else skipped.push(o.id);
           } else again.remove(o.id);
         }
-        await again.save({ bak, attempt: attempt + 1 });
+        // replay 必须带下去：否则嵌套那层用默认的 2 次重放，限次形同虚设（实测会多写一次 root）
+        const sub = await again.save({ bak, replay, attempt: attempt + 1 });
         // 本 handle 的待落盘改动已由 again 那份落盘 → 清空，免得再次 save 拿旧内存态覆盖回去
         dirty.clear();
         rootDirty = false;
+        opLog.length = 0;
+        // 嵌套那层重放的是同一份 opLog（超集）→ 优先用它报的 skipped
+        const miss = (sub && sub.skipped) || skipped;
+        return miss.length ? { skipped: miss } : undefined;
       }
+      // 落盘成功：本轮意图已持久化 → **必须清空 opLog**（2026-09-17 二次复查 R4）。留着它，
+      // 同一个 handle 再 save 一次并撞冲突时，会把上一轮的陈旧改动（旧快照）一起重放回盘上，
+      // 把并发方在这期间写的值覆盖掉——正是本轮在修的那类丢失更新。
+      opLog.length = 0;
+      return undefined;
     },
   };
   return h;
@@ -851,7 +867,7 @@ async function resumeMigration(store, rootEtag = null) {
  * { single: id, append: true } 追加模式：调用方保证该书不在索引里（发布新书 / 回收站恢复），
  * 片里没有它时**不再退化成全量加载**——一片就够写，让这两个端点的开销与书库规模无关（P2-5）。
  */
-async function openIndex(store, opts = {}) {
+export async function openIndex(store, opts = {}) {
   // opts.rootRaw：调用方（批量接口）已经读过一次 root 用来核预算，传进来复用，省 1 子请求；
   // 显式传 undefined（而不是 null）才重新读——null 表示「root 确实不存在」，语义不同。
   // opts.rootEtag：与 rootRaw 配套的版本号（批量接口复用那次读时一起传进来）。
@@ -1580,8 +1596,14 @@ async function syncIndexAfterEdit(store, meta) {
   } catch {
     /* 无进度则沿用原镜像 */
   }
-  idx.patch(meta.id, (b) => ({ ...indexEntryFromMeta(meta), pinned: !!b.pinned, prog: prog || b.prog }));
-  await idx.save({ bak: true });
+  // 书在「守卫通过之后、这次 patch 之前」被并发软删摘出索引时，patch 会抛非冲突错误 → 500，
+  // 而正文与 meta 已经写完（响应说失败、盘上已改）。软删语义已吸收这次编辑，索引条目已由删除
+  // 流程摘掉，跳过同步即可——与 apiPatchBook / apiProgressPut 的 get() 守卫对齐
+  // （2026-09-17 二次复查 R2）。
+  if (idx.get(meta.id)) {
+    idx.patch(meta.id, (b) => ({ ...indexEntryFromMeta(meta), pinned: !!b.pinned, prog: prog || b.prog }));
+    await idx.save({ bak: true });
+  }
 }
 
 /** 插入章后迁移进度：原进度章在插入位之后 → 章号 +1（章正文未变） */
@@ -1832,6 +1854,8 @@ async function apiBatchBooks(req, store) {
     // 预扣一次 CAS 冲突重放的开销（2026-09-17 复查 F3）：save() 撞冲突会重开索引
     // （root 1 读 + 跨片读）并重写（root 1 写 + 每脏片 2 写）≈ 2+3*newS。不预留的话，
     // 顶格批量撞冲突 → 重放把总子请求顶破 Workers 50 上限。
+    // ⚠️ 这个预留**只在「最多重放一次」时才成立**——所以下面 save() 一律传 replay:1
+    // （2026-09-17 二次复查 R3 实测：默认允许 2 次重放，6 片删除连续两次冲突时达 ~56 > 50）。
     const replay = 2 + 3 * newS;
     const est = (action === 'delete' ? 5 + 3 * newS : 1 + 3 * newS + 2 * (processed.length + 1)) + replay;
     if (est > budget) break;
@@ -1882,11 +1906,17 @@ async function apiBatchBooks(req, store) {
   }
   if (writes.length) await Promise.all(writes);
 
+  let patchSkip = 0;
   if (patches.size) {
     for (const [id, p] of patches) idx.patch(id, (b) => ({ ...b, ...p }));
-    await idx.save({ bak: true });
+    // 重放时书被并发删除 → 该 patch 被跳过（F2）→ 不能计入 updated，否则文案与实际盘面不符
+    // （2026-09-17 二次复查 R5）
+    // replay:1：预算只按「一次重放」预扣，次数必须一起限死（R3）；第二次冲突冒成 409 让客户端重试
+    const r = await idx.save({ bak: true, replay: 1 });
+    patchSkip = r && r.skipped ? r.skipped.length : 0;
   }
-  return json({ ok: true, updated: patches.size, skipped: remain - patches.size, deferred, ...(retry ? { retry: true } : {}) });
+  const updated = patches.size - patchSkip;
+  return json({ ok: true, updated, skipped: remain - updated, deferred, ...(retry ? { retry: true } : {}) });
 }
 
 /** 批量软删：索引分片摘除成员 + trash 一次写入（不读各书 meta，index 条目即摘要）。
@@ -1900,7 +1930,7 @@ async function batchSoftDelete(store, idx, targets) {
     if (e) entries.set(id, e);
   }
   for (const id of targets) idx.remove(id);
-  await idx.save({ bak: true });
+  await idx.save({ bak: true, replay: 1 }); // 同上：delete 的预算（5+3k）只预扣一次重放（R3）
   // trash 走 CAS（见 updateTrash）：并发的另一次软删不会把这一批条目吃掉
   let n = 0;
   await updateTrash(store, (t) => {
@@ -1961,8 +1991,13 @@ async function apiTagsMerge(req, store) {
   for (const b of hit) {
     const n = shardNoOf(b.id);
     const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
-    // 预扣一次冲突重放（2026-09-17 复查 F3）：全量模式重放 = root 1 读 + K 片读 + root 1 写 + 每脏片 2 写
-    if (1 + idx.shardCount + 2 * (targets.length + 1) + 2 * newS + 2 + idx.shardCount + 2 * newS > 48) break;
+    // 预算只算**本次实际要发的**请求：1（root 读）+ K（全片读——标签命中必须全库扫）+ 每本 2
+    // （meta 读+写）+ 每脏片 2（片写+bak）。
+    // ⚠️ **不预扣冲突重放开销**（2026-09-17 二次复查 R1，实测复现）：全量模式的重放要重读 root+K 片
+    // 再重写（≈2+K+2k），K 大时（2 万本/40 片）连 1 本都装不下 → 预留会让本端点**恒零进展**
+    // （K≥20 时 updated 恒为 0，前端 guard<60 白跑 60 轮全库扫描，共 ~2460 子请求）。
+    // 冲突改由 save({replay:false}) 抛给本端点 → 返回可续调响应（下面），前端循环重发即可。
+    if (1 + idx.shardCount + 2 * (targets.length + 1) + 2 * newS > 48) break;
     shardSet.add(n);
     targets.push(b);
   }
@@ -1996,7 +2031,17 @@ async function apiTagsMerge(req, store) {
 
   if (patches.size) {
     for (const [id, p] of patches) idx.patch(id, (x) => ({ ...x, ...p }));
-    await idx.save({ bak: true });
+    try {
+      // 全量模式**不自己做冲突重放**：重放开销（重读 root+K 片 + 重写）在 K 大时会把 50 子请求
+      // 顶破，反而拿不到能续调的响应。本端点本来就按 remaining 分段推进、前端循环到 remaining=0
+      // 才收手（app.js 的 tagMergeRun），meta 写入也是幂等的 → 冲突时交回客户端重发一轮补齐索引
+      // （2026-09-17 二次复查 R1）。
+      await idx.save({ bak: true, replay: false });
+    } catch (e) {
+      if (!isIdxConflict(e)) throw e;
+      // meta 那批已经写完（幂等，重发会重算），索引没落盘 → 报 0 并让前端重发一轮
+      return json({ ok: true, updated: 0, remaining: hit.length, retry: true });
+    }
   }
   return json({ ok: true, updated: patches.size, remaining: Math.max(0, hit.length - targets.length) });
 }

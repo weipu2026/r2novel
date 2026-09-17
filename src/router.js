@@ -241,7 +241,9 @@ async function updateBrute(store, mutate, tries = 4) {
   const cur = await getWithEtag(store, KEY.BRUTE);
   const b = normalizeBrute(cur && tryParseJson(cur.text));
   const r = mutate(b);
-  await store.putText(KEY.BRUTE, JSON.stringify(b));
+  // 耗尽路径同样守 dirty（2026-09-17 复查 F5）：并发对手可能刚清掉/改掉记录，
+  // 无条件写会把读—写间隙里别人写的内容整份吃掉（与 updateTrash 的守卫对称）。
+  if (r.dirty !== false) await store.putText(KEY.BRUTE, JSON.stringify(b));
   return r.out;
 }
 
@@ -631,8 +633,11 @@ function makeHandle(store, root, shards, opts = {}) {
         const again = await openIndex(store, reopenOpts());
         for (const o of opLog) {
           if (o.op === 'upsert') again.upsert(o.id, o.entry);
-          else if (o.op === 'patch') again.patch(o.id, o.fn);
-          else again.remove(o.id);
+          else if (o.op === 'patch') {
+            // 重放时书可能已被并发软删（新盘面的 map 里没有它）——patch 对不在架的书会抛
+            // 非冲突错误 → 500。软删语义已吸收这次改动，跳过即可（2026-09-17 复查 F2）。
+            if (again.get(o.id)) again.patch(o.id, o.fn);
+          } else again.remove(o.id);
         }
         await again.save({ bak, attempt: attempt + 1 });
         // 本 handle 的待落盘改动已由 again 那份落盘 → 清空，免得再次 save 拿旧内存态覆盖回去
@@ -670,7 +675,10 @@ function makeHandle(store, root, shards, opts = {}) {
       //   · 只改既有片（shards 不变）→ 指针先落是对的：数据写失败时指针指着的内容没变，等于本次没生效
       // 因此：**本次新建了分片（首片/拆片）时，顺序必须是「新片 → 既有片 → root」**，让任何一种
       // 单点失败都落在「等于本次没发生」或「有人管」的一侧；没有新片时沿用「root 先、数据后」。
-      const fresh = [...dirty].filter((si) => shardRaw[si] === null); // null = 本次新建、盘上还没有
+      // null=本次新建、盘上还没有；undefined=缺失片（missing，无内容可丢，同样该走「新片先落」序，
+      // 否则 root.map 指向尚未重建的片=指针领先于盘。双坏片走不到这里（前置校验已拒绝覆盖）。
+      // （2026-09-17 复查 F7）
+      const fresh = [...dirty].filter((si) => shardRaw[si] == null);
       const writeRoot = async () => {
         if (!rootDirty) return;
         const next = JSON.stringify(root);
@@ -691,6 +699,10 @@ function makeHandle(store, root, shards, opts = {}) {
           const body = JSON.stringify({ books: shardBooks[si] });
           // 分片也走 CAS：同一片被两个请求并发读—改—写时，后写者会吃掉前者的书条目。
           const bakP = bak ? store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body) : null;
+          // 防悬挂 rejection（2026-09-17 复查 F6）：主片 putIf 若以 rejection 失败，下面的 .then
+          // 不执行 → bakP 无人接管 → unhandledRejection 可打死 dev-server。先挂空 catch 占住
+          // 处理位；成功分支里仍会 await bakP 拿真实结果（bak 写失败照旧让本次 save 失败）。
+          if (bakP) bakP.catch(() => {});
           jobs.push(
             putIf(store, KEY_IDX.shard(shardNo[si]), body, shardEtag[si]).then(async (res) => {
               if (!res.ok) throw idxConflict('shard ' + shardNo[si]);
@@ -1817,7 +1829,11 @@ async function apiBatchBooks(req, store) {
       continue;
     }
     const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
-    const est = action === 'delete' ? 5 + 3 * newS : 1 + 3 * newS + 2 * (processed.length + 1);
+    // 预扣一次 CAS 冲突重放的开销（2026-09-17 复查 F3）：save() 撞冲突会重开索引
+    // （root 1 读 + 跨片读）并重写（root 1 写 + 每脏片 2 写）≈ 2+3*newS。不预留的话，
+    // 顶格批量撞冲突 → 重放把总子请求顶破 Workers 50 上限。
+    const replay = 2 + 3 * newS;
+    const est = (action === 'delete' ? 5 + 3 * newS : 1 + 3 * newS + 2 * (processed.length + 1)) + replay;
     if (est > budget) break;
     shardSet.add(n);
     processed.push(id);
@@ -1890,7 +1906,14 @@ async function batchSoftDelete(store, idx, targets) {
   await updateTrash(store, (t) => {
     n = 0; // mutate 可能被重放 → 计数每次从零重算，绝不累加
     for (const id of targets) {
-      if (t.books.some((x) => x.id === id)) continue;
+      const ei = t.books.findIndex((x) => x.id === id);
+      if (ei >= 0) {
+        // 批量目标全部来自在架书 → 条目已存在只可能是「恢复×批量删」竞态（书刚被恢复流程
+        // 写回索引）→ 刷新 deletedAt 让恢复流程的摘条目作废，同 apiSoftDelete 的判据（F1）。
+        t.books[ei] = { ...t.books[ei], deletedAt: Date.now() };
+        n++;
+        continue;
+      }
       const entry = entries.get(id);
       if (entry) {
         t.books.push({ ...entry, deletedAt: Date.now() });
@@ -1938,7 +1961,8 @@ async function apiTagsMerge(req, store) {
   for (const b of hit) {
     const n = shardNoOf(b.id);
     const newS = shardSet.has(n) ? shardSet.size : shardSet.size + 1;
-    if (1 + idx.shardCount + 2 * (targets.length + 1) + 2 * newS > 48) break;
+    // 预扣一次冲突重放（2026-09-17 复查 F3）：全量模式重放 = root 1 读 + K 片读 + root 1 写 + 每脏片 2 写
+    if (1 + idx.shardCount + 2 * (targets.length + 1) + 2 * newS + 2 + idx.shardCount + 2 * newS > 48) break;
     shardSet.add(n);
     targets.push(b);
   }
@@ -1994,7 +2018,17 @@ async function apiSoftDelete(store, id) {
   }
   // trash 走 CAS（见 updateTrash）：并发的两次软删不会互相覆盖（否则有本书会彻底消失）
   await updateTrash(store, (t) => {
-    if (t.books.some((x) => x.id === id)) return { dirty: false };
+    const i = t.books.findIndex((x) => x.id === id);
+    if (i >= 0) {
+      // 条目已在且书**不在架**（恢复流程还没把书写回）→ 纯 no-op（双击删除/惰性清理抢先）。
+      // 书**在架**说明刚被恢复流程写回索引（恢复×再软删竞态）→ 本次删除是真实意图，
+      // 必须刷新 deletedAt 制造版本变化：并发恢复流程随后的「摘条目」CAS 会撞冲突，
+      // 重放时看到 deletedAt 已变而放弃（2026-09-17 复查 F1）——否则恢复会把这条唯一的
+      // 记录摘掉，书既不在架也不在回收站。
+      if (!b) return { dirty: false };
+      t.books[i] = { ...t.books[i], deletedAt: Date.now() };
+      return {};
+    }
     t.books.push({ ...(b || indexEntryFromMeta(meta)), deletedAt: Date.now() });
     return {};
   });
@@ -2054,6 +2088,9 @@ async function apiRestore(store, id) {
     (t) => {
       const i = t.books.findIndex((b) => b.id === id);
       if (i < 0) return { dirty: false };
+      // 我读快照之后它又被并发软删了一次（deletedAt 变了）→ 这次「摘除」不该生效：
+      // 否则会把别人刚写回的条目吃掉，书既不在架也不在回收站（2026-09-17 复查 F1）。
+      if (t.books[i].deletedAt !== entry.deletedAt) return { dirty: false };
       t.books.splice(i, 1);
       return {};
     },
@@ -2651,7 +2688,18 @@ export async function handleRequest(req, env, store) {
     return opdsExport(req, env, store, mExp[1]);
   }
 
-  if (p.startsWith('/api/')) return handleApi(req, env, store, url, p);
+  if (p.startsWith('/api/')) {
+    // 顶层兜底（2026-09-17 复查 F4）：未捕获异常必须以 JSON 返回，而不是让 Workers 冒 1101
+    // HTML——前端拿到 JSON 才能展示真实错误；索引并发冲突耗尽映射 409（客户端可重试）。
+    try {
+      return await handleApi(req, env, store, url, p);
+    } catch (e) {
+      return json(
+        { error: '请求处理失败：' + (e && e.message ? e.message : String(e)) },
+        isIdxConflict(e) ? 409 : 500
+      );
+    }
+  }
 
   // 静态资源交给外层（Workers: ASSETS / dev: 静态文件服务）
   if (req.method === 'GET' || req.method === 'HEAD') {

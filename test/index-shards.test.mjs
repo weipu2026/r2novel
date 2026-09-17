@@ -245,8 +245,9 @@ test('批量预算：18 本散在多片时按预算裁剪，deferred 原样回�
   const root = JSON.parse(store._map.get(ROOT));
   assert.equal(root.shards, 5);
 
-  // 18 个目标：s0 取 5 本、s1~s3 各 4 本（17 本，est=1+3×4+2×17=47 ✓）、s4 取 1 本
-  // （新片 k=5：est=1+3×5+2×18=50 ✗）→ 恰好裁到 17 本
+  // 18 个目标（2026-09-17 F3 起预算预扣一次冲突重放 2+3k，est=1+3k+2N+(2+3k)=3+6k+2N）：
+  // s0 取 5 本、s1~s2 各 4 本（13 本，k=3：est=3+18+26=47 ✓）、第 14 本进 s3（k=4：est=3+24+28=55 ✗）
+  // → 恰好裁到 13 本
   const ids = [];
   for (let j = 0; j < 5; j++) ids.push(books[j].id);
   for (let s = 1; s < 4; s++) for (let j = 0; j < 4; j++) ids.push(books[s * 500 + j].id);
@@ -257,12 +258,12 @@ test('批量预算：18 本散在多片时按预算裁剪，deferred 原样回�
     req('/api/books/batch', { method: 'POST', cookie, body: { ids, action: 'setFinished', finished: true } })
   );
   assert.equal(r.status, 200);
-  assert.equal(r.data.updated, 17, '预算内恰好处理 17 本');
-  assert.deepEqual(r.data.deferred, [ids[17]], '被裁掉的 id 必须**原样回传**：只回传数量而前端不消费＝静默丢书');
+  assert.equal(r.data.updated, 13, '预算内恰好处理 13 本（F3 预扣重放开销后比旧数学收紧 4 本）');
+  assert.deepEqual(r.data.deferred, ids.slice(13), '被裁掉的 id 必须**原样回传**：只回传数量而前端不消费＝静默丢书');
   assert.equal(r.data.skipped, 0, 'skipped 只算「在架却改不成」的，不含被裁的');
   // meta 只写已处理的书
-  assert.equal(JSON.parse(store._map.get(KEY.book(ids[16]))).finished, true);
-  assert.notEqual(JSON.parse(store._map.get(KEY.book(ids[17]))).finished, true, '被裁掉的书不应被写');
+  assert.equal(JSON.parse(store._map.get(KEY.book(ids[12]))).finished, true);
+  assert.notEqual(JSON.parse(store._map.get(KEY.book(ids[13]))).finished, true, '被裁掉的书不应被写');
   // 索引摘要同步
   const after = await readIdxBooks(store);
   assert.equal(after.find((b) => b.id === ids[0]).finished, true);
@@ -272,7 +273,7 @@ test('批量预算：18 本散在多片时按预算裁剪，deferred 原样回�
     store,
     req('/api/books/batch', { method: 'POST', cookie, body: { ids: r.data.deferred, action: 'setFinished', finished: true } })
   );
-  assert.equal(r2.data.updated, 1);
+  assert.equal(r2.data.updated, 5, '续调把被裁的 5 本（s3×4 + s4×1）一次做完');
   assert.deepEqual(r2.data.deferred, []);
   assert.equal(r2.data.skipped, 0);
   for (const id of ids) assert.equal(JSON.parse(store._map.get(KEY.book(id))).finished, true, `${id} 应已落库`);
@@ -538,12 +539,12 @@ test('save 写序：拆片（新建分片）必须「新片→既有片→root�
   assert.equal(r.status, 200);
   const id = r.data.id;
   for (const i of [1, 2]) await call(store, req(`/api/books/${id}/chapters/${i}`, { method: 'PUT', cookie, body: '正文' + i }));
-  // 故障注入是同步抛错（真实 R2 put 失败也是 reject）——必须断言「请求确实失败」而不是静默成功
-  await assert.rejects(
-    () => call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie })),
-    /inject fail/,
-    '新片写失败必须报错，不能静默成功'
-  );
+  // 故障注入是同步抛错（真实 R2 put 失败也是 reject）——必须断言「请求确实失败」而不是静默成功。
+  // 2026-09-17 F4 起 /api/* 顶层兜底把未捕获异常转成 JSON 500（前端拿到可展示的错误，不再吃 1101 HTML），
+  // 因此这里断言 500 响应 + 真实错误信息可见，而不是 assert.rejects。
+  const fail = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(fail.status, 500, '新片写失败必须报错，不能静默成功');
+  assert.match(fail.data.error, /inject fail/, '错误信息必须透传到 JSON（不能是笼统 1101）');
 
   // ① 盘上必须等于「什么都没发生」——指针绝不能领先于盘（那是无自愈覆盖的一侧）
   const root = JSON.parse(base._map.get(ROOT));
@@ -614,11 +615,10 @@ test('P2-7 + P2-5：恢复先落索引后摘 trash（失败可重试），读取
       return base.putText(k, v);
     },
   };
-  await assert.rejects(
-    () => call(faulty, req(`/api/books/${all[0].id}/restore`, { method: 'POST', cookie })),
-    /inject fail/,
-    '索引写失败必须报错，不能静默成功'
-  );
+  // F4 起裸抛转 500 JSON（同 140 的说明）
+  const fail = await call(faulty, req(`/api/books/${all[0].id}/restore`, { method: 'POST', cookie }));
+  assert.equal(fail.status, 500, '索引写失败必须报错，不能静默成功');
+  assert.match(fail.data.error, /inject fail/);
   assert.ok(
     JSON.parse(base._map.get('meta/trash.json')).books.some((b) => b.id === all[0].id),
     'P2-7：恢复失败必须保留 trash 条目供重试'

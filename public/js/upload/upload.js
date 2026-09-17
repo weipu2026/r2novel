@@ -143,8 +143,8 @@ async function uploadToExisting(id, op, payload, keepRaw, session) {
   const n = payload.chapters.length; // 本次实际要传的正文数
   const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
-  // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：替换/追加/重洗流程依赖响应里的
-  // books 快照免刷新书架，漏掉会静默退化成一次全量 GET /api/books（慢链路 ~2s）
+  // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：发布成功后由 finalizeUpload 内的
+  // onConfirm 分支刷新书架（publish 自 2026-09-17 起不再回传 books 快照，无快照时走 loadShelf 全量刷新）
   const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session);
   return finalizeUpload(id, rawRes);
 }
@@ -190,7 +190,7 @@ function rawInFlight() {
 async function finalizeUpload(id, rawRes) {
   setProg(1, '发布中…');
   const pub = await api.publish(id);
-  return { ...rawRes, ...pub }; // rawFailed + books/wordCount 等发布结果
+  return { ...rawRes, ...pub }; // rawFailed + 发布结果（publish 不再回传 books 快照，前端有 pub.books 判断的兼容分支）
 }
 
 export async function uploadChapters(id, keys, keepRaw, session) {

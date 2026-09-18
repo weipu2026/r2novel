@@ -1,6 +1,7 @@
 /* app.js — 登录 / 书架（分类·批量·标签·诊断）/ 回收站 / 阅读入口；上传域见 upload/ */
 import { api, local, fmtWords, ApiError } from './store.js';
-import { BATCH_BOOKS_MAX, TRASH_DAYS, READ_DONE_RATIO } from './shared-const.js';
+import { BATCH_BOOKS_MAX, TRASH_DAYS, READ_DONE_RATIO, TAG_MAX } from './shared-const.js';
+import { offline } from './offline.js';
 import * as reader from './reader.js';
 import { bindBusy, bindToast, busy, busyDone, toast } from './ui.js';
 import { exportBookTxt } from './exporter.js';
@@ -156,7 +157,7 @@ export function init() {
   els.bbTags.addEventListener('click', batchEditTags);
   els.bbDone.addEventListener('click', () => batchRun('setFinished', { finished: true }, `把 ${selected.size} 本书标记为「已完结」？`));
   els.bbOngoing.addEventListener('click', () => batchRun('setFinished', { finished: false }, `把 ${selected.size} 本书标记为「连载中」？`));
-  els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？15 天内可恢复`));
+  els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？${TRASH_DAYS} 天内可恢复`));
   els.trashBack.addEventListener('click', () => { showView('shelf'); loadShelf().catch(() => {}); });
   els.trashClear.addEventListener('click', clearTrashFlow);
   // 搜索防抖：千本规模下每次按键全量过滤+重建网格，150ms 合并输入更顺滑
@@ -241,18 +242,54 @@ async function doLogin(e) {
   els.loginBtn.disabled = true;
   try {
     await api.login(pwd);
-    els.loginPwd.value = '';
-    showView('shelf');
-    await loadShelf();
   } catch (err) {
     els.loginErr.textContent = err.message || '登录失败';
-  } finally {
     els.loginBtn.disabled = false;
+    return;
   }
+  els.loginPwd.value = '';
+  showView('shelf');
+  // L13：登录已成功——此后的失败属「书架加载」，不能再写进已隐藏的登录页
+  //（用户看到的是纯白书架，分不清「没有书」还是「没拉到」）。
+  await loadShelf().catch((err) => {
+    if (books && books.length) toast('书架刷新失败：' + (err.message || err), 3000); // 已有快照：不打断
+    else renderShelfError(err);
+  });
+  els.loginBtn.disabled = false;
+}
+
+/** 书架加载失败的错误态（L13）：给可见说明与重试入口，别让用户对着纯白猜。 */
+function renderShelfError(err) {
+  const grid = els.grid;
+  grid.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'empty-state';
+  const strong = document.createElement('strong');
+  strong.textContent = '书架加载失败';
+  const p = document.createElement('p');
+  p.textContent = String((err && err.message) || err || '网络异常') + '。你的书都还在，点下面重试即可。';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = '重试';
+  btn.addEventListener('click', () => loadShelf().catch((e2) => renderShelfError(e2)));
+  box.append(strong, p, btn);
+  grid.appendChild(box);
+  els.filterNote.textContent = '';
 }
 
 async function logout() {
-  await api.logout();
+  try {
+    await api.logout();
+  } catch (e) {
+    // M6：清 cookie 只能靠这次请求成功（Set-Cookie 由服务端下发、HttpOnly）。
+    // 失败必须让用户看见并留在原视图，否则「看着已登出、刷新又回到书架」，共享设备上是真实风险。
+    toast('退出登录失败，请重试：' + (e.message || e), 3000);
+    return;
+  }
+  // L18：登出即清本地痕迹——整本离线正文、书架快照、进度镜像都是私人数据，
+  // 共享设备上不给下一个人留下「断网也能读」的后门。
+  await offline.clearAll().catch(() => {});
+  local.clearAll();
   showView('login');
 }
 
@@ -290,7 +327,8 @@ async function loadShelf(data) {
   local.setShelfCache(books);
   // 校正可能失效的筛选项
   if (ui.tag && !books.some((b) => (b.tags || []).includes(ui.tag))) ui.tag = '';
-  ui.page = 1;
+  // L5：页码不做无条件重置——翻到第 3 页点个星标也会触发 loadShelf，重置会把用户拽回第 1 页。
+  // 只做越界收敛（renderGrid 按当前列表长度夹住）；筛选**条件**变化时才回第 1 页（各入口已设）。
   renderShelf();
 }
 
@@ -325,7 +363,26 @@ function sortedBooks(list) {
   return pinned.concat(rest);
 }
 
+/** 批量选择集对账（L4）：筛选条件变化后，已不在当前范围内的书必须从选择集移除。
+ *  否则用户换了关键词/标签再点「删除」，会连带删掉那些已经看不见的书——看不见却删得掉，
+ *  是批量治理里最危险的一类误操作。翻页不算筛选（同页内的书仍在 filteredBooks() 里，保持选中）。 */
+function pruneSelected() {
+  if (!batchMode || !selected.size) return;
+  const live = new Set(filteredBooks().map((b) => b.id));
+  let n = 0;
+  for (const id of Array.from(selected)) {
+    if (!live.has(id)) {
+      selected.delete(id);
+      n++;
+    }
+  }
+  if (!n) return;
+  syncBatchBar();
+  toast(`筛选变化：已取消 ${n} 本不在当前范围内的选择`, 2200);
+}
+
 function renderShelf() {
+  pruneSelected(); // L4：选择集随筛选对账（详见该函数注释）
   els.shelfCount.textContent = books.length ? `共 ${books.length} 本 · ${fmtWords(books.reduce((s, b) => s + (b.wordCount || 0), 0))}` : '';
 
   // 继续阅读：有进度且**还没读完**的书，按云端最后阅读时间倒序取前 3（prog 镜像，电脑/手机一致）。
@@ -349,6 +406,8 @@ function renderShelf() {
 
 function renderGrid(list) {
   const grid = els.grid;
+  // L5：页码越界收敛——筛选/删除让总页数变少时回退到最后有效页，而不是被无条件重置到第 1 页
+  if (ui.page > Math.max(1, Math.ceil(list.length / PAGE))) ui.page = Math.max(1, Math.ceil(list.length / PAGE));
   grid.innerHTML = '';
   const shown = list.slice(0, ui.page * PAGE);
   for (const b of shown) grid.appendChild(makeCard(b));
@@ -780,7 +839,7 @@ function openSheet(b, anchor) {
   del.textContent = '移入回收站';
   del.addEventListener('click', async () => {
     closeSheet();
-    if (await confirmModal(`把《${b.title}》移入回收站？15 天内可恢复。`)) {
+    if (await confirmModal(`把《${b.title}》移入回收站？${TRASH_DAYS} 天内可恢复。`)) {
       try {
         await api.deleteBook(b.id);
         toast('已移入回收站', 1600);
@@ -880,14 +939,16 @@ async function openEditModal(b) {
   refreshPresetTags(); // 打开弹层顺带后台刷新可选标签（快照先显示，与进上传页同款逻辑）
   let note = '';
   let finished = !!b.finished;
+  let metaLoaded = false; // M7：拉取失败时下面必须**省略** note 字段（否则保存即清空服务端的真备注）
   try {
     const meta = await api.bookMeta(b.id);
     if (meta) {
       note = meta.note || '';
       if (typeof meta.finished === 'boolean') finished = meta.finished;
+      metaLoaded = true;
     }
   } catch {
-    /* 用书架摘要（无 note 则空） */
+    /* meta 拉取失败：备注框留空但**禁写**（见 metaLoaded 分支）——不提交 ≠ 清空 */
   }
   openModal(`
     <h3>编辑信息</h3>
@@ -898,7 +959,7 @@ async function openEditModal(b) {
       <div id="mdTagChips" class="tag-chips"></div>
     </div>
     <div class="m-field"><label class="finish-row"><span>已完结</span><input type="checkbox" id="mdFinished" ${finished ? 'checked' : ''}></label></div>
-    <div class="m-field"><label>备注</label><input id="mdNote" value="${esc(note)}" placeholder="这本书的备注（个人备忘）"></div>
+    <div class="m-field"><label>备注</label><input id="mdNote" value="${esc(note)}" placeholder="${metaLoaded ? '这本书的备注（个人备忘）' : '备注加载失败，本次保存不会改动备注'}"${metaLoaded ? '' : ' disabled'}></div>
     <div class="m-acts">
       <button class="ghost" id="mdCancel" type="button">取消</button>
       <button class="primary" id="mdOk" type="button">保存</button>
@@ -911,13 +972,18 @@ async function openEditModal(b) {
   syncMdChips();
   $('#mdCancel', els.modalBox).addEventListener('click', closeModal);
   $('#mdOk', els.modalBox).addEventListener('click', async () => {
+    const rawTags = parseTagInput(mdTags.value);
+    const tags = rawTags.slice(0, TAG_MAX); // L14：超上限要当面说，不能提交后被服务端静默丢掉
+    if (rawTags.length > TAG_MAX) toast(`标签最多 ${TAG_MAX} 个，已忽略多余的 ${rawTags.length - TAG_MAX} 个`, 2600);
     const patch = {
       title: $('#mdTitle', els.modalBox).value.trim(),
       author: $('#mdAuthor', els.modalBox).value.trim(),
-      tags: parseTagInput(mdTags.value),
-      note: $('#mdNote', els.modalBox).value.trim(),
+      tags,
       finished: $('#mdFinished', els.modalBox).checked,
     };
+    // M7：meta 没拉到就**不提交** note —— 服务端对 body.note !== undefined 一律赋值，
+    // 提交空串会把服务端上真实存在的备注抹掉（用户只改了书名，备注却没了）。
+    if (metaLoaded) patch.note = $('#mdNote', els.modalBox).value.trim();
     if (!patch.title) return toast('书名不能为空', 1600);
     closeModal();
     await safePatch(b.id, patch);
@@ -925,12 +991,18 @@ async function openEditModal(b) {
 }
 
 /* ---------- 模态通用 ---------- */
+let modalSeq = 0; // 弹层世代令牌（L12）：任何一次 open/close 都推进，使在途的异步弹层内容作废——
+// 否则「标签管理」的迟到清单会把用户已经关掉或换掉的弹层重新内容化（复活）。
+let pendingConfirm = null; // 未决确认框的 resolve 句柄：被新弹层顶掉时视作「取消」，避免 Promise 永久挂起
 function openModal(html) {
+  modalSeq++;
+  if (pendingConfirm) pendingConfirm(false); // 上一个确认框已被替换 → 先落地为「取消」
   els.modalBox.classList.remove('ce', 'diag'); // 清掉上个弹层可能加的加宽类
   els.modalBox.innerHTML = html;
   els.modalMask.classList.remove('hidden');
 }
 function closeModal() {
+  modalSeq++; // 关掉也让在途的异步弹层内容作废（否则迟到响应会把弹层"复活"）
   els.modalBox.classList.remove('ce', 'diag');
   els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
@@ -949,6 +1021,13 @@ function modalDismiss() {
 }
 function confirmModal(text, okText = '确定') {
   return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => {
+      if (done) return;
+      done = true;
+      if (pendingConfirm === fin) pendingConfirm = null;
+      resolve(v);
+    };
     openModal(`
       <h3>确认</h3>
       <p class="modal-sub confirm-text">${esc(text)}</p>
@@ -956,8 +1035,10 @@ function confirmModal(text, okText = '确定') {
         <button class="ghost" id="cfNo" type="button">取消</button>
         <button class="primary" id="cfYes" type="button">${esc(okText)}</button>
       </div>`);
-    $('#cfNo', els.modalBox).addEventListener('click', () => { closeModal(); resolve(false); });
-    $('#cfYes', els.modalBox).addEventListener('click', () => { closeModal(); resolve(true); });
+    // 注册在 openModal 之后：上面那次 openModal 若顶掉了别的确认框，顶掉的是「上一个」而非自己
+    pendingConfirm = fin;
+    $('#cfNo', els.modalBox).addEventListener('click', () => { closeModal(); fin(false); });
+    $('#cfYes', els.modalBox).addEventListener('click', () => { closeModal(); fin(true); });
   });
 }
 
@@ -1085,8 +1166,10 @@ function batchEditTags() {
   input.addEventListener('input', sync);
   $('#btCancel', els.modalBox).addEventListener('click', closeModal);
   const go = async (action) => {
-    const tags = parse();
-    if (!tags.length) return;
+    const raw = parse();
+    if (!raw.length) return;
+    const tags = raw.slice(0, TAG_MAX); // L14：超上限要当面说（服务端会截断，静默丢弃最容易被误解）
+    if (raw.length > TAG_MAX) toast(`标签最多 ${TAG_MAX} 个，已忽略多余的 ${raw.length - TAG_MAX} 个`, 2600);
     closeModal();
     const verb = action === 'addTags' ? '添加' : '移除';
     await batchRun(action, { tags }, `给 ${selected.size} 本书${verb}标签：${tags.join('、')}？`);
@@ -1098,15 +1181,20 @@ function batchEditTags() {
 /* ---------- 标签管理（全量清单 + 改名/合并/删除，治理碎片标签） ---------- */
 async function openTagMgr() {
   openModal('<h3>标签管理</h3><p class="modal-sub">加载中…</p>');
+  // L12：记下本次弹层世代。⚠️ 必须在 openModal **之后**取——openModal 自己会推进 modalSeq，
+  // 取在前面（++modalSeq）会让校验恒真失配，清单永远渲染不出来。
+  const seq = modalSeq;
   let data;
   try {
     data = await api.tags();
   } catch (e) {
+    if (seq !== modalSeq) return; // 已被关掉/换成别的弹层：整体作废，不得覆盖
     openModal(`<h3>标签管理</h3><p class="modal-sub">加载失败：${esc(e.message || e)}</p>
       <div class="m-acts"><button class="ghost" id="tmErrClose" type="button">关闭</button></div>`);
     $('#tmErrClose', els.modalBox).addEventListener('click', closeModal);
     return;
   }
+  if (seq !== modalSeq) return; // 同上：迟到清单不得把弹层"复活"
   renderTagMgr(data);
 }
 
@@ -1349,10 +1437,15 @@ async function onDiagBoxClick(e) {
     if (!keys.length) return;
     if (!(await confirmModal(`永久删除 ${keys.length} 个无主对象？此操作不可恢复。`, '全部删除'))) return;
     try {
-      const r = await api.purgeOrphans(keys);
-      const done = (r && r.deleted) || 0;
-      const skipped = (r && r.skipped) || 0;
-      toast((done ? `已删除 ${done} 个对象` : '没有可删除的对象') + (skipped ? `（${skipped} 个被跳过）` : ''), 1600);
+      // L15：服务端按子请求预算分批，装不下的原样回传 deferred —— 续调循环收在 api.purgeOrphansAll
+      // （循环消费 deferred 直到清空，skipped 逐轮累加），这里只管措辞。
+      const { done, skipped, pending } = await api.purgeOrphansAll(keys);
+      toast(
+        (done ? `已删除 ${done} 个对象` : '没有可删除的对象') +
+          (skipped ? `（${skipped} 个仍在引用中，未删除）` : '') +
+          (pending.length ? `（还有 ${pending.length} 个未处理完，可再点一次）` : ''),
+        2400
+      );
       await diagRefresh();
     } catch (err) {
       toast('删除失败：' + (err.message || err), 2400);

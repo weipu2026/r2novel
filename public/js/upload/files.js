@@ -103,7 +103,12 @@ async function importBatch(files) {
   const note = els.upNote.value.trim();
   const keepRaw = els.upKeepRaw.checked;
   const summary = `作者「${author || '空'}」· 标签「${tags.join('、') || '空'}」· 备注「${note || '空'}」`;
-  if (!(await host().confirmModal(`将对 ${n} 本书批量导入。书名取文件名，以下信息统一应用到这批：${summary}。与书架同名的自动跳过。继续？`, `导入 ${n} 本`))) return;
+  if (!(await host().confirmModal(`将对 ${n} 本书批量导入。书名取文件名，以下信息统一应用到这批：${summary}。与书架同名的自动跳过。继续？`, `导入 ${n} 本`))) {
+    // 取消：必须复位文件输入（L10）。否则 input.value 仍是这一批文件名，
+    // 用户改主意后重选同一批文件不触发 change 事件 —— 表现为"点了没反应"。
+    els.upFile.value = '';
+    return;
+  }
 
   let ok = 0;
   let skip = 0;

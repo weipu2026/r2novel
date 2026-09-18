@@ -27,6 +27,10 @@ export const MAX_UPLOAD_BYTES = 52428800;
 /** 整本流式导出章节上限（Free 计划子请求护栏） */
 export const EXPORT_MAX_CHAPTERS = 40;
 
+/** 单本书标签上限。前后端共用：服务端按此截断（超出静默丢弃），前端据此提前提示——
+ *  否则用户输了 12 个标签、界面只报「已更新 N 本」，实际只落了 10 个（L14）。 */
+export const TAG_MAX = 10;
+
 /** 回收站保留天数（超期由业务请求时机惰性清除；env.TRASH_DAYS 可覆盖此默认值） */
 export const TRASH_DAYS = 15;
 

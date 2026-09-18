@@ -43,7 +43,10 @@ export const api = {
     return request('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
   },
   async logout() {
-    return request('/api/logout', { method: 'POST' }).catch(() => ({ ok: true }));
+    // 不吞错：清 cookie 的唯一途径就是这次请求成功（Set-Cookie 由服务端下发、且是 HttpOnly，
+    // 前端无法自行清除）。原来吞成 {ok:true} 会让 UI 显示「已登出」而会话仍然有效——
+    // 刷新页面即带旧 cookie 回到书架，共享设备上是真实风险。
+    return request('/api/logout', { method: 'POST' });
   },
   books: () => request('/api/books'),
   bookMeta: (id) => request('/api/books/' + encodeURIComponent(id)),
@@ -114,6 +117,24 @@ export const api = {
   },
   purgeOrphans(keys) {
     return request('/api/diag/orphans', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ objects: keys }) });
+  },
+  /** 残留清理（L15）：服务端按子请求预算分批，装不下的原样回传 deferred。
+   *  原实现把 deferred 与「确认拒删」（skipped）混在一个计数里，前端只能一律说成"被跳过"，
+   *  于是被裁掉的残留永远删不完。这里循环消费 deferred 直到清空（maxRounds 防死循环）。
+   *  ⚠️ skipped 必须**逐轮累加**：每轮传入的是上一轮的 deferred（互不相交），相加即真值；
+   *  写成 `=` 会被后面几轮的 0 覆盖，把"仍在引用中"的真实数量抹掉。
+   *  返回 { done 已删, skipped 确认拒删, pending 仍未处理完（轮次用尽，可再点一次） }。 */
+  async purgeOrphansAll(keys, maxRounds = 60) {
+    let done = 0;
+    let skipped = 0;
+    let pending = Array.isArray(keys) ? keys : [];
+    for (let g = 0; g < maxRounds && pending.length; g++) {
+      const r = await this.purgeOrphans(pending);
+      done += (r && r.deleted) || 0;
+      skipped += (r && r.skipped) || 0;
+      pending = r && Array.isArray(r.deferred) ? r.deferred : [];
+    }
+    return { done, skipped, pending };
   },
   // 书架批量操作（多选治理）：addTags / removeTags / setTags / setFinished / delete
   batchBooks(ids, action, payload = {}) {
@@ -211,6 +232,23 @@ export const local = {
       localStorage.setItem(LS.presetTags, JSON.stringify(tags));
     } catch {
       /* 容量满则忽略 */
+    }
+  },
+  /** 登出清理（L18）：书架快照 / 预设标签 / 各书进度镜像都是私人数据，共享设备上不留痕迹。
+   *  注意作用域——只清本地镜像，云端真值（进度、meta、正文）照旧，重新登录即拉回。 */
+  clearAll() {
+    try {
+      localStorage.removeItem(LS.pref);
+      localStorage.removeItem(LS.shelf);
+      localStorage.removeItem(LS.presetTags);
+      const drop = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('rn_prog_')) drop.push(k);
+      }
+      for (const k of drop) localStorage.removeItem(k);
+    } catch {
+      /* 隐私模式禁用存储：本就无数据可清 */
     }
   },
 };

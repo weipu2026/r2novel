@@ -99,7 +99,7 @@ export const offline = {
   /** 入队一条离线进度（同一本书只保留最新一条，last-write-wins）
    * 拆成「只读取旧 → 只写新」两个事务：IDB 事务在 await 让出后会被浏览器自动提交，
    * 在同一事务内跨 await 再 put/delete 会抛 TransactionInactiveError（离线进度丢失）。 */
-  async queueProgress(bookId, p) {
+  async queueProgress(bookId, p, cleanVer) {
     const rows = (await inTx('progQueue', 'readonly', (os, rp) => rp(os.getAll()))) || [];
     const drop = [];
     let at = Date.now();
@@ -107,19 +107,30 @@ export const offline = {
       if (r.bookId === bookId) drop.push(r.at);
       if (r.at >= at) at = r.at + 1; // keyPath=at 必须唯一：同毫秒入队会互相覆盖
     }
-    const rec = { bookId, ch: p.ch, ratio: p.ratio, updatedAt: p.updatedAt, at };
+    // cleanVer 是入队那一刻该书的内容版本（L17）：离线期间书被编辑/重洗过 → 回网时章号已失去
+    // 意义，服务端凭它丢弃这条陈旧进度（否则会用旧章号覆盖掉编辑后的进度，表现为"进度±1"）。
+    const rec = { bookId, ch: p.ch, ratio: p.ratio, updatedAt: p.updatedAt, cleanVer, at };
     await inTx('progQueue', 'readwrite', (os) => {
       for (const k of drop) os.delete(k);
       os.put(rec);
     });
   },
-  /** 回网上送离线进度；send(bookId,{ch,ratio}) 抛错则保留 */
+  /** 清空全部离线数据（登出）：正文缓存 + 书目快照 + 待上送队列。
+   *  共享设备上退出了还能断网读已下载正文，是真实的隐私缺口。 */
+  async clearAll() {
+    await inTx('chapters', 'readwrite', (os) => os.clear());
+    await inTx('books', 'readwrite', (os) => os.clear());
+    await inTx('progQueue', 'readwrite', (os) => os.clear());
+  },
+  /** 回网上送离线进度；send(bookId,{ch,ratio,updatedAt,cleanVer}) 抛错则保留 */
   async drainProgress(send) {
     const rows = (await inTx('progQueue', 'readonly', (os, p) => p(os.getAll()))) || [];
     let ok = 0;
     for (const r of rows) {
       try {
-        await send(r.bookId, { ch: r.ch, ratio: r.ratio });
+        // 把原写入时间与内容版本一并上送（L6/L17）：服务端据此丢弃"比盘上更旧"的迟到进度，
+        // 以及"书已被编辑过"的失效章号——离线队列的回放不再能回退进度。
+        await send(r.bookId, { ch: r.ch, ratio: r.ratio, updatedAt: r.updatedAt, cleanVer: r.cleanVer });
         await inTx('progQueue', 'readwrite', (os) => os.delete(r.at));
         ok++;
       } catch {

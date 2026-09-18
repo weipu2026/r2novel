@@ -27,7 +27,7 @@
  *     剩余 keys 存 trash 条目 purge 字段，客户端续调直至 done。
  */
 
-import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS, READ_DONE_RATIO } from '../public/js/shared-const.js';
+import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS, READ_DONE_RATIO, TAG_MAX } from '../public/js/shared-const.js';
 
 const SESSION_COOKIE = 'rn_session';
 
@@ -1192,7 +1192,7 @@ async function createBookRecord(store, body) {
     title,
     author: safeStr(body.author, 60),
     note: safeStr(body.note, 500),
-    tags: Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, 10) : [],
+    tags: Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [],
     wordCount: Number(body.wordCount) || 0,
     cleanVer: Number(body.cleanVer) || 1,
     createdAt: now,
@@ -1379,7 +1379,7 @@ async function apiUpdateChapters(req, env, store, id) {
   if (body.author !== undefined) meta.author = safeStr(body.author, 60);
   if (body.note !== undefined && body.note !== null) meta.note = safeStr(body.note, 500);
   if (body.tags !== undefined) {
-    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, 10) : [];
+    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
   }
   if (body.wordCount !== undefined) {
     // append 只传新增部分的字数 → 在旧字数上累加；replace 传的是整本字数 → 直接采用
@@ -1494,7 +1494,7 @@ async function apiPatchBook(req, store, id) {
     patch.note = meta.note;
   }
   if (body.tags !== undefined) {
-    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, 10) : [];
+    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
     patch.tags = meta.tags;
   }
   if (body.pinned !== undefined) {
@@ -1749,6 +1749,23 @@ async function apiProgressPut(req, store, id) {
   let ratio = Number(body.ratio);
   if (!Number.isFinite(ratio)) ratio = 0;
   ratio = Math.min(1, Math.max(0, ratio));
+  // 离线队列回放的对账（L6 / L17）：只有客户端带上「原写入时间」或「入队时的内容版本」时才做。
+  //   · 迟到：盘上真值的 updatedAt 比它新 → 丢弃。离线期间排队、回网后迟到的旧值不能把更新的
+  //     进度回退（同一设备上也成立：联网后先读了新章，随后队列才回放）。
+  //   · 版本不符：该书在离线期间被编辑/重洗（cleanVer 变了）→ 旧章号已失去意义 → 丢弃，
+  //     否则进度会落在错误的章上（表现为跨设备编辑后进度 ±1）。
+  // 在线正常写入不带这两个字段 → 零额外读，行为与从前完全一致（无条件覆盖）。
+  const clientAt = Number(body.updatedAt) || 0;
+  const clientVer = Number(body.cleanVer) || 0;
+  if (clientAt || clientVer) {
+    const prev = await store.getText(KEY.progress(id)).catch(() => null);
+    const pv = tryParseJson(prev);
+    if (pv && clientAt && (Number(pv.updatedAt) || 0) > clientAt) return json({ ok: true, skipped: 'stale' });
+    if (clientVer) {
+      const m = await readBook(store, id).catch(() => null);
+      if (m && Number(m.cleanVer || 1) !== clientVer) return json({ ok: true, skipped: 'cleanVer' });
+    }
+  }
   const data = { ch, ratio, updatedAt: Date.now() };
   await store.putText(KEY.progress(id), JSON.stringify(data));
 
@@ -1801,7 +1818,7 @@ async function apiBatchBooks(req, store) {
   if (!['addTags', 'removeTags', 'setTags', 'setFinished', 'delete'].includes(action)) {
     return json({ error: '未知操作' }, 400);
   }
-  const tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, 10) : [];
+  const tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
   // setTags 允许空数组（清空标签），其余两种必须给非空标签
   if (action !== 'setTags' && action !== 'setFinished' && action !== 'delete' && !tags.length) {
     return json({ error: '请填写标签' }, 400);
@@ -1891,7 +1908,7 @@ async function apiBatchBooks(req, store) {
     if (action === 'addTags') {
       const set = new Set(meta.tags || []);
       for (const t of tags) set.add(t);
-      meta.tags = Array.from(set).slice(0, 10);
+      meta.tags = Array.from(set).slice(0, TAG_MAX);
     } else if (action === 'removeTags') {
       const rm = new Set(tags);
       meta.tags = (meta.tags || []).filter((t) => !rm.has(t));
@@ -2022,7 +2039,7 @@ async function apiTagsMerge(req, store) {
       // from 分支 push to 前已查重、这里放行 to 也不会重复。
       if (!out.includes(t)) out.push(t);
     }
-    meta.tags = out.slice(0, 10);
+    meta.tags = out.slice(0, TAG_MAX);
     meta.updatedAt = now;
     writes.push(store.putText(KEY.book(b.id), JSON.stringify(meta))); // 写一波全并行
     patches.set(b.id, { tags: meta.tags, updatedAt: meta.updatedAt });
@@ -2364,7 +2381,11 @@ async function apiPurgeOrphans(req, store) {
   let used = 2 + idx.shardCount; // 已读 root+分片 + trash
   const metaCache = new Map(); // 同一本书多个删除 key 只回验一次
   const toDelete = [];
-  for (const k of ok) {
+  // 因预算未处理的对象（可续调）——与「确认拒删」分开回传：原实现两者混在 skipped 里，
+  // 前端只能把它说成"被跳过"，被裁掉的残留永远删不完（L15）。
+  const deferred = [];
+  for (let i = 0; i < ok.length; i++) {
+    const k = ok[i];
     const parts = k.split('/');
     // id 解析：text/<id>/<key>.txt 的 id 是 parts[1]；raw/<id>.txt、progress/<id>.json 只有一个斜杠，
     // parts[1] 带扩展名，须剥掉才能对上 live 集合（否则活书的 raw/progress 会被误判为非活书而放行）
@@ -2378,7 +2399,11 @@ async function apiPurgeOrphans(req, store) {
     if (metaCache.has(id)) {
       // 命中缓存
     } else {
-      if (used >= DIAG_VALIDATE_BUDGET) break; // 回验预算尽：不回验也不删（宁漏勿错），余下预算留给删除
+      if (used >= DIAG_VALIDATE_BUDGET) {
+        // 回验预算尽：不回验也不删（宁漏勿错）。余下全部原样回传，交给下一轮继续。
+        deferred.push(...ok.slice(i));
+        break;
+      }
       used++;
       meta = await readBook(store, id);
       metaCache.set(id, meta);
@@ -2390,12 +2415,16 @@ async function apiPurgeOrphans(req, store) {
   }
   let deleted = 0;
   for (const k of toDelete) {
-    if (used >= DIAG_SUB_BUDGET) break; // 总预算含删除本身，防超 50 子请求红线
+    if (used >= DIAG_SUB_BUDGET) {
+      deferred.push(k); // 总预算含删除本身，防超 50 子请求红线：未删的原样回传续调
+      continue;
+    }
     used++;
     await store.delete(k);
     deleted++;
   }
-  return json({ ok: true, deleted, skipped: ok.length - deleted });
+  // skipped 语义收窄为「确认不该删」（活书伴生对象 / 仍在章表内的正文）：预算裁剪的已挪进 deferred
+  return json({ ok: true, deleted, skipped: ok.length - deleted - deferred.length, deferred });
 }
 
 /* ---------------- OPDS 目录 / 整本导出（第三方阅读器通道） ----------------

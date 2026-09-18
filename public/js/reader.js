@@ -270,6 +270,9 @@ async function renderChapter(idx, restoreRatio) {
     // 恢复滚动到目标比例后再存进度：若在此处（滚动位置仍是 0）就保存，
     // 会把云端进度比例覆盖成 0（章节号对、比例丢——跨设备继续阅读会跳回章首）
     requestAnimationFrame(() => {
+      // 迟到帧守卫（L11）：后台标签页会暂停 rAF，切回时这一帧可能落在用户已翻过去的新章上，
+      // 把新章的滚动位置按旧章的 restoreRatio 拽走。判据与渲染守卫一致（书 + 章）。
+      if (state.book !== book || state.cur !== idx) return;
       const el = els.scroll;
       el.scrollTop = restoreRatio * (el.scrollHeight - el.clientHeight) || 0;
       saveProgress();
@@ -655,12 +658,12 @@ function saveProgress() {
   local.setProg(state.book.id, p);
   if (navigator.onLine === false) {
     // 离线：入队，回网自动上送
-    offline.queueProgress(state.book.id, p).catch(() => {});
+    offline.queueProgress(state.book.id, p, state.book.cleanVer).catch(() => {});
     return;
   }
   api
     .putProgress(state.book.id, { ch: p.ch, ratio: p.ratio })
-    .catch(() => offline.queueProgress(state.book.id, p).catch(() => {}));
+    .catch(() => offline.queueProgress(state.book.id, p, state.book.cleanVer).catch(() => {}));
 }
 
 function goto(idx) {

@@ -45,4 +45,4 @@ export const READ_DONE_RATIO = 0.9;
  *  都回落到这里 —— 默认值永远只有这一处真相。
  *  check.mjs 据此禁止 wrangler.toml [vars] 再写一份副本：副本的实际症状是「本地改了、线上没改」
  *  （测试与前端按新值走、生产仍读 wrangler.toml 旧值 → 线上莫名 413）。 */
-export const ENV_DEFAULT_KEYS = ['MAX_CHAPTER', 'MAX_UPLOAD'];
+export const ENV_DEFAULT_KEYS = ['MAX_CHAPTER', 'MAX_UPLOAD', 'TRASH_DAYS'];

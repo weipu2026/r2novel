@@ -1,4 +1,4 @@
-/* check.mjs — 跨平台门禁，`npm run check` 一次跑完两项：
+/* check.mjs — 跨平台门禁，`npm run check` 一次跑完五段：
  *   ① 语法门禁：node --check 递归遍历全仓库（跳过 node_modules / .git / .ui-tests / shots / .wrangler / data-*）
  *   ② 模块一致性：只查浏览器侧 public/**\/*.js —— node --check 只看语法，抓不到下面三类「运行时才炸」的缺陷，
  *      而且它们常常被 try/catch 吞成静默失败（页面零报错、功能静默失效），必须靠静态检查提前拦：
@@ -9,6 +9,10 @@
  *        c) upload/ 里绕过 ctx.host() 直接调用宿主能力（app.js 顶层函数 / init 注入的那批）
  *      已知边界（有意不处理，改动前先想清楚）：`export { default as X } from` 会被 exp.names 判成
  *      未导出而误报（exportsOf 只记 hasDefault 布尔）；`host()['showName']` 括号式访问绕过规则 c。
+ *   ③ 配置与常量一致性：CONST DUP（wrangler.toml [vars] 不得重复定义 shared-const 的默认值）
+ *      + ENV PARSE（禁止 Number(env.X || D)——非数字串变 NaN 使上限静默失效）
+ *   ④ 三端 store 原语一致性：生产 R2 / dev fs / 测试 memStore 的 async 方法集必须完全相同
+ *   ⑤ SW SHELL 双向比对（service worker 预缓存清单 ↔ 实际 import 图）
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -279,7 +283,11 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
   }
   for (const f of files) {
     const src = stripLits(fs.readFileSync(f, 'utf8'));
-    for (const mm of src.matchAll(/Number\(\s*env\.[A-Za-z_$][\w$]*\s*\|\|/g)) {
+    // 复查 P2-4：旧模式只认「Number( 紧跟 env.」一种形态，漏掉 process.env 前缀（dev-server 的
+    // PORT 就是一处漏网实例）、parseInt/parseFloat、`??` 兜底、`env?.X` 与 `env['X']` 取值。
+    // 判据核心不变：**env 取值表达式与 || / ?? 之间不允许有 `)`**（Number(env.X) || D 是正确写法）。
+    // 已知边界（有意不处理）：解构后再 Number(MAX || D) 静态不可判，靠 review。
+    for (const mm of src.matchAll(/(?<![A-Za-z_$.\]])(?:Number|parseInt|parseFloat)\(\s*(?:process\.)?\s*env\s*(?:(?:\?\.\s*|\.\s*)[A-Za-z_$][\w$]*\s*|\[[^\]\n]*\]\s*)(?:\|\||\?\?)/g)) {
       const ln = src.slice(0, mm.index).split('\n').length;
       say('ENV PARSE', `${path.relative(ROOT, f).split(path.sep).join('/')}:${ln} 用了 Number(env.X || D)：非数字串会变 NaN 使上限静默失效 → 改成 Number(env.X) || D`);
     }

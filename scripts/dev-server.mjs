@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC = path.join(ROOT, 'public');
 const DATA = process.env.R2NOVEL_DATA || path.join(ROOT, 'data-dev');
-const PORT = Number(process.env.PORT || 8088);
+const PORT = Number(process.env.PORT) || 8088; // 复查 P2-4：与门禁 ENV PARSE 判据一致（非数字串回落默认）
 
 /* ---- 读取 .dev.vars（如有），用真实 ADMIN_PASSWORD/SESSION_SECRET 模拟线上 ---- */
 function loadDevVars() {

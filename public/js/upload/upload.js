@@ -13,21 +13,22 @@ import { api, fmtWords } from '../store.js';
 import { CHAPTER_MAX, BULK_CHAPTER_BATCH } from '../shared-const.js';
 import { toast } from '../ui.js';
 import { host } from './ctx.js';
+import { buildBookPayload } from './payload.js';
 import * as upSession from './session.js';
 
 function collectPayload(session) {
   const preview = session.preview; // 唯一调用点 onConfirm 必传 session 快照；不兜底当前会话，宁可 fail loud
   if (preview.chapters.length > CHAPTER_MAX) toast(`章节数超过上限 ${CHAPTER_MAX}，多余章节将被截断`, 2600);
-  return {
+  // 「字段从哪来」（DOM 输入框 + 会话快照）在此决定；「怎么组装」单点在 payload.js，
+  // 与批量导入路径共用（原先两份字面量已发生语义漂移，加字段漏一处是静默的）。
+  return buildBookPayload({
     title: els.upTitle.value.trim() || session.title,
     author: els.upAuthor.value.trim(),
     tags: host().parseTagInput(els.upTags.value),
     note: els.upNote.value.trim(),
-    chapters: preview.chapters.slice(0, CHAPTER_MAX).map((c) => c.title),
-    // 字数由 refreshPreviewStats 在每次编辑后实时维护（预览可编辑后它是唯一事实源）
-    wordCount: preview.words || 0,
-    cleanVer: 1,
-  };
+    chapters: preview.chapters,
+    words: preview.words,
+  });
 }
 
 export function setProg(pct, text) {

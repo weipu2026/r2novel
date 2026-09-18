@@ -248,7 +248,82 @@ if (problems) {
 }
 console.log(`MODULE_OK · ${publicFiles.length} files`);
 
-/* ══════════════ ③ SW SHELL 清单一致性 ══════════════
+/* ══════════════ ③ 配置与常量一致性 ══════════════
+ * 两条「手写镜像必漂移」的守卫：
+ *   CONST DUP：shared-const.js 已提供默认值的 env 键，不得再出现在 wrangler.toml [vars]。
+ *             副本的症状是「本地改了、线上没改」——改 shared-const 后测试/前端按新值走、
+ *             生产仍读 wrangler.toml 旧值（线上莫名 413）。默认值单点 + `env.X || DEFAULT` 回落。
+ *   ENV PARSE：禁止 `Number(env.X || DEFAULT)` —— `||` 只挡空字符串，挡不住非数字串
+ *             （`Number('2MB')` = NaN，`len > NaN` 恒 false → 上限静默消失且不报任何错）。
+ *             正确写法 `Number(env.X) || DEFAULT`（空串与非数字串都回落）。
+ */
+{
+  // 判据前去掉注释与字符串字面量 —— 本段自己的说明文案里就写着这个反例模式，不去掉必然自报。
+  // 替换保持字符数（非换行字符→空格），所以报错行号仍然准确。
+  const stripLits = (src) =>
+    src
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/(^|[^:\\])\/\/[^\n]*/gm, (m, p1) => p1 + ' '.repeat(m.length - p1.length))
+      .replace(/`(?:[^`\\]|\\.)*`/g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/'(?:[^'\\\n]|\\.)*'/g, (m) => ' '.repeat(m.length))
+      .replace(/"(?:[^"\\\n]|\\.)*"/g, (m) => ' '.repeat(m.length));
+  const scSrc = fs.readFileSync(path.join(PUBLIC, 'js', 'shared-const.js'), 'utf8');
+  const mk = scSrc.match(/ENV_DEFAULT_KEYS\s*=\s*\[([^\]]*)\]/);
+  const owned = mk ? [...mk[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]) : [];
+  if (!owned.length) say('CONST DUP', 'shared-const.js 里找不到 ENV_DEFAULT_KEYS（门禁失去依据，勿删该导出）');
+  const varsBlock = (fs.readFileSync(path.join(ROOT, 'wrangler.toml'), 'utf8').match(/\[vars\]([\s\S]*?)(?=\n\[|$)/) || [, ''])[1];
+  for (const k of owned) {
+    if (new RegExp(`^[ \t]*${k}[ \t]*=`, 'm').test(varsBlock)) {
+      say('CONST DUP', `wrangler.toml [vars] 重复定义 ${k}：默认值只在 shared-const.js 一处，副本会让生产与本地静默漂移`);
+    }
+  }
+  for (const f of files) {
+    const src = stripLits(fs.readFileSync(f, 'utf8'));
+    for (const mm of src.matchAll(/Number\(\s*env\.[A-Za-z_$][\w$]*\s*\|\|/g)) {
+      const ln = src.slice(0, mm.index).split('\n').length;
+      say('ENV PARSE', `${path.relative(ROOT, f).split(path.sep).join('/')}:${ln} 用了 Number(env.X || D)：非数字串会变 NaN 使上限静默失效 → 改成 Number(env.X) || D`);
+    }
+  }
+}
+
+/* ══════════════ ④ 三端 store 原语一致性 ══════════════
+ * 同一份 store 契约有三个实现：生产 R2（src/worker.js）/ 本地 dev（scripts/dev-server.mjs）/
+ * 测试内存（test/_harness.mjs）。任一端漏实现一个原语，症状都是**静默的**：测试失真
+ * （memStore 漏 CAS 原语 → CAS 路径零覆盖，实测那是"6 个用例齐挂"才反向发现的）。
+ * 做法：静态抽出三端 store 对象内的 async 方法名，要求三端集合完全一致。
+ */
+{
+  const mark = problems;
+  const targets = [
+    ['生产 R2', path.join(ROOT, 'src', 'worker.js'), /function\s+r2Store\s*\(/],
+    ['dev fs', path.join(ROOT, 'scripts', 'dev-server.mjs'), /const\s+fsStore\s*=\s*\{/],
+    ['测试 mem', path.join(ROOT, 'test', '_harness.mjs'), /function\s+memStore\s*\(/],
+  ];
+  const sets = [];
+  for (const [label, p, anchor] of targets) {
+    const src = fs.readFileSync(p, 'utf8');
+    const i = src.search(anchor);
+    if (i < 0) { say('STORE API', `${label}：找不到 store 定义锚点（${path.relative(ROOT, p)}）`); continue; }
+    const open = src.indexOf('{', i);
+    let depth = 0, close = -1;
+    for (let k = open; k < src.length; k++) {
+      if (src[k] === '{') depth++;
+      else if (src[k] === '}') { depth--; if (!depth) { close = k; break; } }
+    }
+    const block = close < 0 ? src.slice(open) : src.slice(open, close + 1);
+    sets.push({ label, names: new Set([...block.matchAll(/^[ \t]*async\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map((x) => x[1])) });
+  }
+  if (sets.length === targets.length) {
+    const base = sets[0];
+    for (const s of sets.slice(1)) {
+      for (const n of base.names) if (!s.names.has(n)) say('STORE API', `${s.label} 缺原语 ${n}（${base.label} 有）`);
+      for (const n of s.names) if (!base.names.has(n)) say('STORE API', `${base.label} 缺原语 ${n}（${s.label} 有）`);
+    }
+    if (problems === mark) console.log(`STORE_API_OK · 三端同构 · ${base.names.size} 原语（${[...base.names].join(' ')}）`);
+  }
+}
+
+/* ══════════════ ⑤ SW SHELL 清单一致性 ══════════════
  * SHELL 是离线壳的预缓存清单，历来靠手写维护——「新增模块忘了加进 SHELL」与
  * 「漏搬常量」同族（手写镜像必漂移），且离线用户只会表现为断网后打不开，平时毫无症状。
  * 这里不做手写镜像，而是**双向比对**：

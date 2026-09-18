@@ -125,6 +125,38 @@ export async function login(store) {
   return 'rn_session=' + m[1];
 }
 
+/* ---------------- 造数助手（新测试专用单点） ----------------
+ * 历史上 10 个测试文件各抄一份 makeReadyBook，签名（tags 在第 4 还是第 5 参）、正文文本、
+ * 是否 PUT raw、返回形状（{id,title} / {id,keys} / 裸 id）已参差 —— 新测试一律用这里的实现，
+ * 存量旧副本逐轮迁移，**不要再新增副本**。
+ * 返回 { id, title, keys }（keys = 章节 key 列表）：只取 id 的调用点写 `const { id } = …`。 */
+
+/** 只建书（草稿态，不含正文 / raw / 发布）——给需要走 bulk 等自定义路径的用例当起点。
+ *  @returns {Promise<{id: string, keys: string[]}>} */
+export async function makeDraftBook(store, cookie, title, n = 2, tags = []) {
+  const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));
+  const r = await call(
+    store,
+    req('/api/books', { method: 'POST', cookie, body: { title, author: '作者', tags, chapters, wordCount: n * 10, cleanVer: 1 } })
+  );
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  return { id: r.data.id, keys: Array.from({ length: n }, (_, i) => String(i + 1)) };
+}
+
+/** 造一本「可直接读」的书：建书 → 逐章 PUT 正文 → PUT raw → 发布。
+ *  @param n 章节数（默认 2） @param tags 标签数组（默认空）
+ *  @returns {Promise<{id: string, title: string, keys: string[]}>} */
+export async function makeReadyBook(store, cookie, title, n = 2, tags = []) {
+  const { id, keys } = await makeDraftBook(store, cookie, title, n, tags);
+  for (const k of keys) {
+    await call(store, req(`/api/books/${id}/chapters/${k}`, { method: 'PUT', cookie, body: '第' + k + '章正文' }));
+  }
+  await call(store, req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: new TextEncoder().encode('raw-' + title) }));
+  const r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  return { id, title, keys };
+}
+
 /* ---------------- v2 分片索引读写助手（测试观察/造数用） ----------------
  * v2 起 index 不再是单个 meta/index.json，而是 meta/idx/root.json + s<N>.json。
  * 测试要「看一眼书架摘要」或「整体改写摘要造数」，统一走这两个助手，禁止再硬编码 v1 key。

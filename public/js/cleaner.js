@@ -13,6 +13,11 @@
 
 import { FIT_CHAPTER_BYTES } from './shared-const.js';
 
+// 字数判据单点在 shared-text.js（router.js 的 wordsOf 是同一份）；
+// 再导出：cleaner.countWords 是 preview.js 与测试沿用的公开入口。
+import { countWords } from './shared-text.js';
+export { countWords };
+
 export const DEFAULT_CLEAN_OPTS = {
   stripRefMarks: true, // 去 [12]【3】 脚注数字标注
   stripMarkdown: true, // 去 Markdown 语法
@@ -258,12 +263,6 @@ export function cleanText(raw, opts = {}) {
 
   // 只清首尾空行，不清行首全角缩进（String.trim 会把 \u3000 一并吞掉）
   return lines.join('\n').replace(/^\n+|\n+$/g, '');
-}
-
-/** 字数统计（不含空白，中文习惯） */
-export function countWords(text) {
-  if (!text) return 0;
-  return String(text).replace(/\s/g, '').length;
 }
 
 /* ---------------- 智能分章 ---------------- */

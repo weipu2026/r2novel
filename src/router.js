@@ -28,6 +28,8 @@
  */
 
 import { CHAPTER_MAX, MAX_CHAPTER_BYTES, BULK_CHAPTER_BATCH, BATCH_BOOKS_MAX, MAX_UPLOAD_BYTES, EXPORT_MAX_CHAPTERS, TRASH_DAYS, READ_DONE_RATIO, TAG_MAX } from '../public/js/shared-const.js';
+// 纯文本判据（与前端同一份实现）—— 勿在此文件另写一遍，两端判据漂移是静默的
+import { normTitle, countWords as wordsOf } from '../public/js/shared-text.js';
 
 const SESSION_COOKIE = 'rn_session';
 
@@ -354,8 +356,8 @@ function newId() {
 
 const safeStr = (v, max = 200) => String(v == null ? '' : v).replace(/[\u0000-\u001f<>"'\\/]/g, '').slice(0, max).trim();
 
-/** 字数统计：去所有空白后计数（与上传/就地编辑/插入共用，唯一实现） */
-const wordsOf = (text) => String(text == null ? '' : text).replace(/\s/g, '').length;
+/** 字数统计（去所有空白后计数）—— 实现单点在 shared-text.js 的 countWords，与前端 cleaner 同一份；
+ *  此处以别名 wordsOf import，调用点（增量字数修正）保持原样。 */
 
 async function readJson(store, key, fallback) {
   const t = await store.getText(key);
@@ -987,8 +989,6 @@ async function readStatus(store, id) {
   return meta.status;
 }
 
-/** 书名规范化（去空白）→ 同名去重/更新提示用 */
-const normTitle = (s) => String(s || '').replace(/\s+/g, '');
 
 /* ---------------- 鉴权 API ---------------- */
 
@@ -1018,7 +1018,7 @@ async function apiLogin(req, env, store) {
     return json({ error: '口令错误' }, 401);
   }
   await bruteClear(req, store);
-  const days = Number(env.SESSION_DAYS || 30) || 30;
+  const days = Number(env.SESSION_DAYS) || 30;
   const payload = b64urlEncode(JSON.stringify({ exp: Date.now() + days * 86400000 }));
   const sig = await hmac(env.SESSION_SECRET || admin, payload);
   return json({ ok: true }, 200, {
@@ -1223,7 +1223,7 @@ async function apiPutChapter(req, env, store, id, key) {
     await dropBody(req);
     return json({ error: '章节不在章表中' }, 404);
   }
-  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
+  const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
   // 有界读取（含声明值快速拒绝）：旧实现先 req.arrayBuffer() 整体读入再判大小，超限时内存已吃满
   let buf;
   try {
@@ -1262,7 +1262,7 @@ async function apiPutChapters(req, env, store, id) {
   if (!meta) return json({ error: '书不存在' }, 404);
   if (meta.status === 'ready') return json({ error: '书已发布，请改用章节编辑接口' }, 409);
   const table = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
-  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
+  const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
   const items = [];
   let total = 0;
   for (const it of list) {
@@ -1290,7 +1290,7 @@ async function apiPutChapters(req, env, store, id) {
  * 解压护栏 = MAX_UPLOAD（解压产物超限即中断流，防 gzip 炸弹），解压后按明文落盘——
  * 存储格式不变（重洗读原件零改动，旧数据天然兼容）。 */
 async function apiPutRaw(req, env, store, id) {
-  const max = Number(env.MAX_UPLOAD || MAX_UPLOAD_BYTES);
+  const max = Number(env.MAX_UPLOAD) || MAX_UPLOAD_BYTES;
   // 声明值/流式超限都在 readBodyBytes 内处理（含 413 映射），此处不再自行 dropBody 排空——
   // 排空超大体等于把它读进内存，反而制造 OOM 面
   let buf;
@@ -1657,7 +1657,7 @@ async function apiPatchChapter(req, env, store, id, key) {
     ch.title = t ? safeStr(t, 120) : '第' + (i + 1) + '章';
   }
   if (hasContent) {
-    const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
+    const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
     if (enc.encode(body.content).byteLength > max) return json({ error: '章节超过上限' }, 413);
     const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
     const newWords = wordsOf(body.content);
@@ -1681,7 +1681,7 @@ async function apiInsertChapter(req, env, store, id) {
   const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
   const content = typeof body.content === 'string' ? body.content : '';
   if (!titleRaw && !content) return json({ error: '章节标题和正文不能都为空' }, 400);
-  const max = Number(env.MAX_CHAPTER || MAX_CHAPTER_BYTES);
+  const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
   if (enc.encode(content).byteLength > max) return json({ error: '章节超过上限' }, 413);
 
   if (!Array.isArray(meta.chapters)) meta.chapters = [];

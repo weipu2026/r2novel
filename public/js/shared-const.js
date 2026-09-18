@@ -39,3 +39,10 @@ export const TRASH_DAYS = 15;
  * （router.js apiProgressPut）各判一次，阈值漂移会出现「角标说读完了但镜像不刷新」的错位。
  * 取 0.9 而非 1：手机端末章末尾常带留白/padding，滚到底未必精确到 1，太严会导致读完也点不亮。 */
 export const READ_DONE_RATIO = 0.9;
+
+/** 由本文件提供默认值的 Worker 环境变量键（wrangler.toml [vars] 里**故意不写**对应项）。
+ *  router.js 一律写 `Number(env.X) || <本文件的默认值>`：env 未配置、或配了非数字串（如 "2MB"）
+ *  都回落到这里 —— 默认值永远只有这一处真相。
+ *  check.mjs 据此禁止 wrangler.toml [vars] 再写一份副本：副本的实际症状是「本地改了、线上没改」
+ *  （测试与前端按新值走、生产仍读 wrangler.toml 旧值 → 线上莫名 413）。 */
+export const ENV_DEFAULT_KEYS = ['MAX_CHAPTER', 'MAX_UPLOAD'];

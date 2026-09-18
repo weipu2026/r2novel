@@ -91,7 +91,6 @@ function draw(size, maskable) {
   };
   // 书页拆两页：左页右页宽度 = (w - spineW)/2
   const spine = maskable ? 0.05 : 0.045;
-  const gap = 0; // 页与脊无缝
   const pageLx = book.lx;
   const pageRx = book.lx + book.w - (book.w - spine) / 2 + spine * 0.02;
 

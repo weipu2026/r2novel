@@ -13,8 +13,8 @@ export const $$ = (sel, scope) => Array.from((scope || document).querySelectorAl
 /** HTML 转义（拼 innerHTML 时必须走它） */
 export const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-/** 书名归一化（判重用：忽略所有空白） */
-export const normTitle = (s) => String(s || '').replace(/\s+/g, '');
+/** 书名归一化（判重用：忽略所有空白）—— 实现单点在 shared-text.js（router.js 也 import 同一份） */
+export { normTitle } from './shared-text.js';
 
 /** 细线 SVG 图标（与阅读工具栏同款语言）：受控字面量，非用户输入，innerHTML 安全。
  *  放共享层的原因：**app.js（标签管理弹层）与 upload/（preview / editor）两端都在用** ——

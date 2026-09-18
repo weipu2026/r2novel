@@ -12,24 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { KEY } from '../src/router.js';
 import { TAG_MAX } from '../public/js/shared-const.js';
-import { memStore, req, call, login, readIdxBooks } from './_harness.mjs';
-
-async function makeReadyBook(store, cookie, title, n) {
-  const chapters = Array.from({ length: n }, (_, i) => '第' + (i + 1) + '章 章' + (i + 1));
-  let r = await call(
-    store,
-    req('/api/books', { method: 'POST', cookie, body: { title, author: '作者', tags: [], chapters, wordCount: n * 10, cleanVer: 1 } })
-  );
-  assert.equal(r.status, 200);
-  const id = r.data.id;
-  for (let i = 0; i < n; i++) {
-    await call(store, req(`/api/books/${id}/chapters/${i + 1}`, { method: 'PUT', cookie, body: '第' + (i + 1) + '章正文' }));
-  }
-  await call(store, req(`/api/books/${id}/raw`, { method: 'PUT', cookie, body: new TextEncoder().encode('raw-' + title) }));
-  r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
-  assert.equal(r.status, 200);
-  return { id };
-}
+import { memStore, req, call, login, readIdxBooks, makeReadyBook } from './_harness.mjs';
 
 const getProg = async (store, cookie, id) => (await call(store, req(`/api/progress/${id}`, { cookie }))).data;
 

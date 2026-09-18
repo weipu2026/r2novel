@@ -5,7 +5,7 @@ import { offline } from './offline.js';
 import * as reader from './reader.js';
 import { bindBusy, bindToast, busy, busyDone, toast } from './ui.js';
 import { exportBookTxt } from './exporter.js';
-import { els, $, $$, esc, normTitle, IC } from './dom.js';
+import { els, $, $$, esc, IC } from './dom.js';
 import { runBatched } from './batch-queue.js';
 import { init as initUpload, openUpload, rewashConfirm, openChapterEditor } from './upload/index.js';
 
@@ -802,54 +802,25 @@ async function openRead(id) {
 }
 
 /* ---------- 操作单（手机＝底部操作单 / 桌面＝贴着触发按钮的下拉） ---------- */
-function openSheet(b, anchor) {
-  const isPin = !!b.pinned;
+/** 操作单公共骨架：卡片操作单与顶栏「更多」菜单本是一对同构实现 ——
+ *  清空 → 标题 → 逐项按钮 → 取消 → 摘 hidden → 定位。收敛到此处的原因：
+ *  定位/关闭语义历来是高发事故点，两份各写一遍时「漏改一个分支」只在单路径显现。
+ *  按钮统一「先 closeSheet() 再执行 act()」——原 openSheet 是每个 act 自己关、openMoreSheet
+ *  是外层关，语义相同但一改就错开；现在由骨架保证。items: [{ text, act, danger? }] */
+function mountSheet(titleText, items, anchor) {
   els.sheet.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'sheet-title';
-  title.textContent = b.title;
+  title.textContent = titleText;
   els.sheet.appendChild(title);
-  const items = [
-    { text: '阅读', act: () => { closeSheet(); openRead(b.id); } },
-    {
-      text: readState(b) === 'done' ? '标记为未读完' : '标记为已读完',
-      act: async () => {
-        const next = readState(b) !== 'done';
-        closeSheet();
-        await markReadDone(b, next);
-      },
-    },
-    { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { closeSheet(); await safePatch(b.id, { pinned: !isPin }); } },
-    { text: b.star ? '取消星标' : '标为星标', act: async () => { closeSheet(); await safePatch(b.id, { star: !b.star }); } },
-    { text: '编辑信息（书名/作者/标签/备注）', act: () => { closeSheet(); openEditModal(b); } },
-    { text: '编辑章节（标题/正文/增删章）', act: () => { closeSheet(); openChapterEditor(b); } },
-    { text: '导出清洗后的 txt', act: () => { closeSheet(); exportBook(b); } },
-    { text: '重新清洗（用原件重排）', act: () => { closeSheet(); rewashConfirm(b); } },
-  ];
   for (const it of items) {
     const btn = document.createElement('button');
     btn.type = 'button';
+    if (it.danger) btn.className = 'danger';
     btn.textContent = it.text;
-    btn.addEventListener('click', it.act);
+    btn.addEventListener('click', () => { closeSheet(); it.act(); });
     els.sheet.appendChild(btn);
   }
-  const del = document.createElement('button');
-  del.type = 'button';
-  del.className = 'danger';
-  del.textContent = '移入回收站';
-  del.addEventListener('click', async () => {
-    closeSheet();
-    if (await confirmModal(`把《${b.title}》移入回收站？${TRASH_DAYS} 天内可恢复。`)) {
-      try {
-        await api.deleteBook(b.id);
-        toast('已移入回收站', 1600);
-        await loadShelf();
-      } catch (e) {
-        toast('删除失败：' + (e.message || e), 2500);
-      }
-    }
-  });
-  els.sheet.appendChild(del);
   const cancel = document.createElement('button');
   cancel.type = 'button';
   cancel.className = 'dim';
@@ -858,6 +829,35 @@ function openSheet(b, anchor) {
   els.sheet.appendChild(cancel);
   els.sheet.classList.remove('hidden');
   placeSheet(anchor); // 必须摘掉 hidden 之后再量尺寸，否则宽高都是 0
+}
+
+function openSheet(b, anchor) {
+  const isPin = !!b.pinned;
+  mountSheet(b.title, [
+    { text: '阅读', act: () => openRead(b.id) },
+    { text: readState(b) === 'done' ? '标记为未读完' : '标记为已读完', act: async () => { await markReadDone(b, readState(b) !== 'done'); } },
+    { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { await safePatch(b.id, { pinned: !isPin }); } },
+    { text: b.star ? '取消星标' : '标为星标', act: async () => { await safePatch(b.id, { star: !b.star }); } },
+    { text: '编辑信息（书名/作者/标签/备注）', act: () => openEditModal(b) },
+    { text: '编辑章节（标题/正文/增删章）', act: () => openChapterEditor(b) },
+    { text: '导出清洗后的 txt', act: () => exportBook(b) },
+    { text: '重新清洗（用原件重排）', act: () => rewashConfirm(b) },
+    {
+      text: '移入回收站',
+      danger: true,
+      act: async () => {
+        if (await confirmModal(`把《${b.title}》移入回收站？${TRASH_DAYS} 天内可恢复。`)) {
+          try {
+            await api.deleteBook(b.id);
+            toast('已移入回收站', 1600);
+            await loadShelf();
+          } catch (e) {
+            toast('删除失败：' + (e.message || e), 2500);
+          }
+        }
+      },
+    },
+  ], anchor);
 }
 
 /* ---------- 操作单定位 ----------
@@ -1065,37 +1065,13 @@ function exitBatchMode() {
 
 /** 顶栏「⋯」收纳菜单：低频治理入口统一收进来，顶栏只留「＋ 上传」+「⋯」 */
 function openMoreSheet(ev) {
-  els.sheet.innerHTML = '';
-  const title = document.createElement('div');
-  title.className = 'sheet-title';
-  title.textContent = '更多';
-  els.sheet.appendChild(title);
-  const items = [
+  mountSheet('更多', [
     { text: '回收站', act: openTrash },
     { text: '标签管理', act: openTagMgr },
     { text: '检查残留', act: openDiag },
     { text: '批量管理', act: enterBatchMode },
     { text: '退出登录', act: logout, danger: true },
-  ];
-  for (const it of items) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    if (it.danger) btn.className = 'danger';
-    btn.textContent = it.text;
-    btn.addEventListener('click', () => {
-      closeSheet();
-      it.act();
-    });
-    els.sheet.appendChild(btn);
-  }
-  const cancel = document.createElement('button');
-  cancel.type = 'button';
-  cancel.className = 'dim';
-  cancel.textContent = '取消';
-  cancel.addEventListener('click', closeSheet);
-  els.sheet.appendChild(cancel);
-  els.sheet.classList.remove('hidden');
-  placeSheet(ev && ev.currentTarget); // 桌面上贴住右上角那个 ⋯
+  ], ev && ev.currentTarget); // 桌面上贴住右上角那个 ⋯
 }
 
 function syncBatchBar() {

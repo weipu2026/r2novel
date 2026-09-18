@@ -71,6 +71,7 @@ test/                   146 项单测（14 文件；index-shards.test.mjs = 分�
 | `presetTags` / `presetTagsAt` / `presetTagsInflight` | 常用分类 chips + 去重/并发守卫 | preset 加载 | `At` 防同一波操作连发 GET；`Inflight` 防并发重复请求 |
 | `sheetAnchor` | 操作单锚定按钮 | placeSheet / closeSheet | 关闭时**必须清干净内联定位样式（left/top/transform）**，残留会盖住手机端响应式断点 |
 | `batchMode` | 书架多选模式 | 批量操作 | — |
+| `selected` | 批量模式下已勾选的书 id 集合（Set） | 卡片点击 / 键盘 Enter 切换、批量栏动作 | **筛选变化时必须与可见集合对账**（`pruneSelected()`）——它是批量删除的**直接依据**（按 `selected.size` 弹确认、按整个集合发送），残留的不可见 id 就是「看不见却删得掉」（L4）。原先它不在本表，正因如此长期无人察觉 |
 | `diagData` | 最近一次残留诊断结果 | 诊断页 | 删除/回收动作读取它，须与扫描结果同会话 |
 | `toastTimer` | toast 定时器 | ui.js 的 toast() | — |
 
@@ -134,24 +135,32 @@ test/                   146 项单测（14 文件；index-shards.test.mjs = 分�
 ## 4. 验证命令（改动后按此顺序，缺一不可）
 
 ```bash
-npm run check          # 门禁一次跑完三项，任一有问题即 CHECK_FAIL 且 RC=1
-#   ① 语法：全仓库 node --check（SYNTAX_OK · 42 files）
+npm run check          # 门禁一次跑完五段，任一有问题即 CHECK_FAIL 且 RC=1
+#   ① 语法：全仓库 node --check（SYNTAX_OK · 49 files）
 #      跳过 node_modules / data-* / .git / .ui-tests / .wrangler / shots
-#   ② 模块一致性（MODULE_OK · 20 files）：只查 public/**/*.js，补 ① 抓不到的运行时缺陷
+#   ② 模块一致性（MODULE_OK · 23 files）：只查 public/**/*.js，补 ① 抓不到的运行时缺陷
 #      a) 命名 import / 再导出的名字在目标模块里不存在（rewash.js 漏 export 事故）；
 #         副作用 import `import './x.js'` 与 `export * from './y.js'` 只校验**路径存在性**
 #      b) 全大写常量被引用却未 import / 未声明（files.js 漏 CHAPTER_MAX、app.js 悬空 IC 事故）；
 #         判据 = 名字总长 ≥4 **或** 它在 public/ 里确实被 export 过（后半句才抓得到 2 字符的 IC）
 #      c) upload/ 里绕过 ctx.host() 裸调宿主能力（含 app.js 顶层函数）；宿主能力名单从
 #         app.js 的 `initUpload({...})` 实参**自动抽取**，不再手写镜像
-#   ③ SW SHELL 双向比对（SHELL_OK）：public/ 全部静态资源必须在 SHELL 预缓存清单里
+#   ③ 配置与常量一致性：CONST DUP（wrangler.toml [vars] 不得再写一遍 shared-const 的默认值 ——
+#      副本会让「本地改了、线上没改」静默漂移）+ ENV PARSE（禁止 Number(env.X || D)：非数字串
+#      会变 NaN 使上限静默消失，应为 Number(env.X) || D）
+#   ④ 三端 store 原语一致性（STORE_API_OK）：生产 R2 / dev fs / 测试 memStore 的 async 方法集
+#      必须完全相同（任一端漏实现一个原语，症状是测试静默失真、零覆盖）
+#   ⑤ SW SHELL 双向比对（SHELL_OK）：public/ 全部静态资源必须在 SHELL 预缓存清单里
 #      （SW MISSING），SHELL 条目必须真实存在（SW UNKNOWN）——手写清单漂移在此被拦
-npm test               # 146 项单测（含 index-shards 分片专项 7 项）
-# UI 回归（每套独立数据目录、串行跑）：
+npm test               # 206 项单测（含 index-shards 分片专项、cleaner 清洗 32 项、#135 收口 3 项）
+# UI 回归（每套独立数据目录、串行跑）：一条命令 `.ui-tests/run-full-regression.sh`
+#   （启服 + 冒烟 + 15 套 UI 同一进程树；⚠️ 沙箱守卫会拦「一次删 >50 文件」，`data-*` 上千文件必撞
+#    → 需 CODEBUDDY_SAFE_DELETE_ENABLED=0。该变量写在脚本**内部 export 无效**（守卫在工具层看
+#    命令串），必须写成 `CODEBUDDY_SAFE_DELETE_ENABLED=0 bash .ui-tests/run-full-regression.sh`）
 # verify-fix-3bugs(27) / audit-render-window(5) / verify-readstate / audit-marks(21)
 # audit-star-chip(10) / verify-iter3(33) / verify-batch(12) / verify-prelaunch(17)
 # verify-audit(14) / verify-audit4(12) / verify-review-fixes(11) / verify-0915-fixes(7)
-# feat-ui(18)* / ui-desktop(20)*
+# verify-fix11-ui(13) / feat-ui(18)* / ui-desktop(20)*
 # * 这两套要求空书架，各自单独用一个干净数据目录
 npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 # CI 部署链：单测+门禁 → 建桶 → 部署 → 同步密钥 → 生产冒烟(55) → verify-deploy.mjs 哈希核验
@@ -223,3 +232,34 @@ npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 - 迁移写序：分片（含片 bak）与 v1 留档先落，**root 最后提交**（并发写中断会留下「root 说有 N 片、
   分片一个都没落」，而 root 看着合法 → 自愈链永不重迁 → 书架永久为空且发布必 500）
 - 新增 API 的 index 读写一律走 `openIndex` 三种模式，别绕过 handle 直接拼 key
+
+**CAS 与冲突重放（opLog）**：R2 没有事务，而「读—改—写」遍布索引与计数文件（两个标签页同时发布，
+后写者会静默吃掉前者的改动 → 其中一本从书架消失）。`store` 契约因此含两个乐观锁原语，**三端必须同构**
+（生产 R2 / dev fs / 测试 memStore；④ 门禁静态核对，缺一端即 FAIL）：
+- `getTextWithEtag(key)` → `{ text, etag }`：一次读拿两样，不多花子请求
+- `putTextIf(key, text, etag)` → 三态条件写：**字符串** = CAS（版本相等才写）、**null** = 不存在才写、
+  **undefined** = 无条件写；条件不满足返回 `null`（不抛错），调用方据此重读重放
+etag 必须**内容派生**（R2 普通 put = MD5 / fs·mem = sha1，内容不变则 etag 不变）——不能改成自增版本号：
+测试与脚本会直接改存储造数，内容派生才不会被绕过。CAS 是**可选能力**：老 store / 外部探针没实现时
+退化为无条件写（等价旧版行为）。
+
+`makeHandle().save()` 把本轮改动记进 `opLog`（upsert / patch / remove）；CAS 失败 → 重开索引拿新盘面 →
+按 opLog **重放**本轮的改动 → 再写一次。`replay` 参数决定策略：`true`（默认，最多 `IDX_SAVE_TRIES-1` 次）、
+`false`（不重放，冲突直接抛给调用方，全量模式端点用）、数字 `N`（预算敏感端点最多重放 N 次）。
+两条铁律：
+- **嵌套重放必须把 `replay` 带下去** —— 否则内层用默认值，限次形同虚设（实测会多写一次 root）
+- **落盘成功必须清空 `opLog`** —— 留着它，后续失败会把**陈旧意图**重放到新盘面上（R4）
+
+**写序判据（多对象写入，唯一依据是「哪一侧有自愈代码」）**：
+
+> 任何多对象写入，失败后的状态必须落在**自愈链已覆盖**的那一侧。落盘顺序的选择依据不是
+> 「哪个更符合直觉」，而是「**哪一侧有自愈代码**」。
+
+两种路径的正确写序**相反**，别照抄：
+- **首次创建**（指针文件原本不存在）：**数据先、指针后** —— 指针写失败 → 下次走重建/重迁，幂等自愈
+- **更新**（指针已存在）：**指针先、数据后** —— 数据写失败时指针指着的仍是旧内容，对账（`reconcileIdx`）可自愈
+
+反例（审计 P1-1）：把 root 与全部新分片塞进同一个 `Promise.all` → root 可能先落盘而分片未落。危害不在
+指针本身，而在**兜底逻辑会据此误判**：`reconcileIdx` ② 的判据是「指针说这本书在本片、而本片**确凿读到**
+却没有它 ⇒ 判为死指针并摘除」，于是那批书被当成死指针摘掉、残缺指针随即落盘固化
+（实测 501 本 → 251 本：文件还在，索引不认）。

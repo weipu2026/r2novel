@@ -7,9 +7,9 @@
  */
 import { els } from '../dom.js';
 import { api } from '../store.js';
-import { CHAPTER_MAX } from '../shared-const.js';
 import { busy, busyDone, toast } from '../ui.js';
 import { host } from './ctx.js';
+import { buildBookPayload } from './payload.js';
 import { hint, prepareFile } from './prepare.js';
 import { runPreview } from './preview.js';
 import { setProg, uploadChapters } from './upload.js';
@@ -134,15 +134,8 @@ async function importBatch(files) {
           fail++;
           continue;
         }
-        const payload = {
-          title,
-          author,
-          tags,
-          note,
-          chapters: preview.chapters.slice(0, CHAPTER_MAX).map((c) => c.title),
-          wordCount: preview.words || 0,
-          cleanVer: 1,
-        };
+        // 字段来源（文件解析值，非 DOM）在此决定；组装单点在 payload.js，与单文件上传同一份
+        const payload = buildBookPayload({ title, author, tags, note, chapters: preview.chapters, words: preview.words });
         const created = await api.createBook(payload);
         if (created.duplicate && created.needCreate && created.book) {
           skip++; // 同名 → 跳过（批量不弹窗确认）

@@ -1925,7 +1925,14 @@ async function apiBatchBooks(req, store) {
 
   let patchSkip = 0;
   if (patches.size) {
-    for (const [id, p] of patches) idx.patch(id, (b) => ({ ...b, ...p }));
+    // 复查 P3（R2 同型残留窗口）：inShelf 守卫（上方 idx.get）到这里的 patch 之间隔着
+    // 批量 meta 读+写（2N 个子请求），期间书被并发软删摘出索引时 idx.patch 会抛非冲突错
+    // → 顶层兜底 500，而 meta 已写完（响应说失败、盘上已改）。与 syncIndexAfterEdit 的
+    // 守卫（2026-09-17 二次复查 R2）对齐：跳过且不计入 updated。
+    for (const [id, p] of patches) {
+      if (!idx.get(id)) { patchSkip++; continue; }
+      idx.patch(id, (b) => ({ ...b, ...p }));
+    }
     // 重放时书被并发删除 → 该 patch 被跳过（F2）→ 不能计入 updated，否则文案与实际盘面不符
     // （2026-09-17 二次复查 R5）
     // replay:1：预算只按「一次重放」预扣，次数必须一起限死（R3）；第二次冲突冒成 409 让客户端重试
@@ -2046,8 +2053,15 @@ async function apiTagsMerge(req, store) {
   }
   if (writes.length) await Promise.all(writes);
 
+  // 复查 P3（R2 同型残留窗口）：从 hit 过滤到下面的 patch 之间隔着批量 meta 读+写，
+  // 期间书被并发软删摘出索引时 idx.patch 会抛非冲突错 → 顶层兜底 500，而 meta 已写完
+  // （响应说失败、盘上已改）。与 syncIndexAfterEdit 的守卫（R2）对齐：跳过且不计入 updated。
+  let mergeSkip = 0;
   if (patches.size) {
-    for (const [id, p] of patches) idx.patch(id, (x) => ({ ...x, ...p }));
+    for (const [id, p] of patches) {
+      if (!idx.get(id)) { mergeSkip++; continue; }
+      idx.patch(id, (x) => ({ ...x, ...p }));
+    }
     try {
       // 全量模式**不自己做冲突重放**：重放开销（重读 root+K 片 + 重写）在 K 大时会把 50 子请求
       // 顶破，反而拿不到能续调的响应。本端点本来就按 remaining 分段推进、前端循环到 remaining=0
@@ -2060,7 +2074,7 @@ async function apiTagsMerge(req, store) {
       return json({ ok: true, updated: 0, remaining: hit.length, retry: true });
     }
   }
-  return json({ ok: true, updated: patches.size, remaining: Math.max(0, hit.length - targets.length) });
+  return json({ ok: true, updated: patches.size - mergeSkip, remaining: Math.max(0, hit.length - targets.length) });
 }
 
 /* ---------------- 回收站 API ---------------- */
@@ -2768,8 +2782,15 @@ export async function handleRequest(req, env, store) {
     try {
       return await handleApi(req, env, store, url, p);
     } catch (e) {
+      // 复查 P3（精确化）：内部异常 message 只对**已认证**请求透传——泄露面在 /api/login
+      // 这类鉴权之前的路径（未认证者也可能读到分片损坏/key 越界等运维细节）；站长本人
+      // （单管理员站）仍要看到真实错误，F4 的初衷就是「前端能展示真实错误」，有测试护栏
+      // （review-fix9 F4 / index-shards 写序两处）。真实堆栈进日志；409 判据保留
+      // （IDX_CONFLICT 的 message 无害，且客户端要靠 409 重试）。
+      const authed = await verifyCookie(req, env).catch(() => false);
+      console.error('[api] 未捕获异常:', e && e.stack ? e.stack : e);
       return json(
-        { error: '请求处理失败：' + (e && e.message ? e.message : String(e)) },
+        { error: authed && e && e.message ? e.message : '服务器内部错误' },
         isIdxConflict(e) ? 409 : 500
       );
     }

@@ -281,15 +281,34 @@ async function logout() {
   try {
     await api.logout();
   } catch (e) {
+    // 复查 P2-2：会话**本就无效**（cookie 过期/服务端换了密钥）时，服务端鉴权检查在 logout
+    // 路由之前（router.js 的 verifyCookie 先行），返回 401 且不带 Set-Cookie → 重试永远 401，
+    // 卡在旧数据书架上只能手动刷新。这种「已经登不进去」的 401 视同登出成功；
+    // 其余错误才留守重试（M6 语义不变）。
+    if (e instanceof ApiError && e.status === 401) return finishLogout();
     // M6：清 cookie 只能靠这次请求成功（Set-Cookie 由服务端下发、HttpOnly）。
     // 失败必须让用户看见并留在原视图，否则「看着已登出、刷新又回到书架」，共享设备上是真实风险。
     toast('退出登录失败，请重试：' + (e.message || e), 3000);
     return;
   }
-  // L18：登出即清本地痕迹——整本离线正文、书架快照、进度镜像都是私人数据，
-  // 共享设备上不给下一个人留下「断网也能读」的后门。
+  await finishLogout();
+}
+
+/** L18 登出清痕迹 + 复查 P2-1：持久层（离线正文/书架快照/进度镜像）与**内存态**都要清。
+ *  只清持久层的漏洞：换人登录后 loadShelf 往返窗口内会先看到前任的完整书卡；加载失败时
+ *  books.length>0 走「已有快照」分支（doLogin），**永久停留**在前任书架、错误态永不触发。
+ *  selected（批量栏计数）/ presetTags（上传页预设 chips）同理是跨会话残留。 */
+async function finishLogout() {
   await offline.clearAll().catch(() => {});
   local.clearAll();
+  batchMode = false;
+  selected.clear();
+  els.batchBar.classList.add('hidden');
+  books = [];
+  tagCache = null;
+  ui.page = 1;
+  presetTags = []; presetTagsAt = 0; presetTagsInflight = null;
+  els.grid.innerHTML = '';
   showView('login');
 }
 

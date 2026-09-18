@@ -143,23 +143,144 @@ test('分章：自定义正则（2 捕获组）', () => {
   assert.equal(r.chapters[0].title, '=== 第一卷 山间 ===');
 });
 
+/* 2 章 GBK 样本（码位手工核验）：'第一章 中文\n这是测试。\n第二章 小字\n这是测试。'
+ *   第B5DA 一D2BB 章D5C2 空格20 中D6D0 文CEC4 \n0A
+ *   这D5E2 是CAC7 测B2E2 试CAD4 。A1A3 \n0A
+ *   第B5DA 二B6FE 章D5C2 空格20 小D0A1 字D7D6 \n0A
+ *   这D5E2 是CAC7 测B2E2 试CAD4 。A1A3
+ * 末章刻意带正文：只有标题行、正文为空的章会被 L1 丢弃，本样本断言的是分章本身。
+ * 截断用例（M3）在同一份字节上砍末字节。 */
+const GBK_TWO_CH = Uint8Array.from([
+  0xb5, 0xda, 0xd2, 0xbb, 0xd5, 0xc2, 0x20, 0xd6, 0xd0, 0xce, 0xc4, 0x0a,
+  0xd5, 0xe2, 0xca, 0xc7, 0xb2, 0xe2, 0xca, 0xd4, 0xa1, 0xa3, 0x0a,
+  0xb5, 0xda, 0xb6, 0xfe, 0xd5, 0xc2, 0x20, 0xd0, 0xa1, 0xd7, 0xd6, 0x0a,
+  0xd5, 0xe2, 0xca, 0xc7, 0xb2, 0xe2, 0xca, 0xd4, 0xa1, 0xa3,
+]);
+
 test('processBook：一次到位（bytes → 章节+字数）', { skip: !GBK }, () => {
-  // GBK 样本（码位手工核验）：'第一章 中文\n这是测试。\n第二章 小字'
-  //   第B5DA 一D2BB 章D5C2 空格20 中D6D0 文CEC4 \n0A
-  //   这D5E2 是CAC7 测B2E2 试CAD4 。A1A3 \n0A
-  //   第B5DA 二B6FE 章D5C2 空格20 小D0A1 字D7D6
-  const bytes = Uint8Array.from([
-    0xb5, 0xda, 0xd2, 0xbb, 0xd5, 0xc2, 0x20, 0xd6, 0xd0, 0xce, 0xc4, 0x0a,
-    0xd5, 0xe2, 0xca, 0xc7, 0xb2, 0xe2, 0xca, 0xd4, 0xa1, 0xa3, 0x0a,
-    0xb5, 0xda, 0xb6, 0xfe, 0xd5, 0xc2, 0x20, 0xd0, 0xa1, 0xd7, 0xd6,
-  ]);
-  const r = processBook(bytes, { fallbackTitle: '中文' });
+  const r = processBook(GBK_TWO_CH, { fallbackTitle: '中文' });
   assert.equal(r.encoding, 'gb18030');
   assert.equal(r.chapters.length, 2);
   assert.equal(r.chapters[0].title, '第一章 中文');
   assert.equal(r.chapters[1].title, '第二章 小字');
   assert.ok(r.chapters[0].content.includes('这是测试'));
+  assert.ok(r.chapters[1].content.includes('这是测试'));
   assert.ok(r.words > 0);
+});
+
+/* ---- #134 清洗组回归（M3 / M4 / M5 / L1 / L2 / L3） ---- */
+
+test('编码：UTF-8 混一个非法字节不再整本归零（M3）', () => {
+  const good = new TextEncoder().encode(
+    '第一章 测试\n正文内容写得很长，汉字很多很多。\n第二章 继续\n这里还有更多汉字内容。'
+  );
+  const bytes = new Uint8Array(good.length + 1);
+  bytes.set(good.subarray(0, 20), 0);
+  bytes[20] = 0xff; // GB18030 的非法字节：三个 fatal 解码器会全部抛异常
+  bytes.set(good.subarray(20), 21);
+  const r = detectEncoding(bytes);
+  assert.equal(r.encoding, 'utf-8');
+  assert.ok(r.text.length > 0, 'fatal 全失败时不能返回空文本（旧实现返回 "" → 整本归零）');
+  assert.equal(r.replaced, 1);
+  // 手动切换编码是最后的自救手段，同样不能被 fatal 锁死
+  for (const lab of ['utf-8', 'gb18030', 'big5']) {
+    assert.ok(decodeWith(bytes, lab).length > 0, lab + ' 的宽容解码应有输出');
+  }
+  const pb = processBook(bytes, { fallbackTitle: 'X' });
+  assert.equal(pb.chapters.length, 2);
+  assert.ok(pb.words > 0);
+});
+
+test('编码：GBK 尾部截断（悬空多字节）仍能识别（M3）', { skip: !GBK }, () => {
+  // 砍掉末字节 → 尾部悬空前导字节，三个 fatal 解码器会全抛（旧实现因此整本归零）
+  const cut = GBK_TWO_CH.slice(0, GBK_TWO_CH.length - 1);
+  const r = detectEncoding(cut);
+  assert.equal(r.encoding, 'gb18030');
+  assert.equal(r.replaced, 1);
+  assert.ok(r.text.length > 0, 'fatal 全失败时不能返回空串');
+  const pb = processBook(cut, { fallbackTitle: 'X' });
+  assert.equal(pb.chapters.length, 2, '截断也不该退化成整本一章');
+  assert.ok(pb.chapters[1].title.startsWith('第二章'));
+  assert.ok(pb.chapters[0].content.includes('这是测试'));
+});
+
+test('分章：两位数章号必须识别（含 〇 / 全角数字）', () => {
+  // 回归护栏：字符类曾漏掉 `+` 量词 → 章号只能吃一个字符，「第十一章」「第一〇章」全不识别，
+  // 而单字符章号的用例照旧通过（所以这条用例专盯「多字符章号」这一维）。
+  const cases = [
+    '第十一章 起始\n正文甲。\n第十二章 终局\n正文乙。',
+    '第一〇章 起始\n正文甲。\n第一一章 终局\n正文乙。',
+    '第１章 起始\n正文甲。\n第２章 终局\n正文乙。',
+    '第100章 起始\n正文甲。\n第101章 终局\n正文乙。',
+  ];
+  for (const t of cases) {
+    const r = splitChapters(t, {});
+    assert.equal(r.detected, 'cn', '未识别：' + t.slice(0, 5));
+    assert.equal(r.chapters.length, 2, '章数不对：' + t.slice(0, 5));
+  }
+});
+
+test('分章：标题带问号/叹号/省略号不被降级（M4）', () => {
+  const text =
+    '第一章 谁在那里？\n正文甲。\n' +
+    '第二章 轰！天崩地裂\n正文乙。\n' +
+    '第三章 魔宫建立，十二个时辰之后现身\n正文丙。';
+  const r = splitChapters(text, {});
+  assert.deepEqual(
+    r.chapters.map((c) => c.title),
+    ['第一章 谁在那里？', '第二章 轰！天崩地裂', '第三章 魔宫建立，十二个时辰之后现身']
+  );
+  assert.ok(r.chapters[0].content.startsWith('正文甲'), '副标题不该被复制进正文');
+});
+
+test('分章：紧贴正文的行仍判正文（M4 反向对照）', () => {
+  const text = '第一章 他推开门，走了进去。\n后面还有正文。\n第二章 他醒了。\n正文。';
+  const r = splitChapters(text, {});
+  assert.deepEqual(r.chapters.map((c) => c.title), ['第一章', '第二章']);
+  assert.ok(r.chapters[0].content.startsWith('他推开门'));
+});
+
+test('分章：Chapter / chapter / CHAPTER 都识别（M5）', () => {
+  for (const head of ['Chapter', 'chapter', 'CHAPTER']) {
+    const t = head + ' 1 A\nbody one.\n' + head + ' 2 B\nbody two.';
+    const r = splitChapters(t, {});
+    assert.equal(r.detected, 'en', head + ' 未识别');
+    assert.equal(r.chapters.length, 2);
+    assert.equal(r.chapters[0].title, head + ' 1 A');
+  }
+});
+
+test('分章：纯目录页不再产出 N 个空正文章（L1）', () => {
+  const toc = ['第一章 起始', '第二章 成长', '第三章 试炼', '第四章 转折', '第五章 终局'].join('\n');
+  const r = splitChapters(toc, { fallbackTitle: '目录书' });
+  assert.equal(r.chapters.length, 1);
+  assert.equal(r.chapters[0].title, '目录书');
+  assert.ok(r.chapters[0].content.includes('第一章 起始'));
+  assert.ok(r.chapters.every((c) => c.content.trim()), '不该有空正文章');
+});
+
+test('分章：只有个别章无正文时，其余章照常（L1 反向对照）', () => {
+  const text = '第一章 楔子\n第二章 起始\n正文甲。\n第三章 终局\n正文乙。';
+  const r = splitChapters(text, {});
+  assert.deepEqual(r.chapters.map((c) => c.title), ['第二章 起始', '第三章 终局']);
+  assert.ok(r.chapters[0].content.startsWith('正文甲'));
+});
+
+test('清理：cleanGarbled 不再删假名/谚文/罗马数字（L2）', () => {
+  const src = '第一章 你好\n「こんにちは」与「안녕하세요」以及 Ⅰ Ⅱ Ⅲ 结尾。';
+  const out = cleanText(src, { cleanGarbled: true, stripSite: false });
+  assert.ok(/[ぁ-んァ-ヴ]/.test(out), '假名（U+3040-30FF）应保留');
+  assert.ok(/[가-힣]/.test(out), '谚文（U+AC00-D7AF）应保留');
+  assert.ok(/[Ⅰ-Ⅿ]/.test(out), '罗马数字（U+2160-217F）应保留');
+  assert.ok(out.includes('こんにちは'));
+  assert.ok(out.includes('안녕하세요'));
+});
+
+test('清理：cleanGarbled 仍能清私用区与控制符（L2 反向对照）', () => {
+  const out = cleanText('第一\uE000章\u0007正文\uF8FF。', { cleanGarbled: true, stripSite: false });
+  assert.ok(!/[\uE000\uF8FF]/.test(out), '私用区仍应清除');
+  assert.ok(!/\u0007/.test(out), '控制符仍应清除');
+  assert.ok(out.includes('正文'));
 });
 
 test('countWords 不含空白', () => {

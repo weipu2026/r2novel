@@ -36,6 +36,18 @@ function getDecoder(label) {
   return decoders.get(label);
 }
 
+/* 宽容解码器（非 fatal）：非法字节解成 U+FFFD 而非抛异常。
+ * M3 用 —— fatal 试错全失败时不能让整本归零，也不能让手动切换编码同样无救。 */
+const lenientDecoders = new Map();
+function getLenientDecoder(label) {
+  try {
+    if (!lenientDecoders.has(label)) lenientDecoders.set(label, new TextDecoder(label));
+  } catch {
+    return null;
+  }
+  return lenientDecoders.get(label);
+}
+
 /** 可读性打分：汉字占比 + 常用字命中率 - 替换符/罕见区惩罚 */
 function readabilityScore(text) {
   if (!text) return 0;
@@ -100,31 +112,38 @@ export function detectEncoding(bytes) {
 
   const labels = ['utf-8', 'gb18030', 'big5'];
   const cands = labels.map((lab) => {
-    const d = getDecoder(lab);
-    if (!d) return { encoding: lab, ok: false, score: -9999, replaced: 0 };
-    try {
-      const text = d.decode(bin);
-      return { encoding: lab, ok: true, score: readabilityScore(text), replaced: (text.match(/\uFFFD/g) || []).length, text };
-    } catch {
-      return { encoding: lab, ok: false, score: -9999, replaced: 0 };
+    const strict = decodeOnce(bin, lab); // fatal 试错：成功 ⇒ 该编码下「完全合法」
+    let text = strict && strict.ok ? strict.text : null;
+    if (text == null) {
+      // M3：三路 fatal 全失败时**绝不能返回空文本**。含 0xFF（GB18030 非法字节）或下载被
+      // 截断（悬空多字节前导）时，三个 fatal 解码器全抛 → 旧实现返回 ''，预览页于是
+      // 「分章规则：未识别」+ 确认按钮永久禁用，而手动切换编码走 decodeWith 也是 fatal
+      // → 用户无任何站内自救途径。这里退回宽容解码（坏字节 → U+FFFD）交给打分排序：
+      // readabilityScore 对每个 U+FFFD 扣 60 分，足以分辨「整体乱码」与「仅个别坏字节」。
+      const len = getLenientDecoder(lab);
+      text = len ? len.decode(bin) : '';
     }
+    return { encoding: lab, score: readabilityScore(text), replaced: (text.match(/\uFFFD/g) || []).length, text };
   });
   // 稳定排序：同分时保持 utf-8 → gb18030 → big5 优先级（全 ASCII 文本默认 utf-8）
   cands.sort((a, b) => b.score - a.score);
-  const top = cands.find((c) => c.ok) || cands[0];
+  const top = cands[0]; // 每个候选都必有 text（fatal 失败已由宽容解码兜底）
   return {
-    encoding: top.ok ? top.encoding : 'utf-8',
-    text: top.ok ? top.text : '',
+    encoding: top.encoding,
+    text: top.text,
     replaced: top.replaced || 0,
-    score: top.ok ? top.score : 0,
+    score: top.score,
     candidates: cands.map(({ encoding, score, replaced }) => ({ encoding, score, replaced })),
   };
 }
 
-/** 按指定编码重解（预览页手动切换时用） */
+/** 按指定编码重解（预览页手动切换时用）
+ * fatal 失败时退回宽容解码：手动切换是用户最后的自救手段，不能也返回空串（M3）。 */
 export function decodeWith(bytes, label) {
   const r = decodeOnce(bytes, label);
-  return r && r.ok ? r.text : '';
+  if (r && r.ok) return r.text;
+  const len = getLenientDecoder(label);
+  return len ? len.decode(bytes) : '';
 }
 
 /* ---------------- 清理规则 ---------------- */
@@ -138,6 +157,12 @@ const KEEP_RE = new RegExp(
     '\\u3400-\\u4DBF\\u4E00-\\u9FFF' + // CJK 汉字
     '\\uF900-\\uFAFF\\uFE30-\\uFE4F' + // CJK 兼容
     '\\uFF00-\\uFFEF' + // 全角字符
+    // L2：假名 / 谚文 / 罗马数字原先不在白名单里 → cleanGarbled 默认开启时被**静默删除**
+    //     （「こんにちは」变空白、Ⅰ Ⅱ Ⅲ 消失）。这三段都是「成体系的文字」，不可能是
+    //     解码乱码（乱码产出的是散落的汉字/拉丁符号），加进白名单不削弱清乱码能力。
+    '\\u3040-\\u30FF' + // 日文假名（半角/全角片假名已含在 FF00 段）
+    '\\u1100-\\u11FF\\u3130-\\u318F\\uA960-\\uA97F\\uAC00-\\uD7AF\\uD7B0-\\uD7FF' + // 谚文（Jamo/兼容/音节）
+    '\\u2160-\\u217F' + // 罗马数字 Ⅰ Ⅱ Ⅲ …
     ']',
   'g'
 );
@@ -243,14 +268,21 @@ export function countWords(text) {
 
 /* ---------------- 智能分章 ---------------- */
 
-/* 正则必须含两个捕获组：标记本体、同行余下文字（章节名候选） */
+/* 章号字符集：半角数字 + 全角数字 ０-９ + 中文数字 + 〇（U+3007）。
+ * 单一来源，5 个检测器共用 —— 改一处即全体生效，不会「改了 4 个漏 1 个」。
+ * L3：全角数字与〇原先一律不识别 → 整本一章兜底。 */
+const CH_NUM = '[0-9\\uFF10-\\uFF19零〇一二三四五六七八九十百千万两]';
+
+/* 正则必须含两个捕获组：标记本体、同行余下文字（章节名候选）
+ * flags：附加的正则标志（默认无）。en 需要 i —— M5：Chapter/chapter/CHAPTER 混写极其常见，
+ *        缺了 i 会整本判「未识别」变一章，而该检测器的 label 本身就写着 Chapter X。 */
 export const DETECTORS = [
-  { id: 'cn', label: '第X章', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*[0-9零一二三四五六七八九十百千万两]+\\s*[章回节卷])\\s*(.*)' },
-  { id: 'cn_hui', label: '第X回', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*[0-9零一二三四五六七八九十百千万两]+\\s*回)\\s*(.*)' },
-  { id: 'cn_jie', label: '第X节', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*[0-9零一二三四五六七八九十百千万两]+\\s*节)\\s*(.*)' },
-  { id: 'cn_juan', label: '第X卷', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*[0-9零一二三四五六七八九十百千万两]+\\s*卷)\\s*(.*)' },
-  { id: 'en', label: 'Chapter X', src: '(?:^|\\n)\\s*(chapter\\s+[0-9ivxlcdm]+)\\s*(.*)' },
-  { id: 'vol', label: '卷X', src: '(?:^|\\n)\\s*(卷\\s*[0-9零一二三四五六七八九十百千万两]+)\\s*(.*)' },
+  { id: 'cn', label: '第X章', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*[章回节卷])\\s*(.*)' },
+  { id: 'cn_hui', label: '第X回', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*回)\\s*(.*)' },
+  { id: 'cn_jie', label: '第X节', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*节)\\s*(.*)' },
+  { id: 'cn_juan', label: '第X卷', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*卷)\\s*(.*)' },
+  { id: 'en', label: 'Chapter X', flags: 'i', src: '(?:^|\\n)\\s*(chapter\\s+[0-9ivxlcdm]+)\\s*(.*)' },
+  { id: 'vol', label: '卷X', src: '(?:^|\\n)\\s*(卷\\s*' + CH_NUM + '+)\\s*(.*)' },
 ];
 
 const DETECT_PREFIX = 5000000;
@@ -259,7 +291,7 @@ function scanDetectors(text) {
   let best = null;
   let bestCount = 0;
   for (const d of DETECTORS) {
-    const c = (text.match(new RegExp(d.src, 'gm')) || []).length;
+    const c = (text.match(new RegExp(d.src, 'gm' + (d.flags || ''))) || []).length;
     if (c > bestCount) {
       bestCount = c;
       best = d.id;
@@ -275,12 +307,21 @@ function detectBest(text) {
   return r.count >= 2 ? r.id : null;
 }
 
-/** 同行余下文字是否像章节名（而非正文首句） */
+/** 同行余下文字是否像章节名（而非正文首句）
+ *
+ * M4：原判据「含 。！？!?… 一律判正文」把大量合法标题打掉 —— 网文标题带问号/叹号极常见
+ * （「第一章 谁在那里？」「第二章 轰！天崩地裂」），降级后标题只剩「第X章」、副标题被
+ * 复制进正文首行并随之上传入库。改为判「像不像一句完整的话」：
+ *   · 「。」是正文句末标点，标题几乎不会以它收尾 → 出现即判正文；
+ *   · 顿号/逗号类 + 偏长（>16）→ 更像正文首句；标题即便带逗号也很短
+ *     （「风起云涌，少年踏上修仙路」12 字、「魔宫建立，十二个时辰之后现身」14 字）。
+ * 与旧判据的差异只在两处放宽（放行 ？！… 、逗号阈值 12→16）与一处收紧（「。」一律拒），
+ * 因此既修掉降级，又不放过「第一章 他推开门，走了进去。」这类紧贴正文的写法。 */
 function isLikelyTitle(s) {
   if (!s) return false;
   if (s.length > 40) return false;
-  if (/[。！？!?…]/u.test(s)) return false;
-  if (/[,，]/.test(s) && s.length > 12) return false;
+  if (s.includes('。')) return false;
+  if (/[，,、；;]/.test(s) && s.length > 16) return false;
   return true;
 }
 
@@ -300,6 +341,7 @@ export function splitChapters(text, opts = {}) {
 
   let patternId = opts.pattern || 'auto';
   let src;
+  let flags = '';
 
   if (patternId === 'auto') {
     const best = detectBest(raw);
@@ -316,13 +358,14 @@ export function splitChapters(text, opts = {}) {
 
   if (patternId === 'custom') src = opts.customSrc || '';
   else {
-    const det = DETECTORS.find((d) => d.id === patternId);
-    src = det ? det.src : DETECTORS[0].src;
+    const det = DETECTORS.find((d) => d.id === patternId) || DETECTORS[0];
+    src = det.src;
+    flags = det.flags || ''; // 例：en 需要 i（Chapter / chapter 混写）
   }
 
   let re;
   try {
-    re = new RegExp(src, 'gm');
+    re = new RegExp(src, 'gm' + flags);
   } catch {
     re = new RegExp(DETECTORS[0].src, 'gm');
   }
@@ -372,7 +415,17 @@ export function splitChapters(text, opts = {}) {
   chapters.push({ title: prevTitle, content: lastContent });
   if (preamble) chapters.unshift({ title: '引子', content: clean ? cleanText(preamble, cleanOpts) : preamble });
 
-  return { chapters, detected: patternId };
+  // L1：目录页（连续标记行之间没有任何正文）会产出 N 个「空正文」章 —— 入库后一堆点开是空白，
+  // 书架里也全是 0 字章。空章一律丢弃；若整篇都是目录（全空），退回「整本一章」，避免
+  // chapters:[] 让预览页的「确认入库」永久禁用（那是 M3 同类死胡同，只是成因不同）。
+  const kept = chapters.filter((c) => (c.content || '').trim());
+  if (!kept.length) {
+    const whole3 = clean ? cleanText(raw.trim(), cleanOpts) : raw.trim();
+    if (!whole3) return { chapters: [], detected: null };
+    return { chapters: [{ title: opts.fallbackTitle || '正文', content: whole3 }], detected: null };
+  }
+
+  return { chapters: kept, detected: patternId };
 }
 
 /** 一次到位：bytes → {encoding, chapters, detected, words, candidates}，供上传预览

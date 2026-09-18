@@ -1925,10 +1925,12 @@ async function apiBatchBooks(req, store) {
 
   let patchSkip = 0;
   if (patches.size) {
-    // 复查 P3（R2 同型残留窗口）：inShelf 守卫（上方 idx.get）到这里的 patch 之间隔着
-    // 批量 meta 读+写（2N 个子请求），期间书被并发软删摘出索引时 idx.patch 会抛非冲突错
-    // → 顶层兜底 500，而 meta 已写完（响应说失败、盘上已改）。与 syncIndexAfterEdit 的
-    // 守卫（2026-09-17 二次复查 R2）对齐：跳过且不计入 updated。
+    // 这里与上方的 inShelf 守卫读的是**同一份内存快照**：openIndex 在 inShelf 之前已打开，
+    // 两者之间只 await 各书 meta 写入（不触碰 shardBooks），而外部并发只能改盘面、改不了
+    // 这份快照 → 守卫恒不触发（2026-09-18 生产前审计以「移除守卫后并发软删用例仍全绿」坐实，
+    // 回归见 test/review-fix135.test.mjs 的「守卫当前不可达」用例）。
+    // 保留它只作防御：若日后 openIndex 改成惰性取片，这里会重新变成真实窗口。
+    // 真正覆盖「并发软删」的是下面 save() 的重放路径（F2 的 again.get 守卫）——它才读新盘面。
     for (const [id, p] of patches) {
       if (!idx.get(id)) { patchSkip++; continue; }
       idx.patch(id, (b) => ({ ...b, ...p }));
@@ -1937,7 +1939,9 @@ async function apiBatchBooks(req, store) {
     // （2026-09-17 二次复查 R5）
     // replay:1：预算只按「一次重放」预扣，次数必须一起限死（R3）；第二次冲突冒成 409 让客户端重试
     const r = await idx.save({ bak: true, replay: 1 });
-    patchSkip = r && r.skipped ? r.skipped.length : 0;
+    // 累加而非覆盖：上面守卫跳过的书没有进 opLog，因此不会出现在 r.skipped 里，两批互不重叠。
+    // 用覆盖的话，守卫一旦真的命中，它的计数就被静默抹掉 → updated 多报（2026-09-18 审计）。
+    if (r && r.skipped) patchSkip += r.skipped.length;
   }
   const updated = patches.size - patchSkip;
   return json({ ok: true, updated, skipped: remain - updated, deferred, ...(retry ? { retry: true } : {}) });
@@ -2053,9 +2057,9 @@ async function apiTagsMerge(req, store) {
   }
   if (writes.length) await Promise.all(writes);
 
-  // 复查 P3（R2 同型残留窗口）：从 hit 过滤到下面的 patch 之间隔着批量 meta 读+写，
-  // 期间书被并发软删摘出索引时 idx.patch 会抛非冲突错 → 顶层兜底 500，而 meta 已写完
-  // （响应说失败、盘上已改）。与 syncIndexAfterEdit 的守卫（R2）对齐：跳过且不计入 updated。
+  // 与 apiBatchBooks 同因：这里与 hit 过滤读的是同一份内存快照（openIndex 在过滤前已打开，
+  // 中间只 await 各书 meta 写入），外部并发改不了它 → 守卫恒不触发（2026-09-18 审计实测）。
+  // 保留作防御；真正覆盖并发软删的是下面 idx.save 的冲突 catch（replay:false → 交回客户端重发）。
   let mergeSkip = 0;
   if (patches.size) {
     for (const [id, p] of patches) {

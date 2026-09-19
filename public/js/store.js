@@ -302,21 +302,37 @@ export async function fetchChaptersAll(id, onProg, offlineSrc) {
   let cursor = 0;
   let done = 0;
   let missing = 0;
-  // 一次「非 ApiError」失败＝链路本身不通（fetch 直接 reject）→ 后续章节不再逐章空发请求，
-  // 直接走本地缓存。否则离线导出一本千章书会先发一千个注定失败的请求。
-  let netDown = false;
+  // 链路不通（fetch 直接 reject）时不再逐章空发请求——离线导出千章书会先发一千个注定失败的请求。
+  // 但「一次失败＝链路已断」是**过强**的判据：单次 reject（切网瞬间、边缘抖动、请求被取消）不足以
+  // 证明整条链路断了，一票否决会把一次瞬时抖动放大成「整本剩余章节全部判缺失」（实测 20 章只让
+  // 第 1 次失败 → 13 章被判缺失，请求数从 20 掉到 8）。所以：
+  //   · 连续 NET_DOWN_AFTER 次非 ApiError 失败才判定断链（成功一次即清零；ApiError 说明服务端
+  //     有响应、链路是通的，同样清零）；
+  //   · 判定后也不是永久放弃：每 NET_PROBE_EVERY 章放一次**真实探测请求**，成功即恢复网络路径。
+  const NET_DOWN_AFTER = 4;
+  const NET_PROBE_EVERY = 12;
+  let netFails = 0; // 连续的非 ApiError 失败数
+  let netDown = false; // 已判定断链：暂停逐章请求，只留周期探测
+  let probes = 0; // 断链后的探测计数
   await Promise.all(
     Array.from({ length: Math.min(CONC, n) }, async () => {
       while (true) {
         const idx = cursor++;
         if (idx >= n) break;
         const key = chapters[idx].key;
+        // 断链后每 NET_PROBE_EVERY 章放一次真实请求：网络恢复了就及时回到网络路径，
+        // 而不是拿本地缓存拼完剩下的几百章。（++probes 而非 probes++：置位后紧接着的那一章
+        // 不探测，否则等于判据没生效。）
+        const probe = netDown && ++probes % NET_PROBE_EVERY === 0;
         try {
-          if (netDown) throw new Error('offline');
+          if (netDown && !probe) throw new Error('offline');
           texts[idx] = await api.chapter(id, key, meta.cleanVer || 1);
+          netFails = 0;
+          netDown = false; // 探测成功（或本就在网络路径）→ 链路可用，回到逐章请求
         } catch (e) {
           if (e instanceof ApiError && e.status === 401) throw e;
-          if (!(e instanceof ApiError)) netDown = true;
+          if (e instanceof ApiError) netFails = 0; // 服务端有业务响应 → 链路是通的
+          else if (++netFails >= NET_DOWN_AFTER) netDown = true;
           // 单章失败 → 先看本地整本缓存里有没有这一章（离线导出的关键一步）
           const off = offChapter ? await offChapter(key) : null;
           if (off != null) {

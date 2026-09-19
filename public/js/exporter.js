@@ -5,7 +5,10 @@ import { fetchChaptersAll } from './store.js';
 import { offline } from './offline.js';
 import { downloadText, downloadBlob } from './ui.js';
 
-/** 拉全章 → 拼 txt → 触发浏览器下载。返回书名。 */
+/** 拉全章 → 拼 txt → 触发浏览器下载。返回 { title, missing }。
+ *  missing 必须回传：客户端兜底路径可能拉不齐章（离线 / 网络抖动），此前只 console.warn、
+ *  返回值里也不含它 → 调用处照样提示「已导出」，用户拿到一本大量缺章的 txt 却以为成功。
+ *  服务端流式端点（首条路径）是整本一次性生成，不存在缺章 → missing 恒为 0。 */
 export async function exportBookTxt(id, onProg) {
   try {
     const r = await fetch(`/export/${encodeURIComponent(id)}.txt`);
@@ -15,7 +18,7 @@ export async function exportBookTxt(id, onProg) {
       const head = await blob.slice(0, 4096).text(); // 书名只从头 4KB 的第一行取
       const title = (head.split('\n', 1)[0] || '').trim() || 'book';
       downloadBlob(blob, title + '.txt');
-      return title;
+      return { title, missing: 0 };
     }
     // 404（未发布/半成品）等情况 → 落到客户端兜底
   } catch {
@@ -38,5 +41,5 @@ export async function exportBookTxt(id, onProg) {
   });
   downloadText(parts.join('\n'), (meta.title || 'book') + '.txt');
   if (missing) console.warn(`导出《${meta.title}》有 ${missing} 章拉取失败（对应章节为空），可稍后重试`);
-  return meta.title;
+  return { title: meta.title, missing };
 }

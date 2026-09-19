@@ -1342,6 +1342,18 @@ async function apiUpdateChapters(req, env, store, id) {
       const n = Number(c.key);
       if (Number.isInteger(n) && n > maxNum) maxNum = n;
     }
+    // ⚠️ replace 遗留的孤儿 key 必须一并避让：孤儿正文还在盘上（分批清理没清完，ORPHAN_BATCH=24），
+    // 新章的 key 若落回那些 key，下一次 sweep（publish / 目录读取）会把**刚上传的新章正文**当成
+    // 孤儿删掉，而章表仍引用它们 → 阅读 404。实测：60 章 replace 成 10 章后直接 append 50 章，
+    // 新章 35..58 共 24 个正文被删（章号完全正常，是「重洗减章数 + 没清完就补章」这个常规组合）。
+    // 两层都要做：先尽力清干净释放 key 空间，清不掉（存储故障）时靠下面的避让兜住新章。
+    if (Array.isArray(meta.orphans) && meta.orphans.length) {
+      await sweepOrphans(store, meta, Infinity).catch(() => {});
+      for (const k of Array.isArray(meta.orphans) ? meta.orphans : []) {
+        const n = Number(k);
+        if (Number.isInteger(n) && n > maxNum) maxNum = n;
+      }
+    }
     const startKey = Math.max(oldCh.length + 1, maxNum + 1);
     const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
     meta.chapters = oldCh.concat(add);
@@ -1477,6 +1489,9 @@ async function apiBookMeta(store, id) {
       const again = await getWithEtag(store, KEY.book(id));
       const fresh = again ? tryParseJson(again.text) : null;
       if (!fresh) break; // 期间书被删了 → 不再写回
+      // 并发 replace/publish 把 status 改回了 creating：既不能用这份半成品盘面写回，更不能把它
+      // 当 ready 返回（客户端会拿着半成品章表去读，读到的章 404）。判据与函数开头保持一致 → 409。
+      if (fresh.status !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
       meta = fresh;
       etag = again.etag;
       if (!Array.isArray(meta.orphans) || !meta.orphans.length) break; // 新盘面已无孤儿
@@ -1807,19 +1822,39 @@ async function apiProgressPut(req, store, id) {
   const baseAt = Number(body.baseAt) || 0;
   const clientAt = Number(body.updatedAt) || 0;
   const clientVer = Number(body.cleanVer) || 0;
-  if (hasBase || clientAt || clientVer) {
-    const prev = await store.getText(KEY.progress(id)).catch(() => null);
-    const pv = tryParseJson(prev);
-    const prevAt = pv ? Number(pv.updatedAt) || 0 : 0;
-    if (pv && clientAt && prevAt > clientAt) return json({ ok: true, skipped: 'stale', prog: pv });
-    if (hasBase && prevAt > baseAt) return json({ ok: true, skipped: 'occ', prog: pv });
-    if (clientVer) {
-      const m = await readBook(store, id).catch(() => null);
-      if (m && Number(m.cleanVer || 1) !== clientVer) return json({ ok: true, skipped: 'cleanVer' });
+  let data;
+  if (!hasBase && !clientAt && !clientVer) {
+    // 一个对账字段都不带 → 无条件覆盖：老客户端与外部探针的行为**完全不变**（连读子请求数都一致）
+    data = { ch, ratio, updatedAt: Date.now() };
+    await store.putText(KEY.progress(id), JSON.stringify(data));
+  } else {
+    // 带了对账字段 → 读—判—写必须**原子**。原实现是「读 → 判 → 无条件写」，属 TOCTOU：两个并发
+    // 请求可以都读到同一个 prevAt、都通过检查、都写，后写者胜 —— 跨设备覆盖的窗口原封不动留着。
+    // progress 本身支持 putTextIf（CAS，条件由存储端求值、不额外产生读子请求），冲突就重读重判：
+    // 三个判据只用服务端时间与服务端内容版本，重放幂等，不放大任何副作用。
+    for (let attempt = 0; ; attempt++) {
+      const got = await getWithEtag(store, KEY.progress(id));
+      const pv = got ? tryParseJson(got.text) : null;
+      const prevAt = pv ? Number(pv.updatedAt) || 0 : 0;
+      if (pv && clientAt && prevAt > clientAt) return json({ ok: true, skipped: 'stale', prog: pv });
+      if (hasBase && prevAt > baseAt) return json({ ok: true, skipped: 'occ', prog: pv });
+      if (clientVer) {
+        const m = await readBook(store, id).catch(() => null);
+        if (m && Number(m.cleanVer || 1) !== clientVer) return json({ ok: true, skipped: 'cleanVer' });
+      }
+      // updatedAt 每次重试都重取：用循环外那一份会让落盘时间**比并发写推进过的值更旧**，
+      // 时间轴倒退会让后续的 prevAt > baseAt 判据失去意义。
+      data = { ch, ratio, updatedAt: Date.now() };
+      // 文件不存在时 etag 传 null（仅当不存在才写）→ 正好挡住「另一个请求刚把它建出来」的竞态
+      const res = await putIf(store, KEY.progress(id), JSON.stringify(data), got ? got.etag : null);
+      if (res.ok) break;
+      if (attempt + 1 >= IDX_SAVE_TRIES) {
+        // 重试用尽（同一本书的写极端密集）：放弃这一次，但必须回传盘上真值让客户端对账 ——
+        // 否则客户端按响应推进基线、以为写成功了，下一次写入反而被「自己以为的版本」拒掉。
+        return json({ ok: true, skipped: 'occ', prog: pv });
+      }
     }
   }
-  const data = { ch, ratio, updatedAt: Date.now() };
-  await store.putText(KEY.progress(id), JSON.stringify(data));
 
   // 书架进度角标镜像：只在「换章」时写该书所在分片（单书模式）。章内滚动只写 progress 小文件（真值），
   // 不再写镜像 —— 消除写放大（千本规模分片≈150KB/次，长章滚几屏就是几十次），

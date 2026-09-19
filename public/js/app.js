@@ -1168,7 +1168,10 @@ async function batchRun(action, payload, confirmText) {
     return;
   }
   refreshPresetTags(true); // 标签可能变了：强制刷新 chips（不阻塞后面的书架刷新）
-  await loadShelf().catch((e) => handleAuth(e)); // 401 收敛到登录页；其余沿用「不打断结果提示」
+  // 书架刷新也可能 401（会话刚刚失效）：handleAuth 会收敛到登录页 → 其后不能再弹业务 toast，
+  // 否则用户在登录页上看到一条与鉴权无关的「完成 N 本」提示。其余错误沿用「不打断结果提示」。
+  const dead = await loadShelf().then(() => false).catch((e) => handleAuth(e));
+  if (dead) return;
   toast(fail ? `完成 ${ok} 本，${fail} 本未生效（可能不在书架或仍是半成品）` : `已更新 ${ok} 本`, 2600);
 }
 
@@ -1508,8 +1511,11 @@ async function onDiagBoxClick(e) {
 async function exportBook(b) {
   try {
     busy(0.02, `正在导出《${b.title}》…`);
-    const title = await exportBookTxt(b.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
-    toast(`《${title}》已导出`, 1800);
+    const { title, missing } = await exportBookTxt(b.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
+    // 缺章必须说出来：此前只 console.warn、返回值里也没有它，界面照样提示「已导出」→
+    // 用户拿到一本大量缺章的 txt 却以为成功（离线 / 网络抖动时最容易发生）。
+    if (missing) toast(`《${title}》已导出，但有 ${missing} 章未取到（可联网后重试）`, 3200);
+    else toast(`《${title}》已导出`, 1800);
   } catch (e) {
     toast('导出失败：' + (e.message || e), 2800);
   } finally {

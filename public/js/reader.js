@@ -651,8 +651,41 @@ function onScroll() {
   }
 }
 
+/** pagehide 专用：页面即将销毁时的**最后一次**落盘。不复用 saveProgress() 的两个理由：
+ *  ① 它把写交给串行队列（progFlight / progQueued），而队列的推进依赖 Promise 的 .finally ——
+ *     页面销毁后不保证执行，在途期间入队的那份待写会**永久丢失**；旧实现是立即 fire-and-forget，
+ *     虽然会与在途写并发，但至少发得出去（#138 的串行化把它换成了「可能永远不发」）。
+ *  ② 普通 fetch 在文档卸载时会被浏览器中止。
+ *  所以这里绕开队列，用 keepalive fetch 直发（浏览器保证文档销毁后仍把请求发完；请求体远低于 64KB 上限）。
+ *  ⚠️ 仍然**带上 baseAt** —— 绕开的是队列，不是并发控制。云端若已有他机的更新，这次照样被拒；
+ *  被拒时页面正在销毁、对账跑不了，但「云端保持对方的新位置」本就是正确结果。反过来若不带基线
+ *  无条件覆盖，就等于给「后台久置的旧标签页被关闭」开了一个覆盖新进度的后门，正是 #138 要修的事
+ *  （实测：verify-fix138 §2 的跨设备保护当场翻红）。
+ *  与在途写的自撞交给服务端的时间判据：两者都在飞时，后到的那个才可能被拒。 */
 function onHidden() {
-  saveProgress();
+  const book = state.book;
+  if (!book) return;
+  if (state.failedIdx !== null && state.failedIdx === state.cur) return; // 失败章不算读到
+  const ratio = curRatio();
+  if (ratio === null) return; // 阅读器已隐藏/未渲染：比例不可测，宁可不写也不写 0
+  const p = { ch: state.cur + 1, ratio, updatedAt: Date.now() };
+  local.setProg(book.id, p);
+  if (navigator.onLine === false) {
+    offline.queueProgress(book.id, p, book.cleanVer).catch(() => {});
+    return;
+  }
+  const occ = progBase.id === book.id && progBase.known ? { baseAt: progBase.at } : {};
+  try {
+    fetch('/api/progress/' + encodeURIComponent(book.id), {
+      method: 'PUT', // 与 api.putProgress 一致（路由只接受 PUT，POST 会 404）
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ch: p.ch, ratio: p.ratio, ...occ }),
+      credentials: 'same-origin',
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* 卸载路径：失败已无处可报（旧实现同样是 fire-and-forget） */
+  }
 }
 
 /** visibilitychange 处理器：**两个方向都要处理**。
@@ -686,9 +719,14 @@ const clampChapter = (x) => Math.max(0, Math.min(state.chapters.length - 1, Math
  *  serverProg 可由调用方直接传入（拒写响应里已带回真值，省一次读）。
  *  服务端更新了 → **位置与基线一起同步**：只推进基线不改位置的话，下一次写入会把这个已经
  *  过期的位置写上去，等于没修。 */
-async function syncFromServer(serverProg) {
+async function syncFromServer(serverProg, forBookId) {
   const book = state.book;
   if (!book) return;
+  // serverProg 是**产生这次拒绝的那本书**的进度（拒写响应带回），而 book 是**此刻**的当前书。
+  // 两者不同就整条丢弃——少了这道闸的后果是跨书污染：正在读 A、一次写在途时切到 B，A 的拒写
+  // 响应回来后会拿 A 的位置改写 B（云端进度 + 本地镜像 + 跳章三处都错，且持久化）。
+  // 注意下面那道 `state.book !== book` 挡不住它：入参路径没有 await，取 book 与用它落在同一 tick。
+  if (forBookId && forBookId !== book.id) return;
   if (!serverProg) {
     // 纯节流：频繁切标签页不重复发请求。真漏了一次也有自愈——写入会被服务端拒
     //（skipped:'occ'），那条路径带着真值回调进来，不受节流限制。
@@ -765,12 +803,14 @@ function drainProgress() {
         if (progBase.id === q.id) progBase = { id: q.id, at: Number(r.updatedAt) || 0, known: true };
         return;
       }
-      // 被拒＝另一台设备写过了 → 用响应里带回的真值立刻对账（位置与基线一起同步）
+      // 被拒＝另一台设备写过了 → 用响应里带回的真值立刻对账（位置与基线一起同步）。
+      // 必须传 q.id：这份 prog 属于**产生这次拒绝的那本书**，而用户此刻可能已经切到别的书
+      //（A 的写在途时返回书架开 B）。不传的话就会拿 A 的位置改写 B —— 云端、本地镜像、跳章三处全错。
       if (r && r.skipped === 'occ') {
         // 排队中的那份是「得知服务端更新之前」的位置，已过期 → 丢弃（否则对账完又用它盖回去）。
         // 只丢同一本书的：换书后队列里那本是另一本书的合法位置，不能连带丢掉。
         if (progQueued && progQueued.id === q.id) progQueued = null;
-        syncFromServer(r.prog).catch(() => {});
+        syncFromServer(r.prog, q.id).catch(() => {});
       }
     })
     .catch(() => offline.queueProgress(q.id, q.p, q.cleanVer).catch(() => {}))
@@ -889,8 +929,10 @@ async function exportCurrentText() {
   if (!book) return;
   busy(0.02, `导出《${book.title}》…`);
   try {
-    const title = await exportBookTxt(book.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
-    showTip('已导出《' + title + '》，可在下载中查看', 2000);
+    const { title, missing } = await exportBookTxt(book.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
+    // 缺章要说出来：此前只 console.warn，界面照样显示「已导出」→ 用户拿到大量缺章的 txt 却以为成功
+    if (missing) showTip(`已导出《${title}》，但有 ${missing} 章未取到`, 3000);
+    else showTip('已导出《' + title + '》，可在下载中查看', 2000);
   } catch (e) {
     showTip('导出失败：' + (e.message || e), 2800);
   } finally {

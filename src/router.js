@@ -1171,18 +1171,28 @@ async function sweepOrphans(store, meta, max = ORPHAN_BATCH) {
 /** 清一批孤儿正文（删除幂等，属副作用 → **不进** mutateMeta 的纯变换）→ 返回 { swept, left }：
  *  · swept = 本次确实删掉的 key 集合（据此从待清表里剔除，避免反复无效删）
  *  · left  = 没清掉的（存储故障时 = 全部，方向保守：继续登记，并让新章避让它们的 key）
- *  max 传 Infinity 表示「一次清完」（append 前要腾出完整 key 空间）。 */
-async function sweepOrphansBatch(store, id, keys, max) {
+ *  max 传 Infinity 表示「一次清完」（append 前要腾出完整 key 空间）。
+ *  liveKeys：**清完后仍会被章表引用的 key 集合**（append=现有章 key；replace=新表 key；
+ *  publish=现有章 key）。以「伪 chapters」传给 sweepOrphans，让它的活键防御在这里也生效 ——
+ *  #140 复查（F2）：tmp 不带 chapters 时防御恒空，历史脏数据里 orphans ∩ 章表重叠的 key 会被
+ *  误删正文（append 流程客户端不重传旧章 → 阅读 404）。 */
+async function sweepOrphansBatch(store, id, keys, max, liveKeys = null) {
   const pre = Array.from(new Set(Array.isArray(keys) ? keys : []));
   if (!pre.length) return { swept: new Set(), left: [] };
-  const tmp = { id, orphans: pre.slice() };
+  const live = Array.isArray(liveKeys) ? liveKeys : [];
+  const tmp = { id, orphans: pre.slice(), chapters: live.map((k) => ({ key: k })) };
   try {
     await sweepOrphans(store, tmp, max);
   } catch {
     return { swept: new Set(), left: pre }; // 删除失败：一个都不算已清
   }
   const left = Array.isArray(tmp.orphans) ? tmp.orphans : [];
-  return { swept: new Set(pre.slice(0, pre.length - left.length)), left };
+  // swept 按真实删除数从 pre 头部切（sweepOrphans 只删 cand 前缀）；防御剔掉的活键既没删也没留，
+  // 不落在这两类里 → 用「pre − left − live」算，而不是 pre.length − left.length（会把活键算成已删）。
+  const leftSet = new Set(left);
+  const liveSet = new Set(live);
+  const swept = new Set(pre.filter((k) => !leftSet.has(k) && !liveSet.has(k)));
+  return { swept, left };
 }
 
 /* ---------------- 书架 / 建书 ---------------- */
@@ -1414,7 +1424,10 @@ async function apiUpdateChapters(req, env, store, id) {
   const newKeySet = op === 'append' ? null : new Set(chapters.map((_, i) => String(i + 1)));
   const preKeys = new Set(Array.isArray(meta.orphans) ? meta.orphans : []);
   if (newKeySet) for (const c of oldCh) if (!newKeySet.has(c.key)) preKeys.add(c.key);
-  const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), op === 'append' ? Infinity : ORPHAN_BATCH);
+  // 活键 = 清完后**仍会被章表引用**的 key：append=现有章（一本都不删）；replace=新表 key。
+  // 传给 sweepOrphansBatch 让「活键防御」在这条路径也生效（F2，见该函数注释）。
+  const sweepLive = newKeySet ? Array.from(newKeySet) : oldCh.map((c) => c.key);
+  const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), op === 'append' ? Infinity : ORPHAN_BATCH, sweepLive);
 
   // 阶段 B（副作用，只做一次）：replace 的进度迁移（读—写 progress，best-effort，不进 CAS）。
   // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
@@ -1527,7 +1540,14 @@ async function apiPublish(req, env, store, id) {
     if (sampled[i] == null) return json({ error: `章节 ${samples[i]} 未上传，发布中止` }, 409);
   }
   // 阶段 A（副作用）：清一批孤儿正文 + 记下「已清掉 / 没清掉」两类 key（见 sweepOrphansBatch）
-  const sweptA = await sweepOrphansBatch(store, id, meta0.orphans, ORPHAN_BATCH);
+  // 活键 = 现有章表 key（publish 不动章表，凡被章表引用的正文一律不删，F2）
+  const sweptA = await sweepOrphansBatch(
+    store,
+    id,
+    meta0.orphans,
+    ORPHAN_BATCH,
+    (meta0.chapters || []).map((c) => c.key)
+  );
   const T2 = Date.now();
   // 阶段 B：CAS 写 meta。原来这条写是无条件整份覆盖 —— 与并发的就地编辑/批量标签撞上时，后写者会
   // 连**章表**一起写回旧版（并发删掉的章被复活）。改成 CAS 后冲突即重读重放，盘面收敛到最新。
@@ -1863,8 +1883,6 @@ async function apiInsertChapter(req, env, store, id) {
   if (afterKey && gAt === 0) return json({ error: '参照章节不存在' }, 404);
 
   const key = newId(); // 只生成一次：重放时若换 key，盘上会留下孤儿正文
-  const title = safeStr(titleRaw || '第' + (gAt + 1) + '章', 120);
-  await shiftProgressOnInsert(store, id, gAt); // 先迁移进度，再改章表（尽力而为，不进 CAS）
   await store.putText(KEY.text(id, key), content); // 空正文也落盘（阅读时提示无内容，不 404）
   const m = await mutateMeta(
     store,
@@ -1880,6 +1898,8 @@ async function apiInsertChapter(req, env, store, id) {
         at = j >= 0 ? j + 1 : arr.length;
       }
       at = Math.max(0, Math.min(at, arr.length));
+      // 缺省标题按**实际插入位**推导（纯内存，重放安全）：守卫读的 gAt 在重放后可能不再是真实位置
+      const title = titleRaw ? safeStr(titleRaw, 120) : '第' + (at + 1) + '章';
       arr.splice(at, 0, { key, title });
       meta.chapterCount = arr.length;
       meta.wordCount = (Number(meta.wordCount) || 0) + wordsOf(content);
@@ -1890,6 +1910,10 @@ async function apiInsertChapter(req, env, store, id) {
     g.cur
   );
   if (!m.ok) return metaFail(m);
+  // 进度迁移放在 CAS 成功之后、用**实际插入位** m.out.at（F4）：原先放在 CAS 之前用守卫读的
+  // gAt —— 重放后参照章被并发移动/删除时迁移阈值偏 1 章，且 409/冲突时进度被白迁。progress
+  // 与 meta 是两个文件，迁移只读进度自身、与 meta 写序无关 → 放成功之后语义不变、失败面更小。
+  await shiftProgressOnInsert(store, id, m.out.at);
   await syncIndexAfterEdit(store, m.meta);
   return json({ ok: true, key, title: m.meta.chapters[m.out.at].title, chapterCount: m.out.count, cleanVer: m.meta.cleanVer });
 }

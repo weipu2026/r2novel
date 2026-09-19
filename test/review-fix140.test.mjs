@@ -259,3 +259,76 @@ test('护栏 mutateMeta：重试用尽 → 409（有界重试，不静默写回�
   const after = await rawMeta(store, id);
   assert.equal(after.chapters[0].title, '第1章 章1', '写不进去就不该有任何字段被改');
 });
+
+/* ───────── #140 复查 F2：批量清扫路径的活键防御（sweepOrphansBatch） ─────────
+ * sweepOrphans 的「活键防御」原本只在 apiBookMeta（直接传真 meta）生效；apiUpdateChapters /
+ * apiPublish 走 sweepOrphansBatch，它构造的 tmp 不带 chapters → 防御恒空。历史脏数据里
+ * orphans ∩ 章表重叠时，append 流程客户端不重传旧章正文 → 活章正文被误删、阅读 404。 */
+
+test('F2 append 清扫：孤儿表混入章表在用的 key → 批量路径也不得删在用正文', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id, keys } = await makeReadyBook(store, cookie, 'F2-append清扫', 3);
+
+  // 历史脏数据：孤儿表与章表重叠（keys[0] 既是「孤儿」又是活章）
+  const m = await rawMeta(store, id);
+  m.orphans = [keys[0]];
+  await store.putText(KEY.book(id), JSON.stringify(m));
+
+  const r = await updateChapters(store, cookie, id, { op: 'append', chapters: ['续章'] });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  // append 后书是 creating 态，GET 章会 409 → 直读存储验正文存活（这才是被清扫威胁的东西）
+  assert.equal(await store.getText(KEY.text(id, keys[0])), '第1章正文', 'append 不重传旧章 → 在用正文绝不能被阶段 A 清掉');
+  assert.ok(await store.getText(KEY.text(id, r.data.chapterKeys[0])), '新章正文已落盘');
+
+  const after = await rawMeta(store, id);
+  // append 分支不重建孤儿表（残留的活键由 apiBookMeta 的惰性清扫剔除——那里有防御，cand 全 live 时整表作废），
+  // 本用例的关键不变量是「在用正文不被删」，上面已直读存储验证
+  assert.equal(after.chapters.length, 4);
+});
+
+test('F2 replace 清扫：孤儿表混入新表仍在用的 key → 正文不得被阶段 A 删掉', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id, keys } = await makeReadyBook(store, cookie, 'F2-replace清扫', 3);
+
+  const m = await rawMeta(store, id);
+  m.orphans = [keys[0]];
+  await store.putText(KEY.book(id), JSON.stringify(m));
+
+  // 新表 5 章（key 1..5）→ keys[0]（=「1」）仍被新表引用
+  const r = await updateChapters(store, cookie, id, { op: 'replace', chapters: ['一', '二', '三', '四', '五'], wordCount: 100 });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(await store.getText(KEY.text(id, '1')), '第1章正文', '新表引用的正文不得被清扫删掉（creating 态直读存储验证）');
+  assert.equal(await store.getText(KEY.text(id, '2')), '第2章正文');
+});
+
+/* ───────── #140 复查 F4：插入的进度迁移移到 CAS 成功之后 ───────── */
+
+test('F4 插章：CAS 重试用尽（409）时进度不得被白迁 —— 迁移必须发生在 meta 写成功之后', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id, keys } = await makeReadyBook(store, cookie, 'F4-409不迁进度', 3);
+  await store.putText(KEY.progress(id), JSON.stringify({ ch: 3, ratio: 0.5, updatedAt: 100 }));
+
+  const origPutIf = store.putTextIf.bind(store);
+  store.putTextIf = async (k, s, etag) => (k === KEY.book(id) ? null : origPutIf(k, s, etag)); // meta 永远写不进去
+  const r = await insertChapter(store, cookie, id, { after: keys[0], title: 'X', content: 'Y' });
+  assert.equal(r.status, 409, JSON.stringify(r.data));
+
+  const prog = JSON.parse(await store.getText(KEY.progress(id)));
+  assert.equal(prog.ch, 3, 'meta 没写进去 → 插入没发生 → 进度不得被迁移（旧实现放在 CAS 之前 → ch 被白 +1 成 4）');
+});
+
+test('F4 插章：成功路径的进度迁移用实际插入位，行为与原先一致', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id, keys } = await makeReadyBook(store, cookie, 'F4-成功迁移', 3);
+  await store.putText(KEY.progress(id), JSON.stringify({ ch: 3, ratio: 0.5, updatedAt: 100 }));
+
+  const r = await insertChapter(store, cookie, id, { after: keys[0], title: '插入章', content: 'Y' });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  const prog = JSON.parse(await store.getText(KEY.progress(id)));
+  assert.equal(prog.ch, 4, '插入位在第 1 章后 → 原第 3 章顺移为第 4 章（正对照：迁移仍然发生）');
+  assert.equal(prog.ratio, 0.5);
+});

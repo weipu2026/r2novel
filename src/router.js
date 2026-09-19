@@ -183,6 +183,51 @@ async function putIf(store, key, text, etag) {
   return r ? { ok: true, etag: r.etag } : { ok: false, etag: null };
 }
 
+/* ---------------- 元信息的原子「读—改—写」：mutateMeta（#140 · D1 统一收口） ----------------
+ * 为什么需要它：`读 meta → 改内存对象 → 写回` 之间**没有 await 让出点**时，JS 单线程的 microtask
+ * FIFO 会让这段在调度层面几乎原子（实测：20 路独立 socket 真并发 × 40ms 读窗口，20 本 meta 的
+ * cleanVer 精确 +20，零覆盖）；但那只是**巧合**——任何人往中间插一个 await（读旧正文算字数、
+ * 迁移进度、清孤儿）就立刻变成真实覆盖窗口（apiPatchChapter 改正文那条路径本来就有 2 个 await），
+ * Workers 多 isolate 部署下更是必然丢。本函数把这条隐式约束换成显式保证：所有 meta 写统一走它。
+ *
+ * ⚠️ 不变式（加/改调用点前必读）：
+ *  · mutate 必须是**可重放的纯内存变换**：只改传进来的 meta；不得在其中 await 任何存储操作
+ *    ——既破坏原子性，重放时还会重复副作用。要先落正文 / 迁移进度 / 清孤儿的，放在调用之前
+ *    （副作用本身必须幂等），或放在返回之后的补偿步骤里。
+ *  · 结果必须**每次都从 meta 重新推导**（幂等），不能用「增量叠加」式逻辑：冲突时会重放。
+ *  · 不可重放的副作用先例：apiBookMeta 要在**每次重试里**重跑 sweepOrphans（删除）→ 它保留
+ *    自管循环（语义与本函数一致），不强行套用。
+ *
+ * mutate(meta) 的返回：`{ out, dirty }`
+ *  · `dirty === false` → 无需落盘，按成功返回（并发已达成同一结果时的幂等短路）
+ *  · `abort: Response` → 立即返回该响应、不写盘（校验失败、并发删章等）
+ *  · `out` → 原样带回给调用方（如 index patch）
+ * pre：调用方已经读过一次（守卫读）→ 传 { text, etag } 复用，省一次子请求；更重要的是让 CAS
+ * 覆盖**从那次读开始**的整个窗口——中间会 await 写正文/迁移进度，冲突即重读重放。
+ * 重试用尽 → `{ ok:false, code:'conflict' }` 交调用方回 409：meta 的失效方向必须偏保守，
+ * 宁可让用户重试，也不能把一份可能过期的整份 meta 写回去（会复活并发者刚删掉的章）。
+ * 约定与 updateTrash 同源（`{ out, dirty }` + tries 循环），全仓只有这一种读—改—写写法。
+ */
+async function mutateMeta(store, id, mutate, pre = null, tries = IDX_SAVE_TRIES) {
+  let snapshot = pre;
+  for (let i = 0; i < tries; i++) {
+    const cur = snapshot || (await getWithEtag(store, KEY.book(id)));
+    snapshot = null;
+    const meta = cur ? tryParseJson(cur.text) : null;
+    if (!meta) return { ok: false, code: 'missing' };
+    const r = mutate(meta) || {};
+    if (r.abort) return { ok: false, abort: r.abort };
+    if (r.dirty === false) return { ok: true, meta, out: r.out, skipped: true };
+    const w = await putIf(store, KEY.book(id), JSON.stringify(meta), cur.etag);
+    if (w.ok) return { ok: true, meta, out: r.out };
+  }
+  return { ok: false, code: 'conflict' };
+}
+
+/** mutateMeta 失败的统一响应：校验类失败原样返回；缺书 404；重试用尽 409 */
+const metaFail = (m, msg = '并发冲突，请重试') =>
+  m.abort || (m.code === 'missing' ? json({ error: '书不存在' }, 404) : json({ error: msg }, 409));
+
 /* ---------------- 防爆破（R2 持久化：跨 isolate/重启有效；指数退避防长期锁死） ----------------
  * 计数按客户端 IP 的 SHA-256 前缀（不存明文 IP）。
  * fail 计数带 15 分钟滑动窗口：隔了一刻钟再试，重新计次，不累积冤枉。
@@ -1107,12 +1152,37 @@ async function sweepTrash(store, env, maxBooks = 1) {
 async function sweepOrphans(store, meta, max = ORPHAN_BATCH) {
   const keys = Array.isArray(meta.orphans) ? meta.orphans : [];
   if (!keys.length) return 0;
-  const batch = keys.slice(0, max);
+  // 防御：孤儿表与章表理论上互斥（replace 登记时已按新章表过滤），但历史脏数据（#139 修复前
+  // 写入的 meta）可能重叠 —— 删掉章表仍在引用的正文就是阅读 404。宁可漏删（下次再扫），绝不误删。
+  const live = new Set((Array.isArray(meta.chapters) ? meta.chapters : []).map((c) => c.key));
+  const cand = keys.filter((k) => !live.has(k));
+  if (!cand.length) {
+    delete meta.orphans; // 全是「其实在用」的 key → 整表作废，不再反复扫
+    return 0;
+  }
+  const batch = cand.slice(0, max);
   await Promise.all(batch.map((k) => store.delete(KEY.text(meta.id, k))));
-  const left = keys.slice(batch.length);
+  const left = cand.slice(batch.length);
   if (left.length) meta.orphans = left;
   else delete meta.orphans;
   return left.length;
+}
+
+/** 清一批孤儿正文（删除幂等，属副作用 → **不进** mutateMeta 的纯变换）→ 返回 { swept, left }：
+ *  · swept = 本次确实删掉的 key 集合（据此从待清表里剔除，避免反复无效删）
+ *  · left  = 没清掉的（存储故障时 = 全部，方向保守：继续登记，并让新章避让它们的 key）
+ *  max 传 Infinity 表示「一次清完」（append 前要腾出完整 key 空间）。 */
+async function sweepOrphansBatch(store, id, keys, max) {
+  const pre = Array.from(new Set(Array.isArray(keys) ? keys : []));
+  if (!pre.length) return { swept: new Set(), left: [] };
+  const tmp = { id, orphans: pre.slice() };
+  try {
+    await sweepOrphans(store, tmp, max);
+  } catch {
+    return { swept: new Set(), left: pre }; // 删除失败：一个都不算已清
+  }
+  const left = Array.isArray(tmp.orphans) ? tmp.orphans : [];
+  return { swept: new Set(pre.slice(0, pre.length - left.length)), left };
 }
 
 /* ---------------- 书架 / 建书 ---------------- */
@@ -1201,6 +1271,8 @@ async function createBookRecord(store, body) {
     status: 'creating',
     chapters: chTable,
   };
+  // 新 id 的首次写：此刻盘上还没有这本书，不存在「并发读—改—写」面 → 刻意**不**走 mutateMeta
+  // （CAS 只会白花一次读）。同类的首发路径见 apiPutChapter / apiBlob 等。
   await Promise.all([store.putText(KEY.book(id), JSON.stringify(meta)), putStatus(store, id, 'creating')]);
   return json({ ok: true, duplicate: false, id, chapterKeys: chTable.map((c) => c.key) });
 }
@@ -1328,39 +1400,26 @@ async function apiUpdateChapters(req, env, store, id) {
 
   if (!(await indexHas(store, id))) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
 
-  const meta = await readBook(store, id);
+  const gotCh = await getWithEtag(store, KEY.book(id));
+  const meta = gotCh ? tryParseJson(gotCh.text) : null;
   if (!meta) return json({ error: '书不存在' }, 404);
   const oldCh = Array.isArray(meta.chapters) ? meta.chapters : [];
   const oldTitles = oldCh.map((c) => c.title);
   const now = Date.now();
 
-  if (op === 'append') {
-    // 起点取「现有数字 key 最大值 +1」与「章数+1」的较大者：
-    // 就地删除会让数字 key 变稀疏（如 [1,3]），只按章数推算会撞上已存在的 key → 新正文覆盖旧章
-    let maxNum = 0;
-    for (const c of oldCh) {
-      const n = Number(c.key);
-      if (Number.isInteger(n) && n > maxNum) maxNum = n;
-    }
-    // ⚠️ replace 遗留的孤儿 key 必须一并避让：孤儿正文还在盘上（分批清理没清完，ORPHAN_BATCH=24），
-    // 新章的 key 若落回那些 key，下一次 sweep（publish / 目录读取）会把**刚上传的新章正文**当成
-    // 孤儿删掉，而章表仍引用它们 → 阅读 404。实测：60 章 replace 成 10 章后直接 append 50 章，
-    // 新章 35..58 共 24 个正文被删（章号完全正常，是「重洗减章数 + 没清完就补章」这个常规组合）。
-    // 两层都要做：先尽力清干净释放 key 空间，清不掉（存储故障）时靠下面的避让兜住新章。
-    if (Array.isArray(meta.orphans) && meta.orphans.length) {
-      await sweepOrphans(store, meta, Infinity).catch(() => {});
-      for (const k of Array.isArray(meta.orphans) ? meta.orphans : []) {
-        const n = Number(k);
-        if (Number.isInteger(n) && n > maxNum) maxNum = n;
-      }
-    }
-    const startKey = Math.max(oldCh.length + 1, maxNum + 1);
-    const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
-    meta.chapters = oldCh.concat(add);
-  } else {
-    // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
-    // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
-    const newCh = chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));
+  // 阶段 A（副作用，只做一次）：先清一批孤儿正文释放 key 空间。删除幂等；清不掉的会留在
+  // sweptA.left 里，由下面的变换**避让它们的 key**——否则新章正文会被后续 sweep 当成孤儿删掉，
+  // 而章表仍引用它们 → 阅读 404（#139 实测：60 章 replace 成 10 章后直接 append 50 章，丢 24 章）。
+  // replace 的候选 = 已登记的孤儿 ∪ 被新表挤掉的旧章（都排除新表仍在用的 key）。
+  const newKeySet = op === 'append' ? null : new Set(chapters.map((_, i) => String(i + 1)));
+  const preKeys = new Set(Array.isArray(meta.orphans) ? meta.orphans : []);
+  if (newKeySet) for (const c of oldCh) if (!newKeySet.has(c.key)) preKeys.add(c.key);
+  const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), op === 'append' ? Infinity : ORPHAN_BATCH);
+
+  // 阶段 B（副作用，只做一次）：replace 的进度迁移（读—写 progress，best-effort，不进 CAS）。
+  // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
+  // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
+  if (op !== 'append') {
     let oldProg = null;
     try {
       const pt = await store.getText(KEY.progress(id));
@@ -1369,43 +1428,76 @@ async function apiUpdateChapters(req, env, store, id) {
       /* 无进度或损坏则跳过迁移 */
     }
     if (oldProg && Number.isFinite(oldProg.ch) && oldProg.ch >= 1 && oldProg.ch <= oldCh.length) {
-      const oldTitle = oldTitles[Math.floor(oldProg.ch) - 1];
-      const ni = newCh.findIndex((c) => c.title === oldTitle);
+      const newTitles = chapters.map((t, i) => safeStr(t, 120) || '第' + (i + 1) + '章');
+      const ni = newTitles.findIndex((t) => t === oldTitles[Math.floor(oldProg.ch) - 1]);
       const next =
         ni >= 0
           ? { ch: ni + 1, ratio: Math.min(1, Math.max(0, Number(oldProg.ratio) || 0)), updatedAt: now }
           : { ch: 1, ratio: 0, updatedAt: now };
       await store.putText(KEY.progress(id), JSON.stringify(next));
     }
-    meta.chapters = newCh;
-    // 旧版多余章节正文成为孤儿对象：记录并在本次请求内先清一批，其余靠 bookMeta/publish 惰性清
-    const newKeys = new Set(newCh.map((c) => c.key));
-    const orphans = oldCh.map((c) => c.key).filter((k) => !newKeys.has(k));
-    if (orphans.length) {
-      meta.orphans = orphans;
-      await sweepOrphans(store, meta);
-    }
   }
 
-  if (body.title !== undefined) meta.title = safeStr(body.title, 120) || meta.title;
-  if (body.author !== undefined) meta.author = safeStr(body.author, 60);
-  if (body.note !== undefined && body.note !== null) meta.note = safeStr(body.note, 500);
-  if (body.tags !== undefined) {
-    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
-  }
-  if (body.wordCount !== undefined) {
-    // append 只传新增部分的字数 → 在旧字数上累加；replace 传的是整本字数 → 直接采用
-    // 两条分支都要夹到 ≥0：异常/恶意客户端传负数会把总字数写成负值（replace 原本就夹了，append 漏了）
-    meta.wordCount = Math.max(
-      0,
-      op === 'append' ? (Number(meta.wordCount) || 0) + (Number(body.wordCount) || 0) : Number(body.wordCount) || 0
-    );
-  }
-  meta.cleanVer = (Number(meta.cleanVer) || 0) + 1;
-  meta.updatedAt = now;
-  meta.status = 'creating'; // publish 前不可读
-  await Promise.all([store.putText(KEY.book(id), JSON.stringify(meta)), putStatus(store, id, 'creating')]);
-  return json({ ok: true, op, cleanVer: meta.cleanVer, chapterKeys: meta.chapters.map((c) => c.key) });
+  // 阶段 C：CAS 变换（纯内存；冲突时会被**重放** —— 所有结果都从 meta 现推，绝不增量叠加）
+  const m = await mutateMeta(
+    store,
+    id,
+    (mm) => {
+      const cur = Array.isArray(mm.chapters) ? mm.chapters : [];
+      if (op === 'append') {
+        // key 起点在**当前盘面**上重算：并发 append 过的话，沿用旧起点会撞 key（新正文覆盖旧章）。
+        // 起点取「现有数字 key 最大值 +1」与「章数+1」的较大者：就地删除会让数字 key 变稀疏
+        // （如 [1,3]），只按章数推算会撞上已存在的 key。孤儿 key 一并避让（见阶段 A）。
+        let maxNum = 0;
+        for (const c of cur) {
+          const n = Number(c.key);
+          if (Number.isInteger(n) && n > maxNum) maxNum = n;
+        }
+        for (const k of [...(Array.isArray(mm.orphans) ? mm.orphans : []), ...sweptA.left]) {
+          const n = Number(k);
+          if (Number.isInteger(n) && n > maxNum) maxNum = n;
+        }
+        const startKey = Math.max(cur.length + 1, maxNum + 1);
+        const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
+        mm.chapters = cur.concat(add);
+      } else {
+        const newCh = chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));
+        mm.chapters = newCh;
+        // 孤儿登记：并上「并发 writer 已登记的」+「本次没清掉的」+「被新表挤掉的旧章」，
+        // 再剔除**章表仍引用**的 key（历史脏数据可能让孤儿表与章表重叠 → sweep 会删掉在用的正文）
+        // 以及本次已确实删掉的 key（免得反复发无效删除）。
+        const live = new Set(newCh.map((c) => c.key));
+        const cand = new Set([...(Array.isArray(mm.orphans) ? mm.orphans : []), ...sweptA.left, ...cur.map((c) => c.key)]);
+        for (const k of live) cand.delete(k);
+        for (const k of sweptA.swept) cand.delete(k);
+        if (cand.size) mm.orphans = Array.from(cand);
+        else delete mm.orphans;
+      }
+      if (body.title !== undefined) mm.title = safeStr(body.title, 120) || mm.title;
+      if (body.author !== undefined) mm.author = safeStr(body.author, 60);
+      if (body.note !== undefined && body.note !== null) mm.note = safeStr(body.note, 500);
+      if (body.tags !== undefined) {
+        mm.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
+      }
+      if (body.wordCount !== undefined) {
+        // append 只传新增部分的字数 → 在旧字数上累加；replace 传的是整本字数 → 直接采用
+        // 两条分支都要夹到 ≥0：异常/恶意客户端传负数会把总字数写成负值（replace 原本就夹了，append 漏了）
+        mm.wordCount = Math.max(
+          0,
+          op === 'append' ? (Number(mm.wordCount) || 0) + (Number(body.wordCount) || 0) : Number(body.wordCount) || 0
+        );
+      }
+      mm.cleanVer = (Number(mm.cleanVer) || 0) + 1;
+      mm.updatedAt = now;
+      mm.status = 'creating'; // publish 前不可读
+      return { out: mm.chapters.map((c) => c.key) };
+    },
+    gotCh
+  );
+  if (!m.ok) return metaFail(m);
+  // 状态副档单独写：它只是「可读性」的廉价判定，与 meta 短暂不一致的后果与原先同类
+  await putStatus(store, id, 'creating');
+  return json({ ok: true, op, cleanVer: m.meta.cleanVer, chapterKeys: m.out });
 }
 
 /**
@@ -1414,11 +1506,11 @@ async function apiUpdateChapters(req, env, store, id) {
  */
 async function apiPublish(req, env, store, id) {
   const T0 = Date.now();
-  const meta = await readBook(store, id);
-  if (!meta) return json({ error: '书不存在' }, 404);
-  if (!meta.chapters || !meta.chapters.length) return json({ error: '书还没有章节' }, 400);
+  const meta0 = await readBook(store, id);
+  if (!meta0) return json({ error: '书不存在' }, 404);
+  if (!meta0.chapters || !meta0.chapters.length) return json({ error: '书还没有章节' }, 400);
   const tMeta = Date.now() - T0;
-  const keys = meta.chapters.map((c) => c.key);
+  const keys = meta0.chapters.map((c) => c.key);
   const samples = [keys[0], keys[Math.floor(keys.length / 2)], keys[keys.length - 1]].filter((k, i, arr) => arr.indexOf(k) === i);
   // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（single+append：root + 1 片）+ progress 镜像源。
   // 发布是导入链路里最高频的写，索引原来按 full 打开只为顺带在响应里回传整张 books 快照 → 2 万本/40 片
@@ -1434,12 +1526,33 @@ async function apiPublish(req, env, store, id) {
   for (let i = 0; i < samples.length; i++) {
     if (sampled[i] == null) return json({ error: `章节 ${samples[i]} 未上传，发布中止` }, 409);
   }
-  meta.chapterCount = keys.length;
-  meta.wordCount = Math.max(Number(meta.wordCount) || 0, 0);
-  meta.status = 'ready';
-  meta.updatedAt = Date.now();
-  if (Array.isArray(meta.orphans) && meta.orphans.length) await sweepOrphans(store, meta);
-  // 书架角标镜像以 progress 文件当前值为准（rewash/replace 可能刚重置过进度）
+  // 阶段 A（副作用）：清一批孤儿正文 + 记下「已清掉 / 没清掉」两类 key（见 sweepOrphansBatch）
+  const sweptA = await sweepOrphansBatch(store, id, meta0.orphans, ORPHAN_BATCH);
+  const T2 = Date.now();
+  // 阶段 B：CAS 写 meta。原来这条写是无条件整份覆盖 —— 与并发的就地编辑/批量标签撞上时，后写者会
+  // 连**章表**一起写回旧版（并发删掉的章被复活）。改成 CAS 后冲突即重读重放，盘面收敛到最新。
+  const m = await mutateMeta(
+    store,
+    id,
+    (meta) => {
+      if (!meta.chapters || !meta.chapters.length) return { abort: json({ error: '书还没有章节' }, 400) };
+      meta.chapterCount = meta.chapters.length;
+      meta.wordCount = Math.max(Number(meta.wordCount) || 0, 0);
+      meta.status = 'ready';
+      meta.updatedAt = Date.now();
+      // 清不掉的 + 并发 writer 新登记的 → 继续登记（下次惰性清）；章表仍引用的、本次已删的一律剔除
+      const live = new Set(meta.chapters.map((c) => c.key));
+      const cand = new Set([...(Array.isArray(meta.orphans) ? meta.orphans : []), ...sweptA.left]);
+      for (const k of live) cand.delete(k);
+      for (const k of sweptA.swept) cand.delete(k);
+      if (cand.size) meta.orphans = Array.from(cand);
+      else delete meta.orphans;
+    },
+    null
+  );
+  if (!m.ok) return metaFail(m);
+  const meta = m.meta;
+  // 索引条目以「刚 CAS 成功的这份 meta」为准（它才是权威盘面）
   const old = idx.get(id);
   let prog = old && old.prog;
   try {
@@ -1451,14 +1564,13 @@ async function apiPublish(req, env, store, id) {
     /* 读取失败沿用旧镜像 */
   }
   idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
-  // 三个互不依赖的写并行：状态副档 ∥ meta ∥ 索引（脏分片 + bak + root 如有成员变化）。
+  // 两个互不依赖的写并行：状态副档 ∥ 索引（脏分片 + bak + root 如有成员变化）。
   // 任一写失败的后果与原「副档先行」分析同类：可读/409 短暂不一致，重试发布即愈合
-  const T2 = Date.now();
-  await Promise.all([putStatus(store, id, 'ready'), store.putText(KEY.book(id), JSON.stringify(meta)), idx.save({ bak: true })]);
+  await Promise.all([putStatus(store, id, 'ready'), idx.save({ bak: true })]);
   const tWrite = Date.now() - T2;
   // 不再回传 books 快照（见上：为它做全量读会在 2 万本量级撞 50 子请求硬顶）。前端 upload.js /
   // upload/files.js 两处都有 `if (pub.books) … else loadShelf()` 兜底，新旧前后端任意组合都安全。
-  // t 为服务端分阶段耗时（meta 读 / 校验+读 / 写），供慢链路诊断
+  // t 为服务端分阶段耗时（meta 读 / 校验+读 / 写含 meta CAS），供慢链路诊断
   return json({
     ok: true,
     id,
@@ -1479,6 +1591,9 @@ async function apiBookMeta(store, id) {
     // 写回走 CAS：这次写回与并发的 PATCH（星标/置顶/readDone/备注）都是「读—改—写 meta」，
     // 无条件整份覆盖时后写者会吃掉前者的字段（用户看到「刚改的星标没了」）。
     // 冲突 → 重读新盘面、再扫一次（删孤儿幂等，重放不会放大）→ 用新版本号写。
+    // ⚠️ 本处**刻意不用** mutateMeta：sweepOrphans 是删除副作用，且它的结果决定写回内容，
+    // 必须在**每次重试里重跑** → 违反「纯内存可重放」不变式（见 mutateMeta 的注释）。 */
+    // 语义与 mutateMeta 一致：冲突重读重放、用尽即止。
     let etag = got.etag;
     for (let attempt = 0; ; attempt++) {
       await sweepOrphans(store, meta);
@@ -1506,15 +1621,11 @@ async function apiPatchBook(req, store, id) {
   const body = await req.json().catch(() => ({}));
   const idx = await openIndex(store, { single: id });
   if (!idx.get(id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
-  // 读—改—写走 CAS：并发的 GET 目录可能正在写回孤儿清理，两边都无条件整份覆盖时后写者会吃掉
-  // 前者的字段（表现为「刚改的星标没了」）。PATCH 是**字段级合并**、重放幂等，所以冲突时重读
-  // 新盘面重放即可，任何一方都不丢。
-  let patch;
-  for (let attempt = 0; ; attempt++) {
-    const got = await getWithEtag(store, KEY.book(id));
-    const meta = got ? tryParseJson(got.text) : null;
-    if (!meta) return json({ error: '书不存在' }, 404);
-    patch = {};
+  // 读—改—写走 CAS（见 mutateMeta）：并发的 GET 目录可能正在写回孤儿清理，两边都无条件整份覆盖
+  // 时后写者会吃掉前者的字段（表现为「刚改的星标没了」）。PATCH 是**字段级合并**、重放幂等，
+  // 所以冲突时重读新盘面重放即可，任何一方都不丢。
+  const m = await mutateMeta(store, id, (meta) => {
+    const patch = {};
     if (body.title !== undefined) {
       const t = safeStr(body.title, 120);
       if (t) {
@@ -1564,10 +1675,10 @@ async function apiPatchBook(req, store, id) {
     }
     meta.updatedAt = Date.now();
     patch.updatedAt = meta.updatedAt;
-    const res = await putIf(store, KEY.book(id), JSON.stringify(meta), got.etag);
-    if (res.ok) break;
-    if (attempt + 1 >= IDX_SAVE_TRIES) return json({ error: '并发冲突，请重试' }, 409);
-  }
+    return { out: patch };
+  });
+  if (!m.ok) return metaFail(m);
+  const patch = m.out;
 
   idx.patch(id, (b) => ({
     ...b,
@@ -1619,15 +1730,18 @@ function chIndex(meta, key) {
   return arr.findIndex((c) => c.key === key);
 }
 
-/** 就地编辑前提：书在架 + 存在 + 已发布；返回 { meta } 或 { resp }（直接作为响应） */
+/** 就地编辑前提：书在架 + 存在 + 已发布；返回 { meta, cur } 或 { resp }（直接作为响应）。
+ *  一并把原始 { text, etag } 交给调用方复用为 mutateMeta 的 pre：既省一次子请求，也让 CAS 覆盖
+ *  「从这次守卫读开始」的整个窗口（这中间会 await 写正文 / 迁移进度 —— 那正是并发窗口所在）。 */
 async function editableMeta(store, id) {
   if (!(await indexHas(store, id))) {
     return { resp: json({ error: '书不在书架（可能已删除或未发布）' }, 404) };
   }
-  const meta = await readBook(store, id);
+  const cur = await getWithEtag(store, KEY.book(id));
+  const meta = cur ? tryParseJson(cur.text) : null;
   if (!meta) return { resp: json({ error: '书不存在' }, 404) };
   if (meta.status !== 'ready') return { resp: json({ error: '书正在更新中，请稍后重试' }, 409) };
-  return { meta };
+  return { meta, cur };
 }
 
 /** 就地编辑后同步书架摘要：单书模式打开（只碰该书分片）→ 重建该条目（章数/字数/更新时间 + 保留 pinned/进度镜像） */
@@ -1693,32 +1807,43 @@ async function shiftProgressOnDelete(store, id, di, newLen) {
 async function apiPatchChapter(req, env, store, id, key) {
   const g = await editableMeta(store, id);
   if (!g.meta) return g.resp;
-  const meta = g.meta;
-  const i = chIndex(meta, key);
-  if (i < 0) return json({ error: '章节不存在' }, 404);
+  if (chIndex(g.meta, key) < 0) return json({ error: '章节不存在' }, 404);
   const body = await req.json().catch(() => ({}));
   const hasTitle = typeof body.title === 'string';
   const hasContent = typeof body.content === 'string';
   if (!hasTitle && !hasContent) return json({ error: '没有要修改的内容' }, 400);
 
-  const ch = meta.chapters[i];
-  if (hasTitle) {
-    const t = body.title.trim();
-    ch.title = t ? safeStr(t, 120) : '第' + (i + 1) + '章';
-  }
+  // 正文先落盘：这一步要读旧正文算字数差，**必须在 CAS 之外只做一次**——放进 mutate 里既会 await
+  // 破坏原子性，重放时还会把「旧正文」读成刚写进去的新正文（增量算成 0）。代价：若 CAS 重试用尽，
+  // 正文已改而 meta 未跟上（字数/cleanVer 短暂滞后），客户端重试即自愈。
+  let wordDelta = 0;
   if (hasContent) {
     const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
     if (enc.encode(body.content).byteLength > max) return json({ error: '章节超过上限' }, 413);
     const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
-    const newWords = wordsOf(body.content);
+    wordDelta = wordsOf(body.content) - oldWords;
     await store.putText(KEY.text(id, key), body.content);
-    meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) + newWords - oldWords);
   }
-  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
-  meta.updatedAt = Date.now();
-  await store.putText(KEY.book(id), JSON.stringify(meta));
-  await syncIndexAfterEdit(store, meta);
-  return json({ ok: true, title: ch.title, cleanVer: meta.cleanVer, wordCount: meta.wordCount });
+  const m = await mutateMeta(
+    store,
+    id,
+    (meta) => {
+      const i = chIndex(meta, key);
+      if (i < 0) return { abort: json({ error: '章节不存在' }, 404) }; // 并发删章 → 不写回
+      if (hasTitle) {
+        const t = body.title.trim();
+        meta.chapters[i].title = t ? safeStr(t, 120) : '第' + (i + 1) + '章';
+      }
+      if (hasContent) meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) + wordDelta);
+      meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+      meta.updatedAt = Date.now();
+      return { out: meta.chapters[i].title };
+    },
+    g.cur
+  );
+  if (!m.ok) return metaFail(m);
+  await syncIndexAfterEdit(store, m.meta);
+  return json({ ok: true, title: m.out, cleanVer: m.meta.cleanVer, wordCount: m.meta.wordCount });
 }
 
 /** POST /api/books/:id/chapters/insert — 插入一章（body: { after?: key|null, title?, content? }）
@@ -1726,57 +1851,80 @@ async function apiPatchChapter(req, env, store, id, key) {
 async function apiInsertChapter(req, env, store, id) {
   const g = await editableMeta(store, id);
   if (!g.meta) return g.resp;
-  const meta = g.meta;
   const body = await req.json().catch(() => ({}));
   const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
   const content = typeof body.content === 'string' ? body.content : '';
   if (!titleRaw && !content) return json({ error: '章节标题和正文不能都为空' }, 400);
   const max = Number(env.MAX_CHAPTER) || MAX_CHAPTER_BYTES;
   if (enc.encode(content).byteLength > max) return json({ error: '章节超过上限' }, 413);
+  const afterKey = body.after === undefined || body.after === null || body.after === '' ? null : String(body.after);
+  const gArr = Array.isArray(g.meta.chapters) ? g.meta.chapters : [];
+  const gAt = afterKey ? gArr.findIndex((c) => c.key === afterKey) + 1 : gArr.length;
+  if (afterKey && gAt === 0) return json({ error: '参照章节不存在' }, 404);
 
-  if (!Array.isArray(meta.chapters)) meta.chapters = [];
-  const arr = meta.chapters; // 必须挂在 meta 上：否则非数组边界下插入结果会丢失
-  let at = arr.length; // 默认追加到末尾
-  if (body.after !== undefined && body.after !== null && body.after !== '') {
-    const j = arr.findIndex((c) => c.key === body.after);
-    if (j < 0) return json({ error: '参照章节不存在' }, 404);
-    at = j + 1;
-  }
-  const key = newId();
-  const title = titleRaw || '第' + (at + 1) + '章';
-  await shiftProgressOnInsert(store, id, at); // 先迁移进度，再改章表
-  arr.splice(at, 0, { key, title: safeStr(title, 120) });
-  meta.chapterCount = arr.length;
-  meta.wordCount = (Number(meta.wordCount) || 0) + wordsOf(content);
+  const key = newId(); // 只生成一次：重放时若换 key，盘上会留下孤儿正文
+  const title = safeStr(titleRaw || '第' + (gAt + 1) + '章', 120);
+  await shiftProgressOnInsert(store, id, gAt); // 先迁移进度，再改章表（尽力而为，不进 CAS）
   await store.putText(KEY.text(id, key), content); // 空正文也落盘（阅读时提示无内容，不 404）
-  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
-  meta.updatedAt = Date.now();
-  await store.putText(KEY.book(id), JSON.stringify(meta));
-  await syncIndexAfterEdit(store, meta);
-  return json({ ok: true, key, title: meta.chapters[at].title, chapterCount: meta.chapters.length, cleanVer: meta.cleanVer });
+  const m = await mutateMeta(
+    store,
+    id,
+    (meta) => {
+      if (!Array.isArray(meta.chapters)) meta.chapters = [];
+      const arr = meta.chapters;
+      // 插入位按**当前盘面**重算：并发插入/删除之后，照旧下标插会插错位置
+      let at = arr.length;
+      if (afterKey) {
+        const j = arr.findIndex((c) => c.key === afterKey);
+        // 参照章被并发删了 → 退化为追加（新章正文已落盘，这里不能 abort 留下孤儿）
+        at = j >= 0 ? j + 1 : arr.length;
+      }
+      at = Math.max(0, Math.min(at, arr.length));
+      arr.splice(at, 0, { key, title });
+      meta.chapterCount = arr.length;
+      meta.wordCount = (Number(meta.wordCount) || 0) + wordsOf(content);
+      meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+      meta.updatedAt = Date.now();
+      return { out: { at, count: arr.length } };
+    },
+    g.cur
+  );
+  if (!m.ok) return metaFail(m);
+  await syncIndexAfterEdit(store, m.meta);
+  return json({ ok: true, key, title: m.meta.chapters[m.out.at].title, chapterCount: m.out.count, cleanVer: m.meta.cleanVer });
 }
 
 /** DELETE /api/books/:id/chapters/:key — 删除一章（正文一并清除） */
 async function apiDeleteChapter(store, id, key) {
   const g = await editableMeta(store, id);
   if (!g.meta) return g.resp;
-  const meta = g.meta;
-  if (!Array.isArray(meta.chapters)) meta.chapters = [];
-  const arr = meta.chapters;
-  const i = arr.findIndex((c) => c.key === key);
-  if (i < 0) return json({ error: '章节不存在' }, 404);
-  if (arr.length <= 1) return json({ error: '至少保留一章' }, 400);
+  const gArr = Array.isArray(g.meta.chapters) ? g.meta.chapters : [];
+  const gi = gArr.findIndex((c) => c.key === key);
+  if (gi < 0) return json({ error: '章节不存在' }, 404);
+  if (gArr.length <= 1) return json({ error: '至少保留一章' }, 400);
   const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
-  await shiftProgressOnDelete(store, id, i, arr.length - 1); // 先迁移进度（用删除前的下标与新章数），再改章表
-  meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) - oldWords);
+  await shiftProgressOnDelete(store, id, gi, gArr.length - 1); // 先迁移进度（用删除前下标与新章数），再改章表
   await store.delete(KEY.text(id, key));
-  arr.splice(i, 1);
-  meta.chapterCount = arr.length;
-  meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
-  meta.updatedAt = Date.now();
-  await store.putText(KEY.book(id), JSON.stringify(meta));
-  await syncIndexAfterEdit(store, meta);
-  return json({ ok: true, chapterCount: arr.length, cleanVer: meta.cleanVer, wordCount: meta.wordCount });
+  const m = await mutateMeta(
+    store,
+    id,
+    (meta) => {
+      const arr = Array.isArray(meta.chapters) ? meta.chapters : [];
+      const i = arr.findIndex((c) => c.key === key);
+      // 并发已删掉同一章 → 结果已达成：短路成功，不写盘、不重复扣字数（幂等）
+      if (i < 0 || arr.length <= 1) return { dirty: false, out: { chapterCount: arr.length } };
+      meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) - oldWords);
+      arr.splice(i, 1);
+      meta.chapterCount = arr.length;
+      meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+      meta.updatedAt = Date.now();
+      return { out: { chapterCount: arr.length } };
+    },
+    g.cur
+  );
+  if (!m.ok) return metaFail(m);
+  if (!m.skipped) await syncIndexAfterEdit(store, m.meta);
+  return json({ ok: true, chapterCount: m.out.chapterCount, cleanVer: m.meta.cleanVer, wordCount: m.meta.wordCount });
 }
 
 /* ---------------- 进度（DR-02：R2 小对象 + index 镜像供书架角标） ---------------- */
@@ -1987,31 +2135,35 @@ async function apiBatchBooks(req, store) {
     return json({ ok: true, updated: n, skipped: remain - n, deferred, ...(retry ? { retry: true } : {}) });
   }
 
-  // 读一波全并行（20 本 = 20 次并发 GET，替代逐本串行 20 程），meta 缺失的书跳过
-  const metas = await Promise.all(targets.map((id) => readBook(store, id)));
+  // 每本「读—改—写」走 CAS（20 本并行）：与旧的 readBook + putText **同为 2 个子请求/本**，
+  // 子请求预算不变（见下方预扣注释），但消掉了「两条并发批量互相吃字段」——旧写法无条件整份覆盖，
+  // 后写者吃掉前者的改动（表现为「刚打的标签少了一个」）。
   const now = Date.now();
   const patches = new Map();
-  const writes = [];
+  const results = await Promise.all(
+    targets.map((id) =>
+      mutateMeta(store, id, (meta) => {
+        if (action === 'addTags') {
+          const set = new Set(meta.tags || []);
+          for (const t of tags) set.add(t);
+          meta.tags = Array.from(set).slice(0, TAG_MAX);
+        } else if (action === 'removeTags') {
+          const rm = new Set(tags);
+          meta.tags = (meta.tags || []).filter((t) => !rm.has(t));
+        } else if (action === 'setTags') {
+          meta.tags = tags;
+        } else if (action === 'setFinished') {
+          meta.finished = !!body.finished;
+        }
+        meta.updatedAt = now;
+        return { out: { tags: meta.tags || [], finished: !!meta.finished, updatedAt: meta.updatedAt } };
+      })
+    )
+  );
   for (let i = 0; i < targets.length; i++) {
-    const meta = metas[i];
-    if (!meta) continue;
-    if (action === 'addTags') {
-      const set = new Set(meta.tags || []);
-      for (const t of tags) set.add(t);
-      meta.tags = Array.from(set).slice(0, TAG_MAX);
-    } else if (action === 'removeTags') {
-      const rm = new Set(tags);
-      meta.tags = (meta.tags || []).filter((t) => !rm.has(t));
-    } else if (action === 'setTags') {
-      meta.tags = tags;
-    } else if (action === 'setFinished') {
-      meta.finished = !!body.finished;
-    }
-    meta.updatedAt = now;
-    writes.push(store.putText(KEY.book(targets[i]), JSON.stringify(meta))); // 写一波全并行
-    patches.set(targets[i], { tags: meta.tags || [], finished: !!meta.finished, updatedAt: meta.updatedAt });
+    // 缺书 / 重试用尽的书**不计入 patches** → updated 不虚报（旧写法无条件写，永远算成功）
+    if (results[i].ok) patches.set(targets[i], results[i].out);
   }
-  if (writes.length) await Promise.all(writes);
 
   let patchSkip = 0;
   if (patches.size) {
@@ -2120,32 +2272,30 @@ async function apiTagsMerge(req, store) {
     targets.push(b);
   }
   if (!targets.length) return json({ ok: true, updated: 0, remaining: hit.length });
-  // 读一波全并行（替代逐本串行，同 apiBatchBooks）
-  const metas = await Promise.all(targets.map((b) => readBook(store, b.id)));
+  // 每本「读—改—写」走 CAS（并行；子请求数与旧 readBook + putText 相同，见上方预扣注释）
   const now = Date.now();
   const patches = new Map();
-  const writes = [];
-  for (let i = 0; i < targets.length; i++) {
-    const b = targets[i];
-    const meta = metas[i];
-    if (!meta) continue;
-    const out = [];
-    for (const t of meta.tags || []) {
-      if (t === from) {
-        if (to && !out.includes(to)) out.push(to); // 改名/合并：落到目标标签（已存在则不重复）
-        continue;
-      }
-      // to 不能在此无条件跳过：index 声明 from 但 meta 已无 from（meta 写波成功、idx.save
-      // 失败的残留态，重试必然命中）时，跳过会把书上的 to 清掉。去重由 includes 保证——
-      // from 分支 push to 前已查重、这里放行 to 也不会重复。
-      if (!out.includes(t)) out.push(t);
-    }
-    meta.tags = out.slice(0, TAG_MAX);
-    meta.updatedAt = now;
-    writes.push(store.putText(KEY.book(b.id), JSON.stringify(meta))); // 写一波全并行
-    patches.set(b.id, { tags: meta.tags, updatedAt: meta.updatedAt });
-  }
-  if (writes.length) await Promise.all(writes);
+  const results = await Promise.all(
+    targets.map((b) =>
+      mutateMeta(store, b.id, (meta) => {
+        const next = [];
+        for (const t of meta.tags || []) {
+          if (t === from) {
+            if (to && !next.includes(to)) next.push(to); // 改名/合并：落到目标标签（已存在则不重复）
+            continue;
+          }
+          // to 不能在此无条件跳过：index 声明 from 但 meta 已无 from（meta 写波成功、idx.save
+          // 失败的残留态，重试必然命中）时，跳过会把书上的 to 清掉。去重由 includes 保证——
+          // from 分支 push to 前已查重、这里放行 to 也不会重复。
+          if (!next.includes(t)) next.push(t);
+        }
+        meta.tags = next.slice(0, TAG_MAX);
+        meta.updatedAt = now;
+        return { out: { tags: meta.tags, updatedAt: meta.updatedAt } };
+      })
+    )
+  );
+  for (let i = 0; i < targets.length; i++) if (results[i].ok) patches.set(targets[i].id, results[i].out);
 
   // 与 apiBatchBooks 同因：这里与 hit 过滤读的是同一份内存快照（openIndex 在过滤前已打开，
   // 中间只 await 各书 meta 写入），外部并发改不了它 → 守卫恒不触发（2026-09-18 审计实测）。

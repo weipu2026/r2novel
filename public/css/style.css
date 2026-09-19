@@ -323,6 +323,10 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .ce-foot { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
 .ce-foot .grow { flex: 1; }
 .ce-busy { font-size: var(--fz-xs); color: var(--muted); }
+/* 忙态：请求在飞时整表置灰（配合 .ce-busy 的文字提示）。不加 pointer-events: none，
+   否则连滚动都被拦；真正的拦截由 disabled 的按钮/输入框负责。 */
+.ce-locked .ce-list { opacity: .55; }
+.ce-locked .ce-foot { cursor: progress; }
 
 /* 阅读器 */
 #view-read { position: relative; }

@@ -16,6 +16,10 @@ const ceState = { id: null, bookTitle: '', chapters: [], count: 0, words: 0, dir
 
 const ceBodies = new Map(); // 已拉取的章节正文缓存 key -> text
 
+// 忙态计数（>0 表示有请求在飞）。用**计数**而不是布尔：ceBusy('…') / ceBusy('') 成对出现，
+// 嵌套路径（插章 → 刷新章表）也会各带一对，布尔会被内层提前解锁。
+let ceLock = 0;
+
 function ceStatText() {
   return `《${ceState.bookTitle}》 · ${ceState.count} 章 · ${fmtWords(ceState.words)} · 改动即时保存`;
 }
@@ -56,6 +60,23 @@ export async function openChapterEditor(b) {
 function ceBusy(text) {
   const el = $('#ceBusy', els.modalBox);
   if (el) el.textContent = text || '';
+  ceLock = Math.max(0, ceLock + (text ? 1 : -1));
+  ceApplyLock();
+}
+
+/** 忙态期间禁掉所有会写 meta 的控件。此前 ceBusy 只改一行文字，输入框与按钮全程可用，
+ *  「改标题（change 失焦即发）→ 立刻点保存正文」会发出两个并发的 meta 读—改—写。
+ *  服务端有 CAS 兜底（mutateMeta），这里让前端**根本不制造**这种并发，同时给出可见的忙态。
+ *  禁用在 mousedown→mouseup 之间生效时那次 click 不触发 → 用户再点一次即可，
+ *  不会出现「看着没反应、请求其实已发出」的双写。 */
+function ceApplyLock() {
+  const box = els.modalBox;
+  if (!box) return;
+  const on = ceLock > 0;
+  box.classList.toggle('ce-locked', on);
+  box.querySelectorAll('input.ce-title, .ce-row button, #ceAppend, #ceDone').forEach((n) => {
+    n.disabled = on;
+  });
 }
 
 function renderCeList() {
@@ -70,6 +91,7 @@ function renderCeList() {
     return;
   }
   ceState.chapters.forEach((ch, i) => ul.appendChild(ceBuildRow(ch, i)));
+  ceApplyLock(); // 新建的行默认可用 → 若此刻仍在忙（插章后的整表重绘），必须重新锁上
 }
 
 /** 构造一行章节：序号 + 标题输入 + 正文/插章/删章按钮 +（可展开的正文编辑区） */

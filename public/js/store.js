@@ -107,6 +107,10 @@ export const api = {
     return new Uint8Array(await res.arrayBuffer());
   },
   getProgress: (id) => request('/api/progress/' + encodeURIComponent(id)).catch(() => ({ ch: 0, ratio: 0, updatedAt: 0 })),
+  /** 严格版（不吞错）：需要区分「服务端就是没有进度」与「这次读失败」时必须用它。
+   *  阅读器的 OCC 基线只能来自「真的读到了」——把读失败当成「服务端没有进度」（updatedAt 0），
+   *  会让这台设备的首次写入被服务端判成「拿旧认知来写」而永久拒掉（见 router.js 的 apiProgressPut）。 */
+  getProgressStrict: (id) => request('/api/progress/' + encodeURIComponent(id)),
   putProgress(id, data) {
     return request('/api/progress/' + encodeURIComponent(id), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
   },
@@ -205,9 +209,17 @@ export const local = {
     try {
       const payload = JSON.stringify({ books, at: Date.now() });
       if (payload.length > SHELF_CACHE_MAX_CHARS) {
+        // 超限必须把**旧快照删掉**再返回：只「跳过写入」的话，localStorage 里那份远古快照会一直
+        // 留着，网络失败时（boot / loadShelf 的快照兜底路径）会长期显示过期书架且永不更新。
+        // 宁可不给快照（如实走网络），也不要给一份错的。
+        try {
+          localStorage.removeItem(LS.shelf);
+        } catch {
+          /* 清不掉也不影响下面仍走网络 */
+        }
         if (!shelfCacheWarned) {
           shelfCacheWarned = true;
-          console.warn(`书架快照过大（${payload.length} 字符 > ${SHELF_CACHE_MAX_CHARS}），已跳过本地缓存，本次及后续将走网络加载`);
+          console.warn(`书架快照过大（${payload.length} 字符 > ${SHELF_CACHE_MAX_CHARS}），已清除旧快照并跳过本地缓存，本次及后续将走网络加载`);
         }
         return false;
       }
@@ -260,10 +272,28 @@ export function fmtWords(n) {
 
 /**
  * 并发拉取一本书全部章节正文（导出/整本离线共用）。
- * 返回 { meta, texts }；texts[i] 与 meta.chapters[i] 对应。
+ * 返回 { meta, texts, missing }；texts[i] 与 meta.chapters[i] 对应。
+ *
+ * offlineSrc（可选）：{ book: () => Promise<meta|null>, chapter: (key) => Promise<string|null> }。
+ * 为什么由调用方注入、而不是这里直接 import offline.js：① 本函数要能在 node 单测里直接 import，
+ * 不该顺带牵出 IndexedDB/DOM；② store.js 是 offline.js 的上游，反向引用会形成模块环。
+ * 传了它，「服务端不可用时用本地整本缓存兜底」才是真的——exporter.js 顶部那句「IndexedDB
+ * 缓存离线可用」此前是**虚假承诺**：离线时首句 api.bookMeta 必抛，已下载的正文一次都没被读过。
  */
-export async function fetchChaptersAll(id, onProg) {
-  const meta = await api.bookMeta(id);
+export async function fetchChaptersAll(id, onProg, offlineSrc) {
+  const offBook = offlineSrc ? () => offlineSrc.book().catch(() => null) : null;
+  const offChapter = offlineSrc ? (key) => offlineSrc.chapter(key).catch(() => null) : null;
+  let meta;
+  try {
+    meta = await api.bookMeta(id);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) throw e;
+    // 服务端不可用（离线 / 未发布 404）→ 本地整本缓存的章表兜底
+    //（offline.getBook 的记录只带 bookId，补 id 供后续取章）
+    const off = offBook ? await offBook() : null;
+    if (!off) throw e;
+    meta = { ...off, id };
+  }
   const chapters = meta.chapters || [];
   const n = chapters.length;
   if (!n) throw new Error('这本书还没有章节');
@@ -272,17 +302,29 @@ export async function fetchChaptersAll(id, onProg) {
   let cursor = 0;
   let done = 0;
   let missing = 0;
+  // 一次「非 ApiError」失败＝链路本身不通（fetch 直接 reject）→ 后续章节不再逐章空发请求，
+  // 直接走本地缓存。否则离线导出一本千章书会先发一千个注定失败的请求。
+  let netDown = false;
   await Promise.all(
     Array.from({ length: Math.min(CONC, n) }, async () => {
       while (true) {
         const idx = cursor++;
         if (idx >= n) break;
+        const key = chapters[idx].key;
         try {
-          texts[idx] = await api.chapter(id, chapters[idx].key, meta.cleanVer || 1);
+          if (netDown) throw new Error('offline');
+          texts[idx] = await api.chapter(id, key, meta.cleanVer || 1);
         } catch (e) {
           if (e instanceof ApiError && e.status === 401) throw e;
-          texts[idx] = ''; // 单章失败不阻断整本
-          missing++;
+          if (!(e instanceof ApiError)) netDown = true;
+          // 单章失败 → 先看本地整本缓存里有没有这一章（离线导出的关键一步）
+          const off = offChapter ? await offChapter(key) : null;
+          if (off != null) {
+            texts[idx] = off;
+          } else {
+            texts[idx] = ''; // 单章失败不阻断整本
+            missing++;
+          }
         }
         done++;
         if (onProg && (done % 12 === 0 || done === n)) onProg(done / n);

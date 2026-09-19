@@ -15,10 +15,13 @@
  * @param {number} pageSize 单批上限（= BATCH_BOOKS_MAX，后端也只认这么多）
  * @param {(batch: string[]) => Promise<{updated?: number, deferred?: string[], retry?: boolean}>} send 单批请求
  * @param {(done: number, total: number) => void} [onProgress] 进度回调（done=已出队数量）
+ * @param {(e: unknown) => void} [onError] 单批失败时的原始错误（失败仍计入 fail，重试语义不变）。
+ *        存在的理由：调用方需要区分「书的问题」与「会话过期（401）」——后者重试一万次也不会成功，
+ *        必须收敛到登录页，而不是报成「N 本失败（可能是半成品书）」。
  * @returns {Promise<{ok: number, fail: number}>} ok=后端 updated 之和（真正落库的本数），
  *          fail=选了但没落库的本数（不在架/半成品/被裁后仍失败）
  */
-export async function runBatched(ids, pageSize, send, onProgress) {
+export async function runBatched(ids, pageSize, send, onProgress, onError) {
   const total = ids.length;
   const size = Math.max(1, Math.floor(Number(pageSize)) || 1);
   let queue = ids.slice();
@@ -34,7 +37,8 @@ export async function runBatched(ids, pageSize, send, onProgress) {
     let resp = null;
     try {
       resp = await send(batch);
-    } catch {
+    } catch (e) {
+      if (onError) onError(e); // 把错误交出去分类，但失败语义不变（整批计入 fail、不原地重试）
       resp = null; // 单批失败：整批计入失败、不原地重试（沿用旧行为，避免网络抖动时死磕）
     }
     ok += Number(resp && resp.updated) || 0;

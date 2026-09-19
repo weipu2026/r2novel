@@ -1459,66 +1459,100 @@ async function apiPublish(req, env, store, id) {
 
 /** 单书目录（章节表）——只读已发布书；顺带惰性清理 replace 遗留的孤儿章节 */
 async function apiBookMeta(store, id) {
-  const meta = await readBook(store, id);
+  const got = await getWithEtag(store, KEY.book(id));
+  let meta = got ? tryParseJson(got.text) : null;
   if (!meta) return json({ error: '书不存在' }, 404);
   if (meta.status !== 'ready') return json({ error: '书正在更新中，请稍后重试' }, 409);
   if (Array.isArray(meta.orphans) && meta.orphans.length) {
-    await sweepOrphans(store, meta);
-    await store.putText(KEY.book(id), JSON.stringify(meta));
+    // 写回走 CAS：这次写回与并发的 PATCH（星标/置顶/readDone/备注）都是「读—改—写 meta」，
+    // 无条件整份覆盖时后写者会吃掉前者的字段（用户看到「刚改的星标没了」）。
+    // 冲突 → 重读新盘面、再扫一次（删孤儿幂等，重放不会放大）→ 用新版本号写。
+    let etag = got.etag;
+    for (let attempt = 0; ; attempt++) {
+      await sweepOrphans(store, meta);
+      const res = await putIf(store, KEY.book(id), JSON.stringify(meta), etag);
+      if (res.ok) break;
+      // 重试用尽：孤儿正文已删，meta 里残留的 orphans 字段不影响读取（下次 GET/PATCH 会再扫）
+      if (attempt + 1 >= IDX_SAVE_TRIES) break;
+      const again = await getWithEtag(store, KEY.book(id));
+      const fresh = again ? tryParseJson(again.text) : null;
+      if (!fresh) break; // 期间书被删了 → 不再写回
+      meta = fresh;
+      etag = again.etag;
+      if (!Array.isArray(meta.orphans) || !meta.orphans.length) break; // 新盘面已无孤儿
+    }
   }
   const { orphans, ...view } = meta;
   return json(view);
 }
 
-/** 改元信息（书名/作者/标签/置顶）——PATCH，同步 index（单书模式：只碰该书所在分片） */
+/** 改元信息（书名/作者/标签/置顶/备注/阅读状态）——PATCH，同步 index（单书模式：只碰该书所在分片） */
 async function apiPatchBook(req, store, id) {
   const body = await req.json().catch(() => ({}));
   const idx = await openIndex(store, { single: id });
   if (!idx.get(id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
-  const meta = await readBook(store, id);
-  if (!meta) return json({ error: '书不存在' }, 404);
-  const patch = {};
-  if (body.title !== undefined) {
-    const t = safeStr(body.title, 120);
-    if (t) {
-      meta.title = t;
-      patch.title = t;
+  // 读—改—写走 CAS：并发的 GET 目录可能正在写回孤儿清理，两边都无条件整份覆盖时后写者会吃掉
+  // 前者的字段（表现为「刚改的星标没了」）。PATCH 是**字段级合并**、重放幂等，所以冲突时重读
+  // 新盘面重放即可，任何一方都不丢。
+  let patch;
+  for (let attempt = 0; ; attempt++) {
+    const got = await getWithEtag(store, KEY.book(id));
+    const meta = got ? tryParseJson(got.text) : null;
+    if (!meta) return json({ error: '书不存在' }, 404);
+    patch = {};
+    if (body.title !== undefined) {
+      const t = safeStr(body.title, 120);
+      if (t) {
+        meta.title = t;
+        patch.title = t;
+      }
     }
+    if (body.author !== undefined) {
+      meta.author = safeStr(body.author, 60);
+      patch.author = meta.author;
+    }
+    if (body.note !== undefined) {
+      meta.note = safeStr(body.note, 500);
+      patch.note = meta.note;
+    }
+    if (body.tags !== undefined) {
+      meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
+      patch.tags = meta.tags;
+    }
+    if (body.pinned !== undefined) {
+      meta.pinned = !!body.pinned;
+      patch.pinned = meta.pinned;
+    }
+    if (body.finished !== undefined) {
+      meta.finished = !!body.finished;
+      patch.finished = meta.finished;
+    }
+    // 「已读完」＝我的阅读状态，与 finished（这本书本身写完了）是两回事，故单独一个字段。
+    // 三态：true 强制已读完 / false 强制未读完（用来摘掉自动判定出来的标记）/ 缺省走自动判定。
+    // null ＝ **清除**该字段，回到自动判定——第三个出口必须存在，否则手动标错一次就永久锁死。
+    // 为什么用 null 而不是省略字段：JSON.stringify 会把 undefined 的键整个丢掉，服务端看到的
+    // 就成了「没这个字段」= 什么都不做，客户端根本无法表达「删除」；而 false 的语义是
+    // 「强制未读完」，与「没标过」不是一回事（前端 readState 按三态分别处理）。
+    // 老书没有该字段 → undefined → 自动回落判定，天然兼容，无需迁移。
+    if (body.readDone !== undefined) {
+      if (body.readDone === null) {
+        delete meta.readDone;
+        patch.readDone = null; // null 作「删除」哨兵传给下面的 index patch
+      } else {
+        meta.readDone = !!body.readDone;
+        patch.readDone = !!body.readDone;
+      }
+    }
+    if (body.star !== undefined) {
+      meta.star = !!body.star;
+      patch.star = !!meta.star;
+    }
+    meta.updatedAt = Date.now();
+    patch.updatedAt = meta.updatedAt;
+    const res = await putIf(store, KEY.book(id), JSON.stringify(meta), got.etag);
+    if (res.ok) break;
+    if (attempt + 1 >= IDX_SAVE_TRIES) return json({ error: '并发冲突，请重试' }, 409);
   }
-  if (body.author !== undefined) {
-    meta.author = safeStr(body.author, 60);
-    patch.author = meta.author;
-  }
-  if (body.note !== undefined) {
-    meta.note = safeStr(body.note, 500);
-    patch.note = meta.note;
-  }
-  if (body.tags !== undefined) {
-    meta.tags = Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [];
-    patch.tags = meta.tags;
-  }
-  if (body.pinned !== undefined) {
-    meta.pinned = !!body.pinned;
-    patch.pinned = meta.pinned;
-  }
-  if (body.finished !== undefined) {
-    meta.finished = !!body.finished;
-    patch.finished = meta.finished;
-  }
-  // 「已读完」＝我的阅读状态，与 finished（这本书本身写完了）是两回事，故单独一个字段。
-  // 三态：true 强制已读完 / false 强制未读完（用来摘掉自动判定出来的标记）/ 缺省走自动判定。
-  // 老书没有该字段 → undefined → 自动回落判定，天然兼容，无需迁移。
-  if (body.readDone !== undefined) {
-    meta.readDone = !!body.readDone;
-    patch.readDone = !!body.readDone;
-  }
-  if (body.star !== undefined) {
-    meta.star = !!body.star;
-    patch.star = !!body.star;
-  }
-  meta.updatedAt = Date.now();
-  patch.updatedAt = meta.updatedAt;
-  await store.putText(KEY.book(id), JSON.stringify(meta));
 
   idx.patch(id, (b) => ({
     ...b,
@@ -1527,7 +1561,8 @@ async function apiPatchBook(req, store, id) {
     tags: patch.tags !== undefined ? patch.tags : b.tags,
     pinned: patch.pinned !== undefined ? patch.pinned : !!b.pinned,
     finished: patch.finished !== undefined ? patch.finished : !!b.finished,
-    readDone: patch.readDone !== undefined ? patch.readDone : b.readDone,
+    // null ＝ 清除：置成 undefined，JSON 序列化时该键直接消失，前端据此回落自动判定
+    readDone: patch.readDone === null ? undefined : patch.readDone !== undefined ? patch.readDone : b.readDone,
     star: patch.star !== undefined ? patch.star : !!b.star,
     updatedAt: patch.updatedAt,
   }));
@@ -1749,18 +1784,35 @@ async function apiProgressPut(req, store, id) {
   let ratio = Number(body.ratio);
   if (!Number.isFinite(ratio)) ratio = 0;
   ratio = Math.min(1, Math.max(0, ratio));
-  // 离线队列回放的对账（L6 / L17）：只有客户端带上「原写入时间」或「入队时的内容版本」时才做。
-  //   · 迟到：盘上真值的 updatedAt 比它新 → 丢弃。离线期间排队、回网后迟到的旧值不能把更新的
-  //     进度回退（同一设备上也成立：联网后先读了新章，随后队列才回放）。
-  //   · 版本不符：该书在离线期间被编辑/重洗（cleanVer 变了）→ 旧章号已失去意义 → 丢弃，
-  //     否则进度会落在错误的章上（表现为跨设备编辑后进度 ±1）。
-  // 在线正常写入不带这两个字段 → 零额外读，行为与从前完全一致（无条件覆盖）。
+  // 三条对账判据。前两条只对**离线队列回放**生效（L6 / L17，行为不动），
+  // 第三条是在线写入的并发控制（OCC），修的是本次审计定位到的跨设备覆盖：
+  //
+  //   · clientAt（离线队列带「原写入时间」）：离线期间排队、回网后迟到的旧值不能把更新的进度
+  //     回退（同一设备上也成立：联网后先读了新章，随后队列才回放）。
+  //   · clientVer（离线队列带「入队时的内容版本」）：该书在离线期间被编辑/重洗（cleanVer 变了）
+  //     → 旧章号已失去意义 → 丢弃，否则进度会落在错误的章上（表现为跨设备编辑后进度 ±1）。
+  //   · baseAt（在线写入带「本设备上次从服务端读到的 updatedAt」）：盘上真值比客户端**所知道的
+  //     版本**新 → 这台设备是拿着过期认知来写的 → 拒写并把真值回传，让它对账后再来。
+  //     场景：后台久置的旧标签页一醒（visibilitychange / pagehide 都会触发保存）就用旧位置
+  //     无条件覆盖另一台设备刚写的新进度，读者感知为「读到哪跳回去了」。
+  //
+  // ⚠️ baseAt 与 clientAt 的本质差别：baseAt 是**服务端自己写过的时间**，全程只与服务端时间比，
+  //    不受客户端时钟快慢影响；clientAt 是客户端时间，只适用于「离线期间产生的改动」这一种场景
+  //    ——在线路径若照抄它，客户端时钟慢于服务端时会把正常写入误判成过期而丢弃，进度反而更不可靠。
+  // ⚠️ 被拒时**不**把盘上真值当新 baseAt 回灌给客户端：那样它下一次写入就会覆盖，正是要修的事。
+  //    基线只在两处推进：写入成功（响应回传的 updatedAt），或客户端亲眼从服务端读到
+  //    （reader.js 的 syncFromServer 对账）。
+  // 三个字段一个都不带 → 无条件覆盖：老客户端与外部探针的行为完全不变（向后兼容）。
+  const hasBase = body.baseAt !== undefined && body.baseAt !== null;
+  const baseAt = Number(body.baseAt) || 0;
   const clientAt = Number(body.updatedAt) || 0;
   const clientVer = Number(body.cleanVer) || 0;
-  if (clientAt || clientVer) {
+  if (hasBase || clientAt || clientVer) {
     const prev = await store.getText(KEY.progress(id)).catch(() => null);
     const pv = tryParseJson(prev);
-    if (pv && clientAt && (Number(pv.updatedAt) || 0) > clientAt) return json({ ok: true, skipped: 'stale' });
+    const prevAt = pv ? Number(pv.updatedAt) || 0 : 0;
+    if (pv && clientAt && prevAt > clientAt) return json({ ok: true, skipped: 'stale', prog: pv });
+    if (hasBase && prevAt > baseAt) return json({ ok: true, skipped: 'occ', prog: pv });
     if (clientVer) {
       const m = await readBook(store, id).catch(() => null);
       if (m && Number(m.cleanVer || 1) !== clientVer) return json({ ok: true, skipped: 'cleanVer' });
@@ -1776,7 +1828,9 @@ async function apiProgressPut(req, store, id) {
   try {
     const idx = await openIndex(store, { single: id });
     const book = idx.get(id);
-    if (!book) return json({ ok: true });
+    // 书不在架（已删/未发布）：书架镜像无处可写，但进度**真值已落盘** → updatedAt 照回。
+    // 不回的话客户端基线跟不上，它下一次写入会被自己刚写的版本拒掉（白跑一次对账）。
+    if (!book) return json({ ok: true, updatedAt: data.updatedAt });
     // 越界进度压回末章（镜像供书架角标直接显示，不能出现「读到 999/10 章」）
     // 恶意/异常客户端可能直接 PUT 超章数 ch；正常前端已 clamp，这里做服务端兜底。
     const cap = Number(book.chapterCount) || 0;
@@ -1797,7 +1851,8 @@ async function apiProgressPut(req, store, id) {
   } catch {
     /* ignore */
   }
-  return json({ ok: true });
+  // updatedAt 必须回传：客户端拿它推进 OCC 基线（否则下一次写入会被自己刚写的这个版本拒掉）
+  return json({ ok: true, updatedAt: data.updatedAt });
 }
 
 /* ---------------- 批量操作 / 标签治理（分片预算核账后裁剪，客户端按 deferred/remaining 续调） ---------------- */

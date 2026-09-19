@@ -2,6 +2,7 @@
  * 优先走服务端流式端点 GET /export/<id>.txt（1 个请求，逐章流式拼好）；
  * 服务端不可用时（离线 / 书未发布 404）回退浏览器逐章拉取拼接（IndexedDB 缓存离线可用）。 */
 import { fetchChaptersAll } from './store.js';
+import { offline } from './offline.js';
 import { downloadText, downloadBlob } from './ui.js';
 
 /** 拉全章 → 拼 txt → 触发浏览器下载。返回书名。 */
@@ -20,7 +21,12 @@ export async function exportBookTxt(id, onProg) {
   } catch {
     /* 离线/网络失败 → 客户端兜底 */
   }
-  const { meta, texts, missing = 0 } = await fetchChaptersAll(id, onProg);
+  // 第三参＝离线兜底数据源：把 offline.js 注入进去，服务端/网络不可用时用 IndexedDB 里
+  // 已下载的正文拼（这正是本文件顶部那句「IndexedDB 缓存离线可用」的实现；此前只是注释）
+  const { meta, texts, missing = 0 } = await fetchChaptersAll(id, onProg, {
+    book: () => offline.getBook(id),
+    chapter: (key) => offline.getChapter(id, key),
+  });
   const parts = [];
   parts.push(meta.title + (meta.author ? '　作者：' + meta.author : ''));
   parts.push('');

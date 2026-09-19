@@ -154,3 +154,48 @@ test('手动标记：新建书的 index 条目不含 readDone（走自动判定�
   assert.equal('readDone' in b, false);
   assert.equal(b.finished, false, 'finished（书是否完结）是另一个维度，不该被牵连');
 });
+
+/* ---------------- 三态的第三个出口：清除（readDone: null） ----------------
+ * 原实现只有 true/false 两个入口，服务端也只有显式布尔赋值——**这个字段没有出口**：
+ * 手动标错一次就永久锁死（用户明确要的「恢复自动判定」在 UI 上和服务端都不存在）。
+ * 客户端发 undefined 也不行：JSON.stringify 会把该键整个丢掉，服务端看到的是「没这个字段」
+ * = 什么都不做；发 null 才是可表达的信号。 */
+
+test('清除标记：readDone:null → meta 与 index 都不残留该字段（回落自动判定）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '清除标记A', 2);
+
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: false } }));
+  let idxBooks = await readIdxBooks(store);
+  assert.equal(idxBooks.find((b) => b.id === id).readDone, false, '前置：先落一个显式 false');
+
+  const r = await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: null } }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+
+  idxBooks = await readIdxBooks(store);
+  const b = idxBooks.find((x) => x.id === id);
+  assert.equal('readDone' in b, false, 'null 必须清除 index 镜像（而不是写成 false —— 那是「强制未读完」）');
+
+  const meta = (await call(store, req(`/api/books/${id}`, { cookie }))).data;
+  assert.equal('readDone' in meta, false, 'meta 侧同样不得残留，否则从 meta 重建索引会把标记带回来');
+
+  // 清除后仍可再次标记：三态能循环，不是单向门
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: true } }));
+  idxBooks = await readIdxBooks(store);
+  assert.equal(idxBooks.find((x) => x.id === id).readDone, true, '清除之后必须还能重新标记');
+});
+
+test('清除标记：从 true 直接清除，且不牵连同一次 PATCH 的其它字段', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '清除标记B', 2);
+
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: true } }));
+  await call(store, req(`/api/books/${id}`, { method: 'PATCH', cookie, body: { readDone: null, pinned: true, tags: ['清除后'] } }));
+
+  const b = (await readIdxBooks(store)).find((x) => x.id === id);
+  assert.equal('readDone' in b, false, '同一次 PATCH 里的清除必须生效');
+  assert.equal(b.pinned, true, '同一批的其它字段照旧落地');
+  assert.deepEqual(b.tags, ['清除后']);
+});

@@ -9,6 +9,10 @@ const DB = 'r2novel';
 const VER = 1;
 
 let dbPromise = null;
+/** 打开（并缓存）连接。
+ *  ⚠️ 失败的 promise **不能留在缓存里**：原实现 reject 后 dbPromise 仍是那个 rejected promise，
+ *  之后每次 openDB() 都直接返回它 → 隐私模式 / 配额耗尽触发一次失败，整个会话的离线能力
+ *  （读缓存、入队回放）就全废了，刷新页面之前无法自愈。失败时清掉缓存，让下次调用重新尝试。 */
 function openDB() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
@@ -24,6 +28,9 @@ function openDB() {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  }).catch((e) => {
+    dbPromise = null; // 交回「未打开」状态：瞬时失败（配额回收、隐私模式切换）下次调用可恢复
+    throw e; // 本次调用仍如实失败，调用方的降级路径不变
   });
   return dbPromise;
 }

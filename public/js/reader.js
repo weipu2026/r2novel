@@ -84,6 +84,10 @@ export function bindReader(root, navCb) {
     else if (act === 'tocClose') closeToc();
     else if (act === 'back') {
       closeToc();
+      // 出口落盘：滚动保存是 8s 节流，而 onNav 立刻 closeReader（清掉 state.book）→ 之后所有
+      // 写入路径失效。少这一次保存，丢的不是「8 秒的滚动量」，而是**最后一次节流保存之后的
+      // 全部位置**：翻到新章后 8 秒内滚到 90% 就点返回，云端仍是「本章 0%」。
+      saveProgress();
       if (onNav) onNav();
     }
     else if (act === 'pref') togglePref();
@@ -122,7 +126,9 @@ export function bindReader(root, navCb) {
     }
   });
   els.scroll.addEventListener('scroll', onScroll);
-  document.addEventListener('visibilitychange', onHidden);
+  // visibilitychange 两个方向都要管（转后台落盘、转前台与服务端对账），故与 pagehide 分开绑：
+  // pagehide 只有「离开」一个含义，继续用 onHidden。
+  document.addEventListener('visibilitychange', onVis);
   window.addEventListener('pagehide', onHidden);
   window.addEventListener('keydown', onKey);
   // 阅读中窗口跨断点：桌面 ⇄ 手机 自动切换侧栏显隐
@@ -186,8 +192,11 @@ export async function openBook(id) {
     ch = clampCh((lp.ch || 1) - 1);
     ratio = lp.ratio || 0;
   }
-  const sp = await api.getProgress(id);
+  // 严格版（不吞错）：读不到 与 服务端「没有进度」必须分开——OCC 基线只能来自「真的读到了」，
+  // 把读失败当成「服务端没有进度」会让这台设备的首次写入被服务端判成「拿旧认知来写」永久拒掉。
+  const sp = await api.getProgressStrict(id).catch(() => null);
   if (seq !== openSeq) return; // 进度请求等待期间已切书/已关闭：整次打开作废（state 尚未落，无需清理）
+  progBase = { id, at: sp ? Number(sp.updatedAt) || 0 : 0, known: !!sp };
   if (sp && sp.updatedAt && Number.isFinite(sp.ch) && (!lp || sp.updatedAt > (lp.updatedAt || 0))) {
     ch = clampCh((sp.ch || 1) - 1);
     ratio = sp.ratio || 0;
@@ -646,24 +655,129 @@ function onHidden() {
   saveProgress();
 }
 
+/** visibilitychange 处理器：**两个方向都要处理**。
+ *  转后台＝落盘（最后一次写盘机会）；转前台＝与服务端对账（另一台设备可能在这期间读过了，
+ *  本标签页的基线已过期，继续写就是拿旧认知覆盖新进度）。
+ *  saveProgress 不做方向判断、两个方向都调：它的守卫（无书/未渲染/比例不可测）已经足够精确，
+ *  而「少写一次」恰是会真丢进度的那个方向。 */
+function onVis() {
+  saveProgress();
+  // 这个读请求只在「不是转后台」时发（省一次往返）。该判据只决定「要不要多发一个读」，
+  // 判错也不影响写盘正确性，所以不用它决定是否保存进度。
+  if (document.visibilityState !== 'hidden') syncFromServer();
+}
+
+/* ---------- 进度并发控制（OCC：跨设备不互相覆盖） ----------
+ * 问题：在线写入原本只发 {ch, ratio}，服务端**无条件覆盖**。于是后台久置的旧标签页一醒
+ * （visibilitychange / pagehide 都会触发保存）就把另一台设备刚写的新进度盖掉，读者看到
+ * 「读到哪跳回去了」；同一设备上的旧快照同理。
+ * 做法：客户端带上「本设备上次从服务端读到的 progress.updatedAt」（baseAt），服务端发现盘上
+ * 更新就拒写（见 src/router.js 的 apiProgressPut）。baseAt 是**服务端自己的时间**，与客户端
+ * 时钟快慢无关——这比「带上客户端时间戳」可靠：客户端时钟慢时，后者会把正常写入误判成过期。
+ * 基线只推进、不回灌：被拒时**不**采用服务端真值当新 baseAt（那等于「拒一次、下一次照样覆盖」），
+ * 而是走一次对账，把位置与基线一起同步过来。
+ * 基线按书 id 记住：返回书架再打开另一本书时旧基线自动失效，不必依赖 closeReader 清理。 */
+let progBase = { id: null, at: 0, known: false };
+let lastSyncAt = 0;
+
+const clampChapter = (x) => Math.max(0, Math.min(state.chapters.length - 1, Math.floor(x) || 0));
+
+/** 与服务端进度对账（转回前台 / 写入被拒时调用）。
+ *  serverProg 可由调用方直接传入（拒写响应里已带回真值，省一次读）。
+ *  服务端更新了 → **位置与基线一起同步**：只推进基线不改位置的话，下一次写入会把这个已经
+ *  过期的位置写上去，等于没修。 */
+async function syncFromServer(serverProg) {
+  const book = state.book;
+  if (!book) return;
+  if (!serverProg) {
+    // 纯节流：频繁切标签页不重复发请求。真漏了一次也有自愈——写入会被服务端拒
+    //（skipped:'occ'），那条路径带着真值回调进来，不受节流限制。
+    const now = Date.now();
+    if (now - lastSyncAt < 10000) return;
+    lastSyncAt = now;
+  }
+  const sp = serverProg || (await api.getProgressStrict(book.id).catch(() => null));
+  if (!sp || !sp.updatedAt) return;
+  if (state.book !== book) return; // await 期间已切书/已关闭
+  if (progBase.id === book.id && Number(sp.updatedAt) <= progBase.at) return; // 服务端没有更新
+  progBase = { id: book.id, at: Number(sp.updatedAt), known: true };
+  // 本地镜像写**服务端时间**：openBook 里「本地 vs 云端谁新」的比较才落在同一条时间轴上
+  local.setProg(book.id, { ch: sp.ch || 1, ratio: sp.ratio || 0, updatedAt: Number(sp.updatedAt) });
+  const idx = clampChapter((sp.ch || 1) - 1);
+  const ratio = Number(sp.ratio) || 0;
+  const cur = curRatio();
+  // 位置确实不同才打断阅读：只差一点点（或此刻比例不可测）就只更新基线
+  if (idx === state.cur && (cur === null || Math.abs(cur - ratio) <= 0.02)) return;
+  showTip('进度已在其他设备更新，已同步到最新位置', 2200);
+  renderChapter(idx, ratio).catch(() => {});
+}
+
 /* 进度：state.cur 为数组下标（0-based），落盘统一转 1-based 章节号。
  * 本地镜像 + 云端同步一体：翻章立即上云（保证「继续阅读/最近在读」跨设备准确），
- * 滚动中由 8s 节流与切后台触发；离线入队、回网补传。 */
+ * 滚动中由 8s 节流与切后台触发；离线入队、回网补传。
+ *
+ * ⚠️ 写入必须**串行**（progFlight / progQueued）。理由不是性能，是 OCC 的正确性：
+ * `goto()` 会先 saveProgress()（旧位置、保留离开前的真实滚动比例）再 renderChapter() → 又
+ * saveProgress()（新位置）——**同一 tick 两次写**。若让它们并发，第二次会带着「第一次写之前的
+ * 基线」发出，而服务端此时已被第一次写推进过 → 被自己的写判成「旧认知」拒掉（实测：翻章后云端
+ * 停在上一章，还会触发一次多余的对账回跳）。旧的无条件覆盖实现里这无害（后写者胜），加了 OCC
+ * 之后就变成自撞。串行化后：第二次等第一次响应回来、基线已推进再发 → 既保住两次写各自的语义
+ * （离开章的比例 + 新章的位置），也不再有自撞。在途期间只保留**最后一份**待写负载：
+ * 中间的滚动位置没有单独保留的价值，最终位置才是要写的。 */
+let progFlight = false; // 是否有一次进度写正在途
+let progQueued = null; // 在途期间的最新待写负载 { id, cleanVer, p }
+
 function saveProgress() {
-  if (!state.book) return;
+  const book = state.book;
+  if (!book) return;
   if (state.failedIdx !== null && state.failedIdx === state.cur) return; // 失败章不算读到
   const ratio = curRatio();
   if (ratio === null) return; // 阅读器已隐藏/未渲染：比例不可测，宁可不写也不写 0（防覆盖真实进度）
   const p = { ch: state.cur + 1, ratio, updatedAt: Date.now() };
-  local.setProg(state.book.id, p);
+  local.setProg(book.id, p);
   if (navigator.onLine === false) {
     // 离线：入队，回网自动上送
-    offline.queueProgress(state.book.id, p, state.book.cleanVer).catch(() => {});
+    offline.queueProgress(book.id, p, book.cleanVer).catch(() => {});
     return;
   }
+  // 队列里带上书 id 与 cleanVer：`back` 会 saveProgress() 之后立刻 closeReader()（state.book 清空），
+  // 若用 state.book 取参数，这一次出口落盘会被整条丢掉 —— 正是 P2-4 要修的那个丢失。
+  progQueued = { id: book.id, cleanVer: book.cleanVer, p };
+  if (progFlight) return; // 在途：只留最新一份，等它落地（基线已推进）再发
+  drainProgress();
+}
+
+/** 发一份排队中的进度写（串行队列的唯一出口）。 */
+function drainProgress() {
+  const q = progQueued;
+  progQueued = null;
+  if (!q) return;
+  progFlight = true;
+  // baseAt 只在「本设备确实从服务端读到过」时才带：没读到（离线打开 / 读进度失败）就不带，
+  // 退回旧的无条件覆盖语义——那种情况下服务端真值未知，拿 0 当基线会把正常写入永久拒掉。
+  // 必须在**发送时刻**取（而不是 saveProgress 调用时刻）：排队的这一份要拿到最新基线才不自撞。
+  const occ = progBase.id === q.id && progBase.known ? { baseAt: progBase.at } : {};
   api
-    .putProgress(state.book.id, { ch: p.ch, ratio: p.ratio })
-    .catch(() => offline.queueProgress(state.book.id, p, state.book.cleanVer).catch(() => {}));
+    .putProgress(q.id, { ch: q.p.ch, ratio: q.p.ratio, ...occ })
+    .then((r) => {
+      if (r && r.updatedAt) {
+        // 落盘成功 → 服务端版本就是我们刚写的这个，基线跟上（否则下一次写会被自己刚写的拒掉）
+        if (progBase.id === q.id) progBase = { id: q.id, at: Number(r.updatedAt) || 0, known: true };
+        return;
+      }
+      // 被拒＝另一台设备写过了 → 用响应里带回的真值立刻对账（位置与基线一起同步）
+      if (r && r.skipped === 'occ') {
+        // 排队中的那份是「得知服务端更新之前」的位置，已过期 → 丢弃（否则对账完又用它盖回去）。
+        // 只丢同一本书的：换书后队列里那本是另一本书的合法位置，不能连带丢掉。
+        if (progQueued && progQueued.id === q.id) progQueued = null;
+        syncFromServer(r.prog).catch(() => {});
+      }
+    })
+    .catch(() => offline.queueProgress(q.id, q.p, q.cleanVer).catch(() => {}))
+    .finally(() => {
+      progFlight = false;
+      if (progQueued) drainProgress();
+    });
 }
 
 function goto(idx) {
@@ -748,7 +862,12 @@ async function downloadCurrent() {
   }
   busy(0.02, `下载《${book.title}》整本…`);
   try {
-    const { meta, texts, missing = 0 } = await fetchChaptersAll(book.id, (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`));
+    const { meta, texts, missing = 0 } = await fetchChaptersAll(
+      book.id,
+      (p) => busy(p, `拉取章节… ${Math.round(p * 100)}%`),
+      // 离线兜底源：已经下过的章直接从 IndexedDB 补，网络抖一下不必整本重来
+      { book: () => offline.getBook(book.id), chapter: (key) => offline.getChapter(book.id, key) }
+    );
     // 若本地旧缓存章节数与新版不一致（重洗后），先整体清掉再写入，避免残留旧章
     const old = await offline.getBook(meta.id).catch(() => null);
     if (old && old.chapterCount !== meta.chapterCount) {

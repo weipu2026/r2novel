@@ -312,6 +312,21 @@ async function finishLogout() {
   showView('login');
 }
 
+/** 会话过期（401）的统一出口：清本地痕迹 + 回登录页并写明原因。
+ *  散落的 401 若不收敛，用户看到的会是「N 本失败（可能是半成品书）」这类与鉴权无关的文案，
+ *  点多少次都不可能成功——会话已死，重试永远不会通过。 */
+function expireSession() {
+  els.loginErr.textContent = '会话已过期，请重新登录';
+  finishLogout().catch(() => {});
+}
+
+/** 401 判定 + 收敛；返回 true 表示已处理（调用方据此不再把失败报成业务问题） */
+function handleAuth(e) {
+  if (!(e instanceof ApiError && e.status === 401)) return false;
+  expireSession();
+  return true;
+}
+
 /* ---------- 书架 ---------- */
 const PALETTE = ['#d97757', '#c2518c', '#7d66c9', '#4e8fd8', '#2f9e8f', '#4f9d4f', '#d0a43a', '#8a7a5c'];
 const colorCache = new Map(); // 按书名缓存封面色，避免上千本书重复哈希
@@ -852,9 +867,15 @@ function mountSheet(titleText, items, anchor) {
 
 function openSheet(b, anchor) {
   const isPin = !!b.pinned;
+  const isDone = readState(b) === 'done';
+  // 阅读状态三态在菜单上的完整映射：只给 true ⇄ false 两个入口时，一次误标就**永远摘不掉**，
+  // 手动标记成了单向门。服务端用 readDone:null 表达「清除」——发 undefined 会被 JSON.stringify
+  // 整个丢掉（服务端看到的是「没这个字段」= 什么都不做），客户端根本无法表达删除。
+  const marked = b.readDone !== undefined;
   mountSheet(b.title, [
     { text: '阅读', act: () => openRead(b.id) },
-    { text: readState(b) === 'done' ? '标记为未读完' : '标记为已读完', act: async () => { await markReadDone(b, readState(b) !== 'done'); } },
+    { text: isDone ? '标记为未读完' : '标记为已读完', act: async () => { await markReadDone(b, !isDone); } },
+    ...(marked ? [{ text: '恢复自动判定', act: async () => { await markReadDone(b, null); } }] : []),
     { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { await safePatch(b.id, { pinned: !isPin }); } },
     { text: b.star ? '取消星标' : '标为星标', act: async () => { await safePatch(b.id, { star: !b.star }); } },
     { text: '编辑信息（书名/作者/标签/备注）', act: () => openEditModal(b) },
@@ -939,15 +960,18 @@ async function safePatch(id, patch) {
   }
 }
 
-/** 手动标记「已读完」/ 摘掉标记（PATCH readDone）。
+/** 手动标记「已读完」/ 摘掉标记 / 清除回自动判定（PATCH readDone）。
  * 存在的意义：自动判定依赖进度（停在末章且滚动过阈值），跳着看、听书、或想手动归档时
- * 手动标记是唯一可靠的兜底。三态由服务端与 readState 共同保证：
- * true 强制已读完 / false 强制未读完 / 缺省走自动判定。 */
+ * 手动标记是唯一可靠的兜底。
+ * ⚠️ done 是**三态**：true 强制已读完 / false 强制未读完（摘掉自动判定出来的标记）/
+ * nullable **null 清除**该字段回到自动判定。第三个状态必须能表达，否则手动标记就是单向门
+ * ——标错过一次永远摘不掉。用 null 而不是省略字段：JSON.stringify 会把 undefined 键整个丢掉，
+ * 服务端看到的是「没这个字段」= 什么都不做；而 false 的语义是「强制未读完」，与「没标过」不同。 */
 async function markReadDone(b, done) {
   try {
     await api.patchBook(b.id, { readDone: done });
     await loadShelf();
-    toast(done ? '已标记为读完' : '已取消「已读完」标记', 1600);
+    toast(done === null ? '已恢复自动判定' : done ? '已标记为读完' : '已取消「已读完」标记', 1600);
   } catch (e) {
     toast('操作失败：' + (e.message || e), 2500);
   }
@@ -956,6 +980,12 @@ async function markReadDone(b, done) {
 /* ---------- 编辑信息模态 ---------- */
 async function openEditModal(b) {
   refreshPresetTags(); // 打开弹层顺带后台刷新可选标签（快照先显示，与进上传页同款逻辑）
+  // L12 弹层世代令牌：**入口就抢占**（++ 而不是只读当前值）才能实现「最后一次点击获胜」。
+  // 只读当前值的话，两次 openEditModal 会拿到同一个号，变成「谁先返回谁赢」——第一个点的那次
+  // 若网络更快就先渲染，用户最后一次点的书反而被丢掉。⚠️ 与 openChapterEditor 写法不同：
+  // 那边必须**在 openModal 之后**取号（openModal 自己会推进 modalSeq，见其注释），本函数则在
+  // openModal **之前**用号，两者不可互换。
+  const seq = ++modalSeq;
   let note = '';
   let finished = !!b.finished;
   let metaLoaded = false; // M7：拉取失败时下面必须**省略** note 字段（否则保存即清空服务端的真备注）
@@ -969,6 +999,10 @@ async function openEditModal(b) {
   } catch {
     /* meta 拉取失败：备注框留空但**禁写**（见 metaLoaded 分支）——不提交 ≠ 清空 */
   }
+  // 元信息是 RTT 之后才到的：期间用户可能已点了另一本书（或关掉了弹层）。没有这道闸门时，
+  // 迟到的响应会直接 openModal 覆盖已显示的表单——用户看着甲书的表单，但他最后点的是乙；
+  // 已经填到一半的内容会被整片冲掉。这里作废本次即可（乙那次会自己渲染出来）。
+  if (seq !== modalSeq) return;
   openModal(`
     <h3>编辑信息</h3>
     <p class="modal-sub">《${esc(b.title)}》 · ${b.chapterCount || 0} 章</p>
@@ -1110,12 +1144,16 @@ async function batchRun(action, payload, confirmText) {
   busy(0, `批量操作中… 0/${ids.length}`);
   let ok = 0;
   let fail = 0;
+  let expired = false; // 批内出现过 401：会话已死，本次「失败」与书无关，不能报成半成品书
   try {
     const r = await runBatched(
       ids,
       BATCH_PAGE,
       (batch) => api.batchBooks(batch, action, payload),
-      (done, total) => busy(done / total, `批量操作中… ${done}/${total}`)
+      (done, total) => busy(done / total, `批量操作中… ${done}/${total}`),
+      (e) => {
+        if (e instanceof ApiError && e.status === 401) expired = true;
+      }
     );
     ok = r.ok;
     fail = r.fail;
@@ -1123,9 +1161,15 @@ async function batchRun(action, payload, confirmText) {
     busyDone();
   }
   exitBatchMode();
+  // 会话过期优先处理：报「N 本失败（可能是半成品书）」会引导用户反复重试，而重试永远不会
+  // 成功（cookie 已失效）。收敛到登录页并说明原因。
+  if (expired) {
+    expireSession();
+    return;
+  }
   refreshPresetTags(true); // 标签可能变了：强制刷新 chips（不阻塞后面的书架刷新）
-  await loadShelf().catch(() => {}); // 刷新失败不吞结果提示
-  toast(fail ? `完成 ${ok} 本，${fail} 本失败（可能是半成品书）` : `已更新 ${ok} 本`, 2600);
+  await loadShelf().catch((e) => handleAuth(e)); // 401 收敛到登录页；其余沿用「不打断结果提示」
+  toast(fail ? `完成 ${ok} 本，${fail} 本未生效（可能不在书架或仍是半成品）` : `已更新 ${ok} 本`, 2600);
 }
 
 /** 批量改标签：输入标签（逗号分隔）→ 添加到所选书 / 从所选书移除 */

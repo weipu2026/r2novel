@@ -35,6 +35,7 @@ export function init(caps) {
     runPreview();
   });
   els.upCleanOpts.addEventListener('change', () => runPreview());
+  els.upNoSplit.addEventListener('change', () => runPreview());
   els.upEncoding.addEventListener('change', () => runPreview());
   els.encManual.addEventListener('click', openEncPick);
   els.upForm.addEventListener('submit', (e) => e.preventDefault());

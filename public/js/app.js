@@ -97,6 +97,7 @@ export function init() {
   els.upDetected = $('#upDetected');
   els.upPrev = $('#upPrev');
   els.upStats = $('#upStats');
+  els.upNoSplit = $('#upNoSplit');
   els.upList = $('#upList');
   els.upKeepRaw = $('#upKeepRaw');
   els.upCancel = $('#upCancel');

@@ -5,7 +5,7 @@
  */
 import { els } from '../dom.js';
 import * as upSession from './session.js';
-import { runPreview } from './preview.js';
+import { runPreview, invalidateAutoEnc } from './preview.js';
 
 export function hint(text) {
   els.upUpdateHint.textContent = text;
@@ -24,6 +24,7 @@ export async function prepareFile(file) {
 
 /** 手动指定编码：展开下拉并填入常见编码（自动检测异常时人工纠正用） */
 export function openEncPick() {
+  invalidateAutoEnc(); // 用户已表达手选意图：即便之后选回与自动检测相同的编码，也按手动口径走
   const enc = els.upEncoding;
   const have = Array.from(enc.options).map((o) => o.value);
   for (const c of ['utf-8', 'gb18030', 'big5']) {

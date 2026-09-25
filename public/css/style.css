@@ -148,6 +148,10 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 .shelf-body { flex: 1; overflow-y: auto; padding: 14px 16px calc(24px + env(safe-area-inset-bottom)); }
 .section-label { font-size: var(--fz-sm); color: var(--muted); margin: 14px 0 8px; }
 .section-label:first-child { margin-top: 0; }
+/* 「不分章」开关（分章预览标题行内）：对齐 muted 文字，勾选态加重点色提示当前生效 */
+.section-label .nosplit { margin-left: 10px; color: inherit; cursor: pointer; user-select: none; white-space: nowrap; }
+.section-label .nosplit input { vertical-align: -1px; margin: 0 4px 0 0; }
+.section-label .nosplit:has(input:checked) { color: var(--accent); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
 @media (max-width: 480px) {
   .grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }

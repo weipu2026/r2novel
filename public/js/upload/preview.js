@@ -9,6 +9,15 @@ import { fmtWords } from '../store.js';
 import * as cleaner from '../cleaner.js';
 import * as upSession from './session.js';
 
+/* 「我们自动写进下拉框的编码值」（见 runPreview 开头的 forceEncoding 判定）。
+ * 模块级而非会话级：跨会话残留无害——新会话 files.js 会把下拉重置为 'auto'，首跑即覆盖。 */
+let lastAutoSet = null;
+
+/** 手动指定编码入口（openEncPick）调用：用户已表达「我要手选」，此后下拉值 ≠ 'auto' 一律算手动 */
+export function invalidateAutoEnc() {
+  lastAutoSet = null;
+}
+
 function currentCleanOpts() {
   const o = { ...cleaner.DEFAULT_CLEAN_OPTS };
   const chosen = new Set($$('input[name=cleanitem]:checked', els.upCleanOpts).map((i) => i.value));
@@ -29,13 +38,19 @@ export function runPreview() {
   // 总开关「自动清洗排版」：关闭则整链不套清理（只按编码解码 + 分章）
   const useClean = els.upClean.checked;
   const cleanOpts = useClean ? currentCleanOpts() : { clean: false };
+  // 编码是否「用户手动指定」：下拉框的 value 会被本函数**自动写入**检测结果，
+  // 若只看 value !== 'auto'，下一次任何重跑（切换清洗项/不分章）都会把自动写入的值
+  // 误读成用户手选，静默钉死编码、检测行文案也跟着变。lastAutoSet 记录「我们写的值」，
+  // 与之相等即视为自动；用户真正在 下拉里换选 时 change 事件带来新值 ≠ lastAutoSet 才算手动。
   let forceEncoding = els.upEncoding.value;
-  if (forceEncoding === 'auto') forceEncoding = null;
+  if (forceEncoding === 'auto' || forceEncoding === lastAutoSet) forceEncoding = null;
   const t0 = Date.now();
   const r = cleaner.processBook(sess.bytes, {
     fallbackTitle: sess.title,
     cleanOpts,
     forceEncoding,
+    // 「不分章」：分章规则切错时的逃生门 —— 整本一章，取消勾选即恢复自动分章
+    pattern: els.upNoSplit && els.upNoSplit.checked ? 'none' : 'auto',
   });
   // 服务端单章上限 2MB：超大章（整本一章兜底等）先按 UTF-8 字节边界自动分段，避免 413 中断留下半成品书
   const fit = cleaner.fitChapters(r.chapters);
@@ -60,6 +75,8 @@ export function runPreview() {
   encSel.appendChild(new Option('自动检测', 'auto'));
   for (const c of pool) encSel.appendChild(new Option(c, c));
   encSel.value = cur;
+  // 记录「本轮我们自动写入的值」：用户手动换选后该记录作废（见函数开头的 forceEncoding 判定）
+  lastAutoSet = manual ? null : cur;
   els.encWrap.classList.toggle('hidden', !showSel);
   // 无歧义时隐藏下拉，但保留「手动指定编码」小入口（自动结果异常时可干预）
   els.encManual.classList.toggle('hidden', showSel);
@@ -67,7 +84,7 @@ export function runPreview() {
     ? (r.chapters.length
         ? `已按 ${cur} 编码解析${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''}`
         : `按 ${cur} 编码解析失败，请换一种或改回自动检测`)
-    : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected || '未识别（整本一章）'} · 处理 ${ms}ms`;
+    : `检测编码：${r.encoding}${r.replaced ? '，含 ' + r.replaced + ' 个乱码符' : ''} · 分章规则：${r.detected === 'none' ? '不分章（整本一章）' : (r.detected || '未识别（整本一章）')} · 处理 ${ms}ms`;
 
   if (upSession.isImporting()) {
     // 批量导入：预览面板整段不可见（反馈走上传进度条），这里只需会话里的 preview 数据。

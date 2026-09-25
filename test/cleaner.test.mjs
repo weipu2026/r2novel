@@ -332,3 +332,52 @@ test('fitChapters：整本一章大书（无章兜底）自动分段后可正常
   assert.equal(joined, text, '整本切块拼接应与原文一致');
   for (const c of r.chapters) assert.ok(new TextEncoder().encode(c.content).length <= 1900000, '每段 ≤1.9MB（默认上限）');
 });
+
+/* ---------------- 不分章（pattern:'none'）—— 2026-09-25 新增 ---------------- */
+
+test('不分章：带章标记的文本也不切，整本一章', () => {
+  const text = '第一章 起点\n正文甲。\n第二章 转折\n正文乙。';
+  const r = splitChapters(text, { pattern: 'none', fallbackTitle: '我的书' });
+  assert.equal(r.chapters.length, 1, '显式不分章必须整本一章（章标记留在正文里当普通文字）');
+  assert.equal(r.chapters[0].title, '我的书');
+  assert.ok(r.chapters[0].content.includes('第一章 起点'), '章标记不得被删');
+  assert.ok(r.chapters[0].content.includes('正文乙。'));
+  assert.equal(r.detected, 'none', 'detected=none 表示用户主动选择，区别于 null（未识别）');
+});
+
+test('不分章：无 fallbackTitle 且首行短 → 取首行当章名', () => {
+  const text = '短标题\n正文内容。';
+  const r = splitChapters(text, { pattern: 'none' });
+  assert.equal(r.chapters.length, 1);
+  assert.equal(r.chapters[0].title, '短标题');
+});
+
+test('不分章：clean 开着时正文仍套清洗（清洗与分章独立）', () => {
+  const text = '第一章 X\n他说了[1]一句话。\n**重要**内容。';
+  const r = splitChapters(text, { pattern: 'none', fallbackTitle: '书' });
+  assert.equal(r.chapters.length, 1, '不得被 auto 分章（否则整章标记被当真切走）');
+  const c = r.chapters[0].content;
+  assert.ok(!c.includes('[1]'), '脚注仍按清洗选项删');
+  assert.ok(!c.includes('**'), 'Markdown 仍按清洗选项删');
+  assert.ok(c.includes('他说了一句话'));
+  assert.ok(c.includes('第一章 X'), '章标记留在正文里');
+});
+
+test('不分章：clean 关掉时正文原样保留', () => {
+  const text = '第一章 X\n他说了[1]一句话。';
+  const r = splitChapters(text, { pattern: 'none', clean: false, fallbackTitle: '书' });
+  assert.equal(r.chapters[0].content, text);
+});
+
+test('不分章：空文本 → 空章节（确认按钮禁用路径不变）', () => {
+  const r = splitChapters('   \n  ', { pattern: 'none', fallbackTitle: '书' });
+  assert.deepEqual(r.chapters, []);
+});
+
+test('processBook：pattern none 透传（上传页的实际入口）', () => {
+  const bytes = new TextEncoder().encode('第一章 甲\n内容一。\n第二章 乙\n内容二。');
+  const r = processBook(bytes, { fallbackTitle: '透传书', pattern: 'none' });
+  assert.equal(r.chapters.length, 1);
+  assert.equal(r.chapters[0].title, '透传书');
+  assert.equal(r.detected, 'none');
+});

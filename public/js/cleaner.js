@@ -342,6 +342,18 @@ export function splitChapters(text, opts = {}) {
   let src;
   let flags = '';
 
+  // 「不分章」（patternId === 'none'）：用户显式选择的逃生门 —— 自动分章切错时，勾上它
+  // 整本一章入库（之后仍可在预览/编辑器手动增删章）。与 auto 未识别的整本兜底同款逻辑，
+  // 但 detected 返回 'none' 以示「用户主动选的」而非「没识别出来」。
+  if (patternId === 'none') {
+    const whole = clean ? cleanText(raw.trim(), cleanOpts) : raw.trim();
+    if (!whole) return { chapters: [], detected: null };
+    const firstLine = whole.split('\n')[0] || '';
+    const fb = opts.fallbackTitle || '';
+    const singleTitle = fb || (firstLine.length > 30 ? '正文' : firstLine);
+    return { chapters: [{ title: singleTitle, content: whole }], detected: 'none' };
+  }
+
   if (patternId === 'auto') {
     const best = detectBest(raw);
     if (!best) {

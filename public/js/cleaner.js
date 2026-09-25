@@ -326,12 +326,14 @@ function isLikelyTitle(s) {
 
 /**
  * splitChapters(text, opts)
- *   opts.pattern    'auto' | 'cn' | 'cn_hui' | 'cn_jie' | 'cn_juan' | 'en' | 'vol' | 'custom'
+ *   opts.pattern    'auto' | 'cn' | 'cn_hui' | 'cn_jie' | 'cn_juan' | 'en' | 'vol' | 'custom' | 'none'
+ *                   'none' = 用户显式「不分章」：跳过检测与切分，整本一章（detected 返回 'none'）
  *   opts.customSrc  自定义正则（需 2 捕获组：标记、标题）
  *   opts.clean      每章是否套用 cleanText（默认 true）
  *   opts.cleanOpts  传给 cleanText 的选项
  *   opts.fallbackTitle  单章时默认章名（通常传书名）
  * 返回 { chapters:[{title, content}], detected }
+ *   detected = 实际生效的规则 id；'none' 表示用户主动选择不分章，null 表示自动检测未识别
  */
 export function splitChapters(text, opts = {}) {
   const clean = opts.clean !== false;

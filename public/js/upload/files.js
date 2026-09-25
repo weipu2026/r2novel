@@ -84,6 +84,10 @@ export async function handleFiles(files) {
     return;
   }
   if (files.length > 1) {
+    // 「不分章」是逐本预览时的一次性选择（勾选前用户看到的是这一本的章数）。批量导入没有
+    // 逐本 UI：预览面板整段隐藏、确认弹窗又整屏遮罩住复选框 —— 沿用上一本的勾选态会**静默**
+    // 把整批都变成 1 章，用户既看不见也改不了。批量一律回到自动分章。
+    els.upNoSplit.checked = false;
     await importBatch(files);
     return;
   }

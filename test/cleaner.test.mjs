@@ -91,6 +91,24 @@ test('清理：站点残留行删除（URL 行 / 书站广告括注）', () => {
   assert.ok(out.includes('继续'));
 });
 
+test('清理：数字小标题「1. xxx」保留（不被当 Markdown 有序列表删除）', () => {
+  const out = cleanText('1. 初见\n他推开门。\n2. 重逢\n她笑了。', { stripMarkdown: true });
+  assert.ok(out.includes('1. 初见'), '编号 1. 应保留');
+  assert.ok(out.includes('2. 重逢'), '编号 2. 应保留');
+  assert.ok(out.includes('他推开门。'));
+});
+
+test('清理：其余 Markdown 规则不受影响（#/列表符/加粗/斜体）', () => {
+  const out = cleanText('# 标题行\n- 项目甲\n*项目乙*\n**加粗正文**', { stripMarkdown: true });
+  assert.ok(!out.includes('#'), '# 标题符应删');
+  assert.ok(!out.includes('- 项目甲'), '- 列表符应删');
+  assert.ok(!out.includes('*'), '星号应删');
+  assert.ok(out.includes('标题行'));
+  assert.ok(out.includes('项目甲'));
+  assert.ok(out.includes('项目乙'));
+  assert.ok(out.includes('加粗正文'));
+});
+
 /* ---- 智能分章 ---- */
 
 test('分章：自动检测 + 标题同行保留 + 引子归章', () => {

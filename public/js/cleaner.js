@@ -180,7 +180,8 @@ function stripMarkdown(text) {
   text = text.replace(/^\s{0,3}#{1,6}\s+/gm, '');
   text = text.replace(/^\s{0,3}>\s?/gm, '');
   text = text.replace(/^\s{0,3}[-*+]\s+/gm, '');
-  text = text.replace(/^\s{0,3}\d+\.\s+/gm, '');
+  // 数字列表标记（"1. "）不删：txt 小说常见「1. xxx」小标题与此模式同形，删掉编号只剩标题、影响阅读；
+  // 真 Markdown 有序列表残留前缀无害 —— 宁保留不误删（2026-09-30 用户拍板）。
   text = text.replace(/^\s{0,3}([-*_])\1{2,}\s*$/gm, '');
   text = text.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
   text = text.replace(/\*\*([^*]+)\*\*/g, '$1');

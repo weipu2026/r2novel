@@ -334,9 +334,10 @@ async function loadChapter(idx) {
   }
 }
 
-/* ---------- 进度线（底栏上沿细线：看全书位置 + 点/拖跳章） ----------
+/* ---------- 进度线（底栏上沿细线：看全书位置 + 跳章） ----------
  * 手机底栏按钮位已满，故不加按钮：细线同时承担「看进度」与「跳章」。
- * 拖动中只更新浮标文案，松手才真正 goto——拖动不触发渲染，长书也不卡。 */
+ * 防误触（2026-09-30）：轻点只预览「第 N 章 · 再点跳转」，CONFIRM_MS 内再点才跳；
+ * 拖动维持松手即跳。拖动中只更新浮标文案，松手才真正 goto——拖动不触发渲染，长书也不卡。 */
 function updateProgressLine() {
   const n = state.chapters.length || 1;
   const i = Math.min(state.cur, n - 1);
@@ -352,6 +353,11 @@ function bindProgLine() {
   if (!p) return;
   let dragging = false;
   let lastTarget = -1; // 拖动中目标章去重：move 是逐像素事件，同章重复写 DOM 会让长书拖动掉帧
+  let downX = 0, downY = 0; // 判「轻点」还是「拖动」：抬手位移 < TAP_PX 算轻点
+  let confirmIdx = -1; // 轻点预览挂起的目标章（-1 = 无）。手机误触高发：轻点不再直接跳章
+  let confirmAt = 0; // 挂起时刻：CONFIRM_MS 内再点一次才真正跳，超时懒失效（不占定时器）
+  const TAP_PX = 8;
+  const CONFIRM_MS = 2500;
   const targetOf = (e) => {
     const n = state.chapters.length;
     if (!n) return 0;
@@ -370,6 +376,9 @@ function bindProgLine() {
     if (!state.book || !state.chapters.length) return;
     dragging = true;
     lastTarget = -1;
+    downX = e.clientX;
+    downY = e.clientY;
+    if (Date.now() - confirmAt > CONFIRM_MS) confirmIdx = -1; // 预览挂起已超时 → 懒过期
     if (p.setPointerCapture) p.setPointerCapture(e.pointerId); // 移出热区仍能收到 move/up
     tipFor(targetOf(e));
     e.preventDefault(); // 防触发页面滚动（配合 CSS touch-action:none）
@@ -381,8 +390,24 @@ function bindProgLine() {
     if (!dragging) return;
     dragging = false;
     const i = targetOf(e);
-    if (i !== state.cur) goto(i); // 跳章后进度线由 renderChapter 统一刷新
-    showTip(label(i), 1200); // 收尾提示总是要给（tipFor 可能因去重跳过）
+    const tap = Math.hypot(e.clientX - downX, e.clientY - downY) < TAP_PX;
+    if (!tap) {
+      // 拖动是有意识选章：维持「松手即跳」原行为
+      confirmIdx = -1;
+      if (i !== state.cur) goto(i); // 跳章后进度线由 renderChapter 统一刷新
+      showTip(label(i), 1200);
+      return;
+    }
+    // 轻点：拇指最易误触的路径 —— 只预览不跳，CONFIRM_MS 内再点一次才真正跳转
+    if (confirmIdx >= 0) {
+      confirmIdx = -1;
+      if (i !== state.cur) goto(i); // 第二击落在哪就跳哪（第一击只是武装确认态）
+      showTip(label(i), 1200);
+    } else {
+      confirmIdx = i;
+      confirmAt = Date.now();
+      showTip(label(i) + ' · 再点跳转', CONFIRM_MS);
+    }
   };
   p.addEventListener('pointerup', finish);
   p.addEventListener('pointercancel', () => {

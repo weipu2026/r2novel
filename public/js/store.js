@@ -314,9 +314,12 @@ export async function fetchChaptersAll(id, onProg, offlineSrc) {
   let netFails = 0; // 连续的非 ApiError 失败数
   let netDown = false; // 已判定断链：暂停逐章请求，只留周期探测
   let probes = 0; // 断链后的探测计数
+  let authDead = false; // 任一 worker 撞到 401 → 其余 worker 立即收工：会话已死，剩下的每章请求
+  // 全都注定 401 且被计成 missing，千章书就是上千个无效请求白烧配额（2026-10-01 审计）
   await Promise.all(
     Array.from({ length: Math.min(CONC, n) }, async () => {
       while (true) {
+        if (authDead) break;
         const idx = cursor++;
         if (idx >= n) break;
         const key = chapters[idx].key;
@@ -330,7 +333,10 @@ export async function fetchChaptersAll(id, onProg, offlineSrc) {
           netFails = 0;
           netDown = false; // 探测成功（或本就在网络路径）→ 链路可用，回到逐章请求
         } catch (e) {
-          if (e instanceof ApiError && e.status === 401) throw e;
+          if (e instanceof ApiError && e.status === 401) {
+            authDead = true;
+            throw e;
+          }
           if (e instanceof ApiError) netFails = 0; // 服务端有业务响应 → 链路是通的
           else if (++netFails >= NET_DOWN_AFTER) netDown = true;
           // 单章失败 → 先看本地整本缓存里有没有这一章（离线导出的关键一步）

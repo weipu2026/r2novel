@@ -41,15 +41,18 @@ export async function runBatched(ids, pageSize, send, onProgress, onError) {
       if (onError) onError(e); // 把错误交出去分类，但失败语义不变（整批计入 fail、不原地重试）
       resp = null; // 单批失败：整批计入失败、不原地重试（沿用旧行为，避免网络抖动时死磕）
     }
-    ok += Number(resp && resp.updated) || 0;
     // 只认「本轮真的发出去的 id」里回传的 deferred：后端回传别的东西也不会污染队列
     const deferred = resp && Array.isArray(resp.deferred) ? resp.deferred.filter((id) => batch.includes(id)) : [];
     if (deferred.length >= batch.length) {
       // 整批退回＝本轮零进展（再试通常还是同样结果 → 收手）。唯一例外：后端**自愈轮**——root 深度坏时
       // 预算全花在重建索引上，一本没动但盘面已修好，此时回传 retry:true 让客户端再发一次。
       // 只容忍一次：后端若一直回 retry 也不会空转（maxRounds 之外再加一道保险）。
+      // ⚠️ 零进展轮**不计 updated**：这批 id 正被原样退回/重跑，照加的话同一批会被计两次成功、
+      // fail = total - ok 被压成 0（2026-10-01 审计：防御后端违反「自愈轮 updated=0」契约）。
       if (resp && resp.retry && !retried) retried = true;
       else break;
+    } else {
+      ok += Number(resp && resp.updated) || 0;
     }
     queue = deferred.concat(rest);
     if (onProgress) onProgress(total - queue.length, total);

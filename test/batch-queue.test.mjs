@@ -130,6 +130,19 @@ test('自愈轮：后端 retry=true 的零进展允许重发一次，再零进�
   assert.equal(calls2, 2, 'retry 只容忍一次，不会无限重发');
 });
 
+test('防御：后端违反「自愈轮 updated=0」契约时不得双计 ok（fail 不被压成 0）', async () => {
+  // 契约是自愈轮零进展；若后端违约回传 updated>0 而整批又退回重跑，同一批会被计两次。
+  const ids = ['a', 'b', 'c'];
+  let calls = 0;
+  const r = await runBatched(ids, PAGE, async (batch) => {
+    calls++;
+    if (calls === 1) return { updated: batch.length, deferred: batch, retry: true }; // 违约：又说做了又说全退回
+    return { updated: batch.length, deferred: [] };
+  });
+  assert.deepEqual(r, { ok: 3, fail: 0 }, '第一轮的 updated 不计入（零进展轮），只算重跑那次');
+  assert.equal(calls, 2);
+});
+
 test('单批失败：该批计失败，队列继续（不吞掉后面的书）', async () => {
   const ids = Array.from({ length: 40 }, (_, i) => 'x' + i);
   let calls = 0;

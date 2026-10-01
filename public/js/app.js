@@ -307,7 +307,10 @@ async function finishLogout() {
   els.batchBar.classList.add('hidden');
   books = [];
   tagCache = null;
-  ui.page = 1;
+  // 筛选/搜索态一并重置：只清持久层的话，重登后书架仍按上一会话的筛选渲染 ——
+  // 星标筛选残留会让新书架显示「没有匹配的书」，用户误以为书丢了（2026-10-01 审计实锤）
+  ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
+  els.searchInput.value = '';
   presetTags = []; presetTagsAt = 0; presetTagsInflight = null;
   els.grid.innerHTML = '';
   showView('login');
@@ -826,13 +829,9 @@ async function openRead(id) {
     showView('read');
     await reader.openBook(id);
   } catch (e) {
+    if (handleAuth(e)) return; // expireSession → finishLogout 已完成视图切换（含回登录页）
     showView('shelf');
-    if (e instanceof ApiError && e.status === 401) {
-      toast('会话过期，请重新登录', 2500);
-      showView('login');
-    } else {
-      toast('打开失败：' + (e.message || e), 2500);
-    }
+    toast('打开失败：' + (e.message || e), 2500);
   }
 }
 
@@ -957,6 +956,7 @@ async function safePatch(id, patch) {
     if (patch.pinned !== undefined) toast(patch.pinned ? '已置顶' : '已取消置顶', 1400);
     if (patch.star !== undefined) toast(patch.star ? '已加星标' : '已取消星标', 1400);
   } catch (e) {
+    if (handleAuth(e)) return; // 会话过期：收敛到登录页，别把 401 报成「操作失败」让用户白重试
     toast('操作失败：' + (e.message || e), 2500);
   }
 }
@@ -974,6 +974,7 @@ async function markReadDone(b, done) {
     await loadShelf();
     toast(done === null ? '已恢复自动判定' : done ? '已标记为读完' : '已取消「已读完」标记', 1600);
   } catch (e) {
+    if (handleAuth(e)) return;
     toast('操作失败：' + (e.message || e), 2500);
   }
 }
@@ -1365,23 +1366,28 @@ async function diagScanAll(onPage) {
       break;
     }
   }
+  if (cursor) incomplete = true; // 200 页守卫耗尽但游标没走完：结果不完整，别谎报「扫描完整」（用户会据此放心地「删除全部」）
   merged.incomplete = incomplete;
   return merged;
 }
 
 async function openDiag() {
   openModal('<h3>残留检查</h3><p class="modal-sub">正在扫描全库对象…</p>');
+  const seq = modalSeq; // L12 世代令牌（openModal 已推进，此刻取号）：扫描途中用户若打开别的
+  // 弹层（如编辑信息），迟到的扫描结果会把别人弹层的内容整块顶掉 —— 输入到一半的数据全丢。
+  // 旧实现只看 mask 显隐，挡不住「mask 可见但开着的是别的弹层」。
   try {
     diagData = await diagScanAll((m) => {
       if (els.modalMask.classList.contains('hidden')) return false; // 已关闭 → 中止后续扫描
+      if (seq !== modalSeq) return false; // 弹层已被换掉 → 中止，别污染别人的弹层
       const el = $('.modal-sub', els.modalBox);
       if (el) el.textContent = `正在扫描全库对象… 已扫 ${m.scannedPages || 0} 页，暂发现 ${(m.residue || []).length + (m.chapterOrphans || []).length} 项残留`;
       return true;
     });
-    if (els.modalMask.classList.contains('hidden')) return; // 扫描期间用户已关闭
+    if (seq !== modalSeq || els.modalMask.classList.contains('hidden')) return; // 已换层/已关闭
     renderDiag();
   } catch (e) {
-    if (els.modalMask.classList.contains('hidden')) return;
+    if (seq !== modalSeq || els.modalMask.classList.contains('hidden')) return;
     els.modalBox.innerHTML = `<h3>残留检查</h3>
       <p class="modal-sub">扫描失败：${esc(e.message || e)}</p>
       <div class="m-acts"><button class="ghost" id="diagErrClose" type="button">关闭</button></div>`;
@@ -1390,12 +1396,15 @@ async function openDiag() {
 }
 
 async function diagRefresh() {
+  const seq = modalSeq; // 同 openDiag：诊断面板内的操作等待期间用户可能换了弹层
   try {
     diagData = await diagScanAll(null);
   } catch (e) {
+    if (handleAuth(e)) return;
     toast('扫描失败：' + (e.message || e), 2200);
     return;
   }
+  if (seq !== modalSeq) return; // 弹层已被换掉：迟到结果不渲染
   renderDiag(); // 无论面板当前是否可见都渲染（调用方需保证面板开着；可见性由 openDiag 入口控制）
 }
 
@@ -1472,6 +1481,7 @@ async function onDiagBoxClick(e) {
       toast(r1 && r1.deleted ? '已删除 1 个对象' : '对象已在引用中，未删除', 1400);
       await diagRefresh();
     } catch (err) {
+      if (handleAuth(err)) return;
       toast('删除失败：' + (err.message || err), 2400);
     }
   } else if (act === 'del-all') {
@@ -1491,6 +1501,7 @@ async function onDiagBoxClick(e) {
       );
       await diagRefresh();
     } catch (err) {
+      if (handleAuth(err)) return;
       toast('删除失败：' + (err.message || err), 2400);
     }
   } else if (act === 'move-book') {
@@ -1503,6 +1514,7 @@ async function onDiagBoxClick(e) {
       toast('已移入回收站', 1600);
       await diagRefresh();
     } catch (err) {
+      if (handleAuth(err)) return;
       toast('操作失败：' + (err.message || err), 2400);
     }
   }
@@ -1518,6 +1530,7 @@ async function exportBook(b) {
     if (missing) toast(`《${title}》已导出，但有 ${missing} 章未取到（可联网后重试）`, 3200);
     else toast(`《${title}》已导出`, 1800);
   } catch (e) {
+    if (handleAuth(e)) return;
     toast('导出失败：' + (e.message || e), 2800);
   } finally {
     busyDone();
@@ -1530,6 +1543,7 @@ async function openTrash() {
   try {
     await loadTrash();
   } catch (e) {
+    if (handleAuth(e)) return; // 会话过期：直接回登录页，别在回收站页渲染「加载失败：unauthorized」
     els.trashList.innerHTML = '';
     const p = document.createElement('p');
     p.className = 'empty muted';
@@ -1590,6 +1604,7 @@ function trashRow(b) {
         toast('已恢复', 1400);
         await loadTrash();
       } catch (e) {
+        if (handleAuth(e)) return;
         toast('恢复失败：' + (e.message || e), 2500);
       }
     });
@@ -1607,6 +1622,9 @@ function trashRow(b) {
 
 async function purgeOne(b) {
   if (!(await confirmModal(`彻底删除《${b.title}》？正文与原件将一并清除，无法恢复。`, '彻底删除'))) return;
+  // 多章书要跑多轮 DELETE：挂上忙态遮罩防重入 —— 否则循环期间用户可再点「彻底删除/恢复」，
+  // 形成两条并发的 purge/restore 请求流（toast 语义混乱、后到者覆盖先到者的 UI 态）
+  busy(0.1, '正在彻底删除…');
   try {
     let remaining = 1;
     let guard = 0;
@@ -1617,7 +1635,10 @@ async function purgeOne(b) {
     toast(remaining ? '删除未完成，请重试' : '已彻底删除', 1400);
     await loadTrash();
   } catch (e) {
+    if (handleAuth(e)) return;
     toast('删除失败：' + (e.message || e), 2500);
+  } finally {
+    busyDone();
   }
 }
 
@@ -1637,6 +1658,7 @@ async function clearTrashFlow() {
     toast(remaining ? '清空未完成，请重试' : '回收站已清空', 1500);
     await loadTrash();
   } catch (e) {
+    if (handleAuth(e)) return;
     toast('清空失败：' + (e.message || e), 2500);
   } finally {
     busyDone();

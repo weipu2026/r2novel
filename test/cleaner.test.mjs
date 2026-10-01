@@ -161,6 +161,50 @@ test('分章：自定义正则（2 捕获组）', () => {
   assert.equal(r.chapters[0].title, '=== 第一卷 山间 ===');
 });
 
+test('分章：连续章标行不互吞（空标题章后紧跟带标题章）', () => {
+  // 旧正则标记后的 \s* 能跨行：第一章命中后把「第二章 开端」整行吞进标题、
+  // 且 lastIndex 越过第二章标记行（2026-10-01 审计实锤）。首章无正文会被既有的
+  // L1 空章过滤丢掉（目录页保护，设计如此），判据落在「标题不再互吞 + 正文归属正确」。
+  const text = '第一章\n第二章 开端\n正文B内容。\n第三章 结局\n正文C内容。';
+  const r = splitChapters(text, {});
+  assert.equal(r.detected, 'cn');
+  assert.equal(r.chapters.length, 2); // 第一章（空正文）按 L1 丢弃
+  assert.equal(r.chapters[0].title, '第二章 开端', '第二章标记应仍是切分点、标题不被吞');
+  assert.ok(r.chapters[0].content.includes('正文B'), '正文B 归属第二章');
+  assert.equal(r.chapters[1].title, '第三章 结局');
+  assert.ok(r.chapters[1].content.includes('正文C'));
+});
+
+test('分章：「第X回」的书 detected 应为 cn_hui 而非 cn', () => {
+  const text = '第一回 出场\n正文甲。\n第二回 交锋\n正文乙。';
+  const r = splitChapters(text, {});
+  assert.equal(r.detected, 'cn_hui');
+  assert.equal(r.chapters.length, 2);
+  assert.equal(r.chapters[0].title, '第一回 出场');
+});
+
+test('分章：custom 非法正则 → 未识别兜底（整本一章 + detected null），不再静默回落 cn', () => {
+  const text = '第一章 甲\n正文一。\n第二章 乙\n正文二。';
+  const r = splitChapters(text, { pattern: 'custom', customSrc: '(第[章' });
+  assert.equal(r.detected, null);
+  assert.equal(r.chapters.length, 1);
+});
+
+test('分章：custom 空正则 → 未识别兜底（不再逐字符碎成海量章）', () => {
+  const text = '第一章 甲\n正文一。\n第二章 乙\n正文二。';
+  const r = splitChapters(text, { pattern: 'custom', customSrc: '' });
+  assert.equal(r.detected, null);
+  assert.equal(r.chapters.length, 1);
+});
+
+test('编码：无 BOM 的 UTF-16LE 可被启发式识别', () => {
+  // Buffer 按小端 UTF-16 编码：'a' → 61 00，0x00 全在奇数位
+  const bytes = new Uint8Array(Buffer.from('第一章 相遇\n他醒了。\n第二章 离别\n她走了。', 'utf16le'));
+  const r = detectEncoding(bytes);
+  assert.equal(r.encoding, 'utf-16le');
+  assert.ok(r.text.includes('第一章'));
+});
+
 /* 2 章 GBK 样本（码位手工核验）：'第一章 中文\n这是测试。\n第二章 小字\n这是测试。'
  *   第B5DA 一D2BB 章D5C2 空格20 中D6D0 文CEC4 \n0A
  *   这D5E2 是CAC7 测B2E2 试CAD4 。A1A3 \n0A

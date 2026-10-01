@@ -67,7 +67,7 @@ export function runPreview() {
   const manual = !!forceEncoding;
   const cur = forceEncoding || r.encoding;
   const pool = manual
-    ? ['utf-8', 'gb18030', 'big5']
+    ? ['utf-8', 'gb18030', 'big5', 'utf-16le', 'utf-16be'] // utf-16 两端序：无 BOM UTF-16 文件的最后自救手段
     : (r.candidates || []).filter((c) => c.encoding !== 'auto' && c.score > -100).map((c) => c.encoding);
   if (manual && !pool.includes(cur)) pool.unshift(cur);
   const showSel = manual || pool.some((c) => c !== cur);

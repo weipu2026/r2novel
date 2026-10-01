@@ -130,6 +130,24 @@ export function detectEncoding(bytes) {
     }
     return { encoding: lab, score: readabilityScore(text), replaced: (text.match(/\uFFFD/g) || []).length, text };
   });
+  // 无 BOM 的 UTF-16 兜底（M3 之后的最后死角）：三路 fatal 候选解 UTF-16 文本全是乱码，
+  // 手动编码池原本也没有 utf-16 → 用户站内完全无解。这里把两端序的宽容解码**有门槛地**
+  // 加入候选：零替换符（真实 UTF-16 必整除解码）且得分 ≥60 —— 实测标定：真实中文解码
+  // 得分 75~133（标点占比高的短文本 ~75），把 UTF-8/GBK 字节流误按 UTF-16 配对解出的
+  // 得分 ≈ -26（多为谚文/私有区/罕用字），60 居中两侧余量都足。纯 ASCII 文件两端解码
+  // 得分 ~0 不参战；正常 UTF-8/GBK 文件完全不受影响。CJK 码元的 0x00 高低位两侧都有
+  // （U+4E00 → 00 4E、U+7B2C → 2C 7B），「按奇偶位统计 0x00」的启发式对中文不成立，
+  // 故用打分门槛而非字节统计。
+  for (const lab of ['utf-16le', 'utf-16be']) {
+    const len = getLenientDecoder(lab);
+    if (!len) continue;
+    const text = len.decode(bin);
+    const replaced = (text.match(/\uFFFD/g) || []).length;
+    const score = readabilityScore(text);
+    if (replaced === 0 && score >= 60) {
+      cands.push({ encoding: lab, score, replaced, text });
+    }
+  }
   // 稳定排序：同分时保持 utf-8 → gb18030 → big5 优先级（全 ASCII 文本默认 utf-8）
   cands.sort((a, b) => b.score - a.score);
   const top = cands[0]; // 每个候选都必有 text（fatal 失败已由宽容解码兜底）
@@ -273,16 +291,23 @@ export function cleanText(raw, opts = {}) {
  * L3：全角数字与〇原先一律不识别 → 整本一章兜底。 */
 const CH_NUM = '[0-9\\uFF10-\\uFF19零〇一二三四五六七八九十百千万两]';
 
-/* 正则必须含两个捕获组：标记本体、同行余下文字（章节名候选）
+/* 标记内部的水平空白统一用 [^\S\n]（\s 去掉换行）：\s 能跨行，标记后的 \s*(.*) 会把
+ * 下一行「第二章 …」整行吞进上一章标题，且 re.lastIndex 越过第二章标记行 —— 该章从此
+ * 不再是切分点、正文并入上一章（2026-10-01 审计实锤）。标记前的 (?:^|\n)\s* 保留 \s*：
+ * 跳过章标行之前的空行是期望行为。
+ * 正则必须含两个捕获组：标记本体、同行余下文字（章节名候选）
  * flags：附加的正则标志（默认无）。en 需要 i —— M5：Chapter/chapter/CHAPTER 混写极其常见，
- *        缺了 i 会整本判「未识别」变一章，而该检测器的 label 本身就写着 Chapter X。 */
+ *        缺了 i 会整本判「未识别」变一章，而该检测器的 label 本身就写着 Chapter X。
+ * 顺序：更具体的检测器在前（cn_hui/cn_jie/cn_juan 先于 cn）—— scanDetectors 平票保序，
+ * 「第X回」的书 cn 与 cn_hui 计数相同，cn 在前会把 detected 误报成「第X章」（切分点
+ * 相同、仅上报标签失真，但会误导用户以为规则选错）。 */
 export const DETECTORS = [
-  { id: 'cn', label: '第X章', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*[章回节卷])\\s*(.*)' },
-  { id: 'cn_hui', label: '第X回', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*回)\\s*(.*)' },
-  { id: 'cn_jie', label: '第X节', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*节)\\s*(.*)' },
-  { id: 'cn_juan', label: '第X卷', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第\\s*' + CH_NUM + '+\\s*卷)\\s*(.*)' },
-  { id: 'en', label: 'Chapter X', flags: 'i', src: '(?:^|\\n)\\s*(chapter\\s+[0-9ivxlcdm]+)\\s*(.*)' },
-  { id: 'vol', label: '卷X', src: '(?:^|\\n)\\s*(卷\\s*' + CH_NUM + '+)\\s*(.*)' },
+  { id: 'cn_hui', label: '第X回', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*回)[^\\S\\n]*(.*)' },
+  { id: 'cn_jie', label: '第X节', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*节)[^\\S\\n]*(.*)' },
+  { id: 'cn_juan', label: '第X卷', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*卷)[^\\S\\n]*(.*)' },
+  { id: 'cn', label: '第X章', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*[章回节卷])[^\\S\\n]*(.*)' },
+  { id: 'en', label: 'Chapter X', flags: 'i', src: '(?:^|\\n)\\s*(chapter[^\\S\\n]+[0-9ivxlcdm]+)[^\\S\\n]*(.*)' },
+  { id: 'vol', label: '卷X', src: '(?:^|\\n)\\s*(卷[^\\S\\n]*' + CH_NUM + '+)[^\\S\\n]*(.*)' },
 ];
 
 const DETECT_PREFIX = 5000000;
@@ -370,19 +395,38 @@ export function splitChapters(text, opts = {}) {
     patternId = best;
   }
 
-  if (patternId === 'custom') src = opts.customSrc || '';
-  else {
+  if (patternId === 'custom') {
+    // custom 由调用方显式指定。非法 / 空正则**不**再静默回落「第X章」规则 —— 回落出的
+    // 分章结果与用户预期完全无关且无任何提示（2026-10-01 审计实锤：空串还会每字符一章，
+    // 2MB 文本 ≈ 200 万章对象）。改走「未识别」兜底：整本一章、detected:null，
+    // 调用方与用户都能从返回值看出规则没生效。
+    const cs = (opts.customSrc || '').trim();
+    let ok = false;
+    if (cs) {
+      try {
+        new RegExp(cs, 'gm');
+        ok = true;
+      } catch {
+        /* 非法正则 → 未识别兜底 */
+      }
+    }
+    if (!ok) {
+      const whole = clean ? cleanText(raw.trim(), cleanOpts) : raw.trim();
+      if (!whole) return { chapters: [], detected: null };
+      const firstLine = whole.split('\n')[0] || '';
+      const singleTitle = opts.fallbackTitle || (firstLine.length > 30 ? '正文' : firstLine);
+      return { chapters: [{ title: singleTitle, content: whole }], detected: null };
+    }
+    src = cs;
+  } else {
     const det = DETECTORS.find((d) => d.id === patternId) || DETECTORS[0];
     src = det.src;
     flags = det.flags || ''; // 例：en 需要 i（Chapter / chapter 混写）
   }
 
-  let re;
-  try {
-    re = new RegExp(src, 'gm' + flags);
-  } catch {
-    re = new RegExp(DETECTORS[0].src, 'gm');
-  }
+  // custom 已在上面预校验、DETECTORS 是常量（有测试钉住）→ 正则构造失败直接抛，
+  // 绝不静默换成别的规则（旧 catch 回落 cn 正是本次要消灭的静默行为）。
+  const re = new RegExp(src, 'gm' + flags);
 
   const chapters = [];
   let m;

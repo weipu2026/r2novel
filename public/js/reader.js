@@ -164,6 +164,7 @@ export function closeReader() {
   state.cache.clear();
   state.inflight.clear();
   state.lastSave = 0;
+  progConfirmIdx = -1; // 确认态跨书残留的话，新书里第一次轻点进度线就会直接跳章（违反「轻点只预览」契约）
 }
 
 export async function openBook(id) {
@@ -194,9 +195,13 @@ export async function openBook(id) {
   }
   // 严格版（不吞错）：读不到 与 服务端「没有进度」必须分开——OCC 基线只能来自「真的读到了」，
   // 把读失败当成「服务端没有进度」会让这台设备的首次写入被服务端判成「拿旧认知来写」永久拒掉。
-  const sp = await api.getProgressStrict(id).catch(() => null);
+  // 网络抖动先重试一次；两次都失败则置 failed 基线（drainProgress 会拦下云端写，见下），
+  // 绝不降级成「无基线写」——那是无条件覆盖，等于 #138 修的跨设备覆盖从读失败侧面绕回来
+  //（2026-10-01 审计实锤）。转前台时 onVis → syncFromServer 会重读并补上基线。
+  let sp = await api.getProgressStrict(id).catch(() => null);
+  if (!sp) sp = await api.getProgressStrict(id).catch(() => null);
   if (seq !== openSeq) return; // 进度请求等待期间已切书/已关闭：整次打开作废（state 尚未落，无需清理）
-  progBase = { id, at: sp ? Number(sp.updatedAt) || 0 : 0, known: !!sp };
+  progBase = { id, at: sp ? Number(sp.updatedAt) || 0 : 0, known: !!sp, failed: !sp };
   if (sp && sp.updatedAt && Number.isFinite(sp.ch) && (!lp || sp.updatedAt > (lp.updatedAt || 0))) {
     ch = clampCh((sp.ch || 1) - 1);
     ratio = sp.ratio || 0;
@@ -348,14 +353,19 @@ function updateProgressLine() {
   }
 }
 
+/* 进度线轻点确认态（模块级：goto()/closeReader() 要能复位，见各自注释） */
+let progConfirmIdx = -1; // 轻点预览挂起的目标章（-1 = 无）。手机误触高发：轻点不再直接跳章
+let progConfirmAt = 0; // 挂起时刻：CONFIRM_MS 内再点一次才真正跳，超时懒失效（不占定时器）
+
 function bindProgLine() {
   const p = els.prog;
   if (!p) return;
   let dragging = false;
+  let activePid = -1; // 多指防混叠：只认第一个落下的手指。两指先后落在这根 16px 细线上时，
+  // 第二指的 down 会覆写判定基线，第一指抬起位移必然 ≥8px → 走「拖动」直达跳章，
+  // 防误触对多指形同虚设（2026-10-01 审计实锤）
   let lastTarget = -1; // 拖动中目标章去重：move 是逐像素事件，同章重复写 DOM 会让长书拖动掉帧
   let downX = 0, downY = 0; // 判「轻点」还是「拖动」：抬手位移 < TAP_PX 算轻点
-  let confirmIdx = -1; // 轻点预览挂起的目标章（-1 = 无）。手机误触高发：轻点不再直接跳章
-  let confirmAt = 0; // 挂起时刻：CONFIRM_MS 内再点一次才真正跳，超时懒失效（不占定时器）
   const TAP_PX = 8;
   const CONFIRM_MS = 2500;
   const targetOf = (e) => {
@@ -374,44 +384,53 @@ function bindProgLine() {
   };
   p.addEventListener('pointerdown', (e) => {
     if (!state.book || !state.chapters.length) return;
+    if (dragging || activePid !== -1) return; // 已有手指在交互：忽略后续手指（多指只认第一根）
     dragging = true;
+    activePid = e.pointerId;
     lastTarget = -1;
     downX = e.clientX;
     downY = e.clientY;
-    if (Date.now() - confirmAt > CONFIRM_MS) confirmIdx = -1; // 预览挂起已超时 → 懒过期
-    if (p.setPointerCapture) p.setPointerCapture(e.pointerId); // 移出热区仍能收到 move/up
+    if (Date.now() - progConfirmAt > CONFIRM_MS) progConfirmIdx = -1; // 预览挂起已超时 → 懒过期
+    try {
+      if (p.setPointerCapture) p.setPointerCapture(e.pointerId); // 移出热区仍能收到 move/up
+    } catch {
+      /* 个别老 WebView 对已释放的 pointer 抛错：吞掉即可，capture 只是体验优化 */
+    }
     tipFor(targetOf(e));
     e.preventDefault(); // 防触发页面滚动（配合 CSS touch-action:none）
   });
   p.addEventListener('pointermove', (e) => {
-    if (dragging) tipFor(targetOf(e));
+    if (dragging && e.pointerId === activePid) tipFor(targetOf(e));
   });
   const finish = (e) => {
-    if (!dragging) return;
+    if (!dragging || e.pointerId !== activePid) return;
     dragging = false;
+    activePid = -1;
     const i = targetOf(e);
     const tap = Math.hypot(e.clientX - downX, e.clientY - downY) < TAP_PX;
     if (!tap) {
       // 拖动是有意识选章：维持「松手即跳」原行为
-      confirmIdx = -1;
+      progConfirmIdx = -1;
       if (i !== state.cur) goto(i); // 跳章后进度线由 renderChapter 统一刷新
       showTip(label(i), 1200);
       return;
     }
     // 轻点：拇指最易误触的路径 —— 只预览不跳，CONFIRM_MS 内再点一次才真正跳转
-    if (confirmIdx >= 0) {
-      confirmIdx = -1;
+    if (progConfirmIdx >= 0) {
+      progConfirmIdx = -1;
       if (i !== state.cur) goto(i); // 第二击落在哪就跳哪（第一击只是武装确认态）
       showTip(label(i), 1200);
     } else {
-      confirmIdx = i;
-      confirmAt = Date.now();
+      progConfirmIdx = i;
+      progConfirmAt = Date.now();
       showTip(label(i) + ' · 再点跳转', CONFIRM_MS);
     }
   };
   p.addEventListener('pointerup', finish);
-  p.addEventListener('pointercancel', () => {
+  p.addEventListener('pointercancel', (e) => {
+    if (e.pointerId !== activePid) return;
     dragging = false;
+    activePid = -1;
   });
 }
 
@@ -700,6 +719,7 @@ function onHidden() {
     return;
   }
   const occ = progBase.id === book.id && progBase.known ? { baseAt: progBase.at } : {};
+  if (progBase.id === book.id && progBase.failed) return; // 基线未知（读进度失败）：不发无判据写，同 drainProgress 的拦截
   try {
     fetch('/api/progress/' + encodeURIComponent(book.id), {
       method: 'PUT', // 与 api.putProgress 一致（路由只接受 PUT，POST 会 404）
@@ -815,6 +835,10 @@ function drainProgress() {
   const q = progQueued;
   progQueued = null;
   if (!q) return;
+  // 基线未知（打开时进度读失败、重试仍失败）：宁可不写也不发「无判据写」——无条件覆盖
+  // 正是 #138 要消灭的行为。本地镜像已存，转前台 onVis → syncFromServer 会重读补基线，
+  // 之后写入恢复带 baseAt；下次打开本书也会重新读基线。
+  if (progBase.id === q.id && progBase.failed) return;
   progFlight = true;
   // baseAt 只在「本设备确实从服务端读到过」时才带：没读到（离线打开 / 读进度失败）就不带，
   // 退回旧的无条件覆盖语义——那种情况下服务端真值未知，拿 0 当基线会把正常写入永久拒掉。
@@ -847,6 +871,7 @@ function drainProgress() {
 
 function goto(idx) {
   if (idx < 0 || idx >= state.chapters.length) return;
+  progConfirmIdx = -1; // 换章后挂起的「再点跳转」目标已失去上下文：不清的话下一次轻点会被当成第二击直接跳章
   saveProgress();
   renderChapter(idx, 0).catch((e) => {
     if (e instanceof ApiError && e.status === 401) showTip('会话过期，请重新登录', 2000);

@@ -226,8 +226,9 @@ test('bulk：gzip 炸弹被解压护栏拦截（KB 级压缩体不得解压成�
   const store = memStore();
   const cookie = await login(store);
   const { id } = await makeDraftBook(store, cookie, '炸弹书', 1);
-  // 25MB 高度可压文本 → 压缩后仅 ~25KB，解压超过 bulk 24MB 护栏
-  const bombSrc = 'A'.repeat(25 * 1024 * 1024);
+  // 40MB 高度可压文本 → 压缩后仅 ~40KB，解压超过 bulk 36MB 护栏
+  //（2026-10-01：护栏 24→36MB —— 16MB 正文 + JSON 转义最坏翻倍 32MB 的合法批次不再被误拒）
+  const bombSrc = 'A'.repeat(40 * 1024 * 1024);
   const gz = new Uint8Array(
     await new Response(new Response(bombSrc).body.pipeThrough(new CompressionStream('gzip'))).arrayBuffer()
   );

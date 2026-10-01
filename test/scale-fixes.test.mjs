@@ -241,13 +241,14 @@ test('publish 不回传 books 快照、索引只开一片 —— 开销与书库
   assert.equal(r.status, 200, JSON.stringify(r.data));
   assert.equal(r.data.books, undefined, 'publish 不再回传快照（前端 loadShelf() 兜底；旧实现为凑快照做全量读）');
   assert.ok(r.data.t && typeof r.data.t.total === 'number', '应含分阶段耗时 t（诊断字段不变）');
-  // 读取 = meta 1 + 抽样 3 + root 1 + 末片 1 + progress 1 = 7，与分片数无关（旧实现 11）
-  assert.ok(store._count.get <= 8, `发布读取子请求必须恒定在个位数（实测 ${store._count.get}）`);
+  // 读取 = meta 1 + 抽样 3 + root 1 + 末片 1 + progress 1 + 回收站 1 = 8，与分片数无关（旧实现 11）
+  // （2026-10-01：+1 为 publish 的回收站守卫读 —— 软删书不得被 API 层 publish「复活」）
+  assert.ok(store._count.get <= 9, `发布读取子请求必须恒定在个位数（实测 ${store._count.get}）`);
   store._count.get = 0;
   store._count.put = 0;
   r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie })); // 二次发布（已在架路径）
   assert.equal(r.status, 200);
-  assert.ok(store._count.get <= 8, `重复发布读取量同样恒定（实测 ${store._count.get}）`);
+  assert.ok(store._count.get <= 9, `重复发布读取量同样恒定（实测 ${store._count.get}）`);
   assert.ok(store._count.put <= 8, `发布写入子请求同样有界（实测 ${store._count.put}）`);
 
   // 前端兜底路径：GET /api/books 能看到刚发布的书，摘要正确

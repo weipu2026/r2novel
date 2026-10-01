@@ -120,6 +120,25 @@ async function readBodyText(req, maxBytes) {
   return new TextDecoder().decode(buf);
 }
 
+/** 读取 JSON 请求体（带上限）。返回 { body } 或 { err, status }——err 时调用方直接回错误。
+ * 动机：下面 9 个 JSON 路由原本 `req.json()` 全量入内存后才校验，持有效会话者发几十 MB 的
+ * JSON 就能把 128MB isolate 打穿（与 readBodyBytes 注释里的 OOM 面同源，只是藏在了 json()
+ * 里）。这些路由的合法载荷都远小于上限，超限即 413、非法 JSON 即 400。 */
+async function readJsonBody(req, maxBytes) {
+  let text;
+  try {
+    text = await readBodyText(req, maxBytes);
+  } catch (e) {
+    if (e && (e.message === '请求体超过上限' || e.message === '解压后超过上限')) return { err: '请求体过大', status: 413 };
+    return { err: '请求体读取失败', status: 400 };
+  }
+  try {
+    return { body: text ? JSON.parse(text) : {} };
+  } catch {
+    return { err: '请求体不是合法 JSON', status: 400 };
+  }
+}
+
 const enc = new TextEncoder();
 
 /** XML 转义（OPDS Atom feed：书名/作者/标签/章节标题都可能是任意文本） */
@@ -1088,9 +1107,17 @@ const ORPHAN_BATCH = 24; // replace 遗留孤儿惰性清理单批（publish/更
  * ——旧实现靠这里 splice 的副作用，CAS 化之后那个副作用就没有了。
  */
 async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
-  const idx = trash.books.findIndex((b) => b.id === id);
-  if (idx < 0) return { entry: null, deleted: 0, done: true, remaining: 0 };
-  let entry = trash.books[idx];
+  // 防恢复竞态（2026-10-01 审计 P2）：调用方传入的 trash 快照可能已过时，而下面的删除动作是
+  // 无条件 store.delete —— 若并发「恢复」恰好在此窗口把书放回书架（它读到的 trash 还没有
+  // purge 标记），这里会把**在架书**的正文乃至 meta/progress 删光，书架留下一本点不开的空壳。
+  // 处置两步关死 TOCTOU：① 重读最新 trash，条目已被摘走（恢复成功）→ 放弃；
+  // ② 删除前先 CAS 写「占用标记」（purge: left）——恢复侧见 purge 非空即 409，
+  //    标记与删除之间的窗口里恢复不可能再插进来；CAS 冲突重放期间条目被摘走则放弃。
+  const fresh = await getWithEtag(store, KEY.TRASH);
+  const t0 = parseTrash(fresh && fresh.text);
+  const i0 = t0.books.findIndex((b) => b.id === id);
+  if (i0 < 0) return { entry: null, deleted: 0, done: true, remaining: 0 };
+  let entry = t0.books[i0];
   let keys = Array.isArray(entry.purge) && entry.purge.length ? entry.purge : null;
   if (!keys) {
     const meta = await readBook(store, id);
@@ -1106,19 +1133,28 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
     }
   }
   const batch = keys.slice(0, maxDel);
+  const left = keys.slice(batch.length);
+  // 占用标记先行：写序依据与索引「指针先落」同一判据 —— 让失败落在可重试的一侧。
+  // 标记写成功后 restore 必 409；进程中断的话 purge 标记已在，下次惰性清理按 left 续删（幂等）。
+  const marked = await updateTrash(
+    store,
+    (t) => {
+      const i = t.books.findIndex((b) => b.id === id);
+      if (i < 0) return { dirty: false, out: { gone: true } }; // 已被并发恢复摘走 → 放弃本次删除
+      t.books[i] = { ...t.books[i], purge: left };
+      return { out: { gone: false } };
+    },
+    3,
+    fresh
+  );
+  if (marked && marked.gone) return { entry: null, deleted: 0, done: true, remaining: 0 };
+  entry = { ...entry, purge: left };
   // 并发删除：子请求数不变，耗时从串行 N 次往返降为一批并发
   await Promise.all(batch.map((k) => store.delete(KEY.text(id, k))));
-  const left = keys.slice(batch.length);
   let deleted = batch.length;
   let done = false;
   if (left.length) {
-    entry = { ...entry, purge: left };
-    await updateTrash(store, (t) => {
-      const i = t.books.findIndex((b) => b.id === id);
-      if (i < 0) return { dirty: false }; // 并发已把它清掉
-      t.books[i] = { ...t.books[i], purge: left };
-      return {};
-    });
+    done = false; // 标记已写（purge: left），下次续删
   } else {
     done = true;
     await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id)), store.delete(KEY.st(id))]);
@@ -1239,7 +1275,9 @@ async function apiBooks(store) {
  * 返回 { id, chapterKeys, duplicate, book? }
  */
 async function apiCreateBook(req, env, store) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 2 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const title = safeStr(body.title, 120);
   if (!title) return json({ error: '书名不能为空' }, 400);
   const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
@@ -1327,11 +1365,12 @@ async function apiPutChapter(req, env, store, id, key) {
 async function apiPutChapters(req, env, store, id) {
   const T0 = Date.now();
   const maxTotal = 16 * 1024 * 1024; // 单批正文字节护栏（body/内存）
-  // 解压护栏 24MB：正文 ≤16MB + JSON 转义/键名开销余量（换行转义 \n 最坏翻倍也已覆盖），
-  // 挡住 gzip 炸弹同时绝不误伤合法批次
+  // 解压护栏 36MB：正文 ≤16MB，但 JSON 转义在「纯 ASCII + 高频换行」正文上最坏逐字节翻倍
+  //（\n → \\n，16MB → 32MB）+ 键名/结构开销 —— 旧值 24MB 会把这类**合法**批次误拒成 413
+  //（2026-10-01 审计复算：16×2=32 > 24，原注释「最坏翻倍也已覆盖」与数学不符）。挡 gzip 炸弹不变。
   let body;
   try {
-    body = JSON.parse(await readBodyText(req, 24 * 1024 * 1024));
+    body = JSON.parse(await readBodyText(req, 36 * 1024 * 1024));
   } catch (e) {
     if (e && (e.message === '解压后超过上限' || e.message === '请求体超过上限')) return json({ error: '请求体过大' }, 413);
     return json({ error: '无效的请求体' }, 400);
@@ -1403,7 +1442,9 @@ async function apiRawGet(store, id) {
  * 都会置 status='creating'（publish 前暂不可读），cleanVer+1 使缓存失效。
  */
 async function apiUpdateChapters(req, env, store, id) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 2 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const op = body.op === 'append' ? 'append' : 'replace';
   const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
@@ -1525,16 +1566,17 @@ async function apiPublish(req, env, store, id) {
   const tMeta = Date.now() - T0;
   const keys = meta0.chapters.map((c) => c.key);
   const samples = [keys[0], keys[Math.floor(keys.length / 2)], keys[keys.length - 1]].filter((k, i, arr) => arr.indexOf(k) === i);
-  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（single+append：root + 1 片）+ progress 镜像源。
-  // 发布是导入链路里最高频的写，索引原来按 full 打开只为顺带在响应里回传整张 books 快照 → 2 万本/40 片
-  // 实测 52 个子请求，越过 Cloudflare 的 50 硬顶（P2-5）。改为「新书追加到最后一片」，发布开销与书库
-  // 规模**无关**；代价是上传收尾多一次 GET /api/books（前端两处都已有兜底分支）。
+  // 三个互不依赖的读并行（原实现串行 3 程）：抽样正文 + 索引（single+append：root + 1 片）+ progress 镜像源
+  // + 回收站（2026-10-01 审计 P3：软删书可被 API 层 publish「复活」成在架+在回收站双态，
+  // 随后 purgeOnce 会删掉一本在架书 —— 前端流程到不了这里（编辑入口有 indexHas 守卫），API 层必须自守）。
   const T1 = Date.now();
-  const [sampled, idx, ptRaw] = await Promise.all([
+  const [sampled, idx, ptRaw, trash] = await Promise.all([
     Promise.all(samples.map((k) => store.getText(KEY.text(id, k)))),
     openIndex(store, { single: id, append: true }),
     store.getText(KEY.progress(id)).catch(() => null),
+    readTrash(store).catch(() => ({ books: [] })),
   ]);
+  if (trash.books.some((b) => b.id === id)) return json({ error: '该书在回收站中，请先恢复再发布' }, 409);
   const tVerify = Date.now() - T1;
   for (let i = 0; i < samples.length; i++) {
     if (sampled[i] == null) return json({ error: `章节 ${samples[i]} 未上传，发布中止` }, 409);
@@ -1638,7 +1680,9 @@ async function apiBookMeta(store, id) {
 
 /** 改元信息（书名/作者/标签/置顶/备注/阅读状态）——PATCH，同步 index（单书模式：只碰该书所在分片） */
 async function apiPatchBook(req, store, id) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 256 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const idx = await openIndex(store, { single: id });
   if (!idx.get(id)) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
   // 读—改—写走 CAS（见 mutateMeta）：并发的 GET 目录可能正在写回孤儿清理，两边都无条件整份覆盖
@@ -1828,7 +1872,9 @@ async function apiPatchChapter(req, env, store, id, key) {
   const g = await editableMeta(store, id);
   if (!g.meta) return g.resp;
   if (chIndex(g.meta, key) < 0) return json({ error: '章节不存在' }, 404);
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 6 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const hasTitle = typeof body.title === 'string';
   const hasContent = typeof body.content === 'string';
   if (!hasTitle && !hasContent) return json({ error: '没有要修改的内容' }, 400);
@@ -1871,7 +1917,9 @@ async function apiPatchChapter(req, env, store, id, key) {
 async function apiInsertChapter(req, env, store, id) {
   const g = await editableMeta(store, id);
   if (!g.meta) return g.resp;
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 6 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
   const content = typeof body.content === 'string' ? body.content : '';
   if (!titleRaw && !content) return json({ error: '章节标题和正文不能都为空' }, 400);
@@ -1927,7 +1975,6 @@ async function apiDeleteChapter(store, id, key) {
   if (gi < 0) return json({ error: '章节不存在' }, 404);
   if (gArr.length <= 1) return json({ error: '至少保留一章' }, 400);
   const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
-  await shiftProgressOnDelete(store, id, gi, gArr.length - 1); // 先迁移进度（用删除前下标与新章数），再改章表
   await store.delete(KEY.text(id, key));
   const m = await mutateMeta(
     store,
@@ -1942,12 +1989,18 @@ async function apiDeleteChapter(store, id, key) {
       meta.chapterCount = arr.length;
       meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
       meta.updatedAt = Date.now();
-      return { out: { chapterCount: arr.length } };
+      return { out: { di: i, chapterCount: arr.length } };
     },
     g.cur
   );
   if (!m.ok) return metaFail(m);
-  if (!m.skipped) await syncIndexAfterEdit(store, m.meta);
+  if (!m.skipped) {
+    // 进度迁移放在 CAS 成功之后、用**实际删除位** m.out.di（与插入路径的 F4 同一修法）：
+    // 原先放在 CAS 之前用守卫读的 gi —— 409/冲突耗尽时章没删成、进度却已被白迁（阅读位置
+    // 错一章）；并发双删时还会在已迁移的值上再迁一次。skipped（并发已删）则不迁——对方已迁。
+    await shiftProgressOnDelete(store, id, m.out.di, m.out.chapterCount);
+    await syncIndexAfterEdit(store, m.meta);
+  }
   return json({ ok: true, chapterCount: m.out.chapterCount, cleanVer: m.meta.cleanVer, wordCount: m.meta.wordCount });
 }
 
@@ -1966,7 +2019,9 @@ async function apiProgressGet(store, id) {
 }
 
 async function apiProgressPut(req, store, id) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 16 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const ch = Math.max(0, Math.floor(Number(body.ch) || 0));
   let ratio = Number(body.ratio);
   if (!Number.isFinite(ratio)) ratio = 0;
@@ -2070,7 +2125,9 @@ async function apiProgressPut(req, store, id) {
  * body: { ids: [...], action: 'addTags'|'removeTags'|'setTags'|'setFinished'|'delete', tags?, finished? }
  */
 async function apiBatchBooks(req, store) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 2 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const idsRaw = Array.isArray(body.ids) ? body.ids : null;
   if (!idsRaw || !idsRaw.length) return json({ error: '请先选择要操作的书' }, 400);
   const ids = Array.from(new Set(idsRaw.map((x) => String(x)).filter((x) => isSafeId(x))));
@@ -2181,7 +2238,8 @@ async function apiBatchBooks(req, store) {
         }
         meta.updatedAt = now;
         return { out: { tags: meta.tags || [], finished: !!meta.finished, updatedAt: meta.updatedAt } };
-      })
+      }, null, 2) // tries=2：批量路径的重试读/写要计入子请求预算（每本预算按 1 读 1 写预扣，
+      // 3 次重试撞满会翻倍越顶；2 次在「宁可早失败」与预算安全之间取平衡，失效方向安全）
     )
   );
   for (let i = 0; i < targets.length; i++) {
@@ -2267,7 +2325,9 @@ async function apiTagsList(store) {
  * 只改受影响书，超出单请求预算时返回 remaining，前端续调即可。
  */
 async function apiTagsMerge(req, store) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 256 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const from = safeStr(body.from, 30);
   const to = safeStr(body.to, 30);
   if (!from) return json({ error: '请指定要处理的标签' }, 400);
@@ -2316,7 +2376,7 @@ async function apiTagsMerge(req, store) {
         meta.tags = next.slice(0, TAG_MAX);
         meta.updatedAt = now;
         return { out: { tags: meta.tags, updatedAt: meta.updatedAt } };
-      })
+      }, null, 2) // tries=2：同 apiBatchBooks —— 批量路径重试开销计入子请求预算
     )
   );
   for (let i = 0; i < targets.length; i++) if (results[i].ok) patches.set(targets[i].id, results[i].out);
@@ -2650,7 +2710,9 @@ async function doDiagScan(store, textCursor = '') {
  * 删除前回验：在架/回收站活书的当前章节正文、raw、progress 一律拒删——阻止「扫描后 append
  * 复用孤儿 key」的竞态把活书正文误删。非活书对象直接放行；预算将尽时剩余 key 不回验也不删。 */
 async function apiPurgeOrphans(req, store) {
-  const body = await req.json().catch(() => ({}));
+  const bj = await readJsonBody(req, 2 * 1024 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body;
   const keys = Array.isArray(body.objects) ? body.objects.map(String) : [];
   if (!keys.length) return json({ error: '没有要删除的对象' }, 400);
   const ok = keys.filter((k) => /^(?:text|raw|progress)\/[^/]/.test(k) && !/\.\./.test(k));

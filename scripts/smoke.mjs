@@ -17,8 +17,17 @@ function loadDevVars() {
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     const t = fs.readFileSync(path.join(root, '.dev.vars'), 'utf8');
     for (const line of t.split('\n')) {
-      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
-      if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
+      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!m || m[1] in process.env) continue;
+      let v = m[2];
+      // 剥引号 + 去内联注释（与 dev-server 同款，2026-10-01 审计）
+      const q = /^"(.*)"\s*(?:#.*)?$/.exec(v) || /^'(.*)'\s*(?:#.*)?$/.exec(v);
+      if (q) v = q[1];
+      else {
+        const c = /\s+#/.exec(v);
+        if (c) v = v.slice(0, c.index);
+      }
+      process.env[m[1]] = v;
     }
   } catch {
     /* 没有 .dev.vars 也能跑（用环境变量） */
@@ -26,7 +35,7 @@ function loadDevVars() {
 }
 loadDevVars();
 
-const BASE = process.env.SMOKE_BASE || 'http://localhost:8088';
+const BASE = process.env.SMOKE_BASE || 'http://127.0.0.1:8088'; // dev-server 只绑回环，直接用 IP 免去 localhost 双栈解析歧义
 const PASS = process.env.SMOKE_PASSWORD || process.env.ADMIN_PASSWORD || '';
 const CLEANUP = process.env.SMOKE_CLEANUP === '1';
 
@@ -78,7 +87,7 @@ function gbkBytes() {
   ]);
 }
 
-async function main() {
+async function runAll() {
   console.log('r2novel smoke → ' + BASE);
 
   let r = await api('/');
@@ -146,8 +155,11 @@ async function main() {
   check('登出后 401', r.status === 401);
 
   if (failures.length) {
-    console.error('\n冒烟失败 ' + failures.length + ' 项：' + failures.join('、'));
-    process.exit(1);
+    // 改 throw 而非 process.exit（2026-10-01 审计）：exit 会跳过 finally，
+    // SMOKE_CLEANUP=1 时测试书全留在库里，下次冒烟被迫撞 duplicate
+    const e = new Error('\n冒烟失败 ' + failures.length + ' 项：' + failures.join('、'));
+    e.smoke = true;
+    throw e;
   }
   console.log('\n冒烟全部通过 ✓');
 
@@ -315,31 +327,57 @@ async function main() {
   r = await fetch(BASE + `/export/${idDup}.txt`, { headers: { authorization: 'Basic ' + Buffer.from('reader:wrong').toString('base64') } });
   check('OPDS 错口令 401', r.status === 401);
 
-  /* ============== 收尾清理（SMOKE_CLEANUP=1，CI 生产冒烟不留测试书） ============== */
-  if (CLEANUP && created.length) {
-    console.log('\n[ 收尾清理 ]');
-    for (const bid of created) {
-      await purgeBook(bid);
-      console.log('  · 已彻底删除测试书 ' + bid);
-    }
-    // 兜底：历次冒烟遗留（含被改过名的）测试书一并清走
-    const lr = await api('/api/books');
-    for (const b of (lr.data.books || []).filter((x) => /^(M2 测试书|冒烟测试书)/.test(x.title || ''))) {
-      await purgeBook(b.id);
-      console.log('  · 已清理遗留测试书 ' + b.id + '《' + b.title + '》');
-    }
-    const lr2 = await api('/api/books');
-    check('清理后书架无测试书', !(lr2.data.books || []).some((x) => /测试书/.test(x.title || '')));
-  }
-
   if (failures.length) {
-    console.error('\nM2 链路失败 ' + failures.length + ' 项：' + failures.join('、'));
-    process.exit(1);
+    // 收尾清理挪到 main 的 finally（见文件尾）：失败路径也照常清理
+    const e = new Error('\nM2 链路失败 ' + failures.length + ' 项：' + failures.join('、'));
+    e.smoke = true;
+    throw e;
   }
   console.log('\nM2 链路全部通过 ✓');
 }
 
+/* 包装层：收尾清理放 finally（2026-10-01 审计）——用例中途抛错/断言失败/建书撞
+ * duplicate 都照常清掉本次创建的测试书，不再留垃圾（此前失败路径直接 process.exit
+ * 跳过清理，书留在库里，下次冒烟被迫撞 duplicate）。 */
+async function main() {
+  try {
+    await runAll();
+  } finally {
+    if (CLEANUP && created.length) {
+      try {
+        console.log('\n[ 收尾清理 ]');
+        // 失败路径可能已登出（cookie 被清空），重新登录保证清理可用
+        cookie = '';
+        const rl = await api('/api/login', { method: 'POST', body: { password: PASS } });
+        const mc = /rn_session=([^;]+)/.exec(rl.headers.get('set-cookie') || '');
+        if (!mc) throw new Error('清理阶段登录失败（检查 SMOKE_PASSWORD / ADMIN_PASSWORD）');
+        cookie = 'rn_session=' + mc[1];
+        for (const bid of created) {
+          await purgeBook(bid);
+          console.log('  · 已彻底删除测试书 ' + bid);
+        }
+        // 兜底：历次冒烟遗留（含被改过名的）测试书一并清走
+        const lr = await api('/api/books');
+        for (const b of (lr.data.books || []).filter((x) => /^(M2 测试书|冒烟测试书)/.test(x.title || ''))) {
+          await purgeBook(b.id);
+          console.log('  · 已清理遗留测试书 ' + b.id + '《' + b.title + '》');
+        }
+        const lr2 = await api('/api/books');
+        const remain = (lr2.data.books || []).filter((x) => /测试书/.test(x.title || ''));
+        if (remain.length) {
+          console.error('  ✗ 清理后书架仍有测试书：' + remain.map((x) => x.id + '《' + x.title + '》').join('、'));
+          process.exitCode = 1;
+        }
+      } catch (e) {
+        console.error('收尾清理异常：', e);
+        process.exitCode = 1;
+      }
+    }
+  }
+}
+
 main().catch((e) => {
-  console.error('冒烟异常：', e);
-  process.exit(1);
+  if (e && e.smoke) console.error(e.message);
+  else console.error('冒烟异常：', e);
+  process.exitCode = 1;
 });

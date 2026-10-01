@@ -1,6 +1,7 @@
 /* check.mjs — 跨平台门禁，`npm run check` 一次跑完五段：
  *   ① 语法门禁：node --check 递归遍历全仓库（跳过 node_modules / .git / .ui-tests / shots / .wrangler / data-*）
- *   ② 模块一致性：只查浏览器侧 public/**\/*.js —— node --check 只看语法，抓不到下面三类「运行时才炸」的缺陷，
+ *   ② 模块一致性：浏览器侧 public/**\/*.js + node 侧（src/、scripts/）反向导入白名单 ——
+ *      node --check 只看语法，抓不到下面三类「运行时才炸」的缺陷，
  *      而且它们常常被 try/catch 吞成静默失败（页面零报错、功能静默失效），必须靠静态检查提前拦：
  *        a) 命名导入 / 再导出 的名字在目标模块里根本不存在（如 upload/rewash.js 漏 export）；
  *           副作用导入 `import './x.js'` 与 `export * from './y.js'` 无法校验名字，只校验**路径存在性**
@@ -244,6 +245,40 @@ for (const f of publicFiles) {
       if (re.test(code)) say('HOST CALL', `${rel} 直接调用 app.js 的 ${n}( )，应改成 host().${n}( )`);
     }
   }
+}
+
+// ---- d) node 侧（src/、scripts/）反向导入 public/ 必须落在白名单共享模块上 ----
+  // shared-const.js / shared-text.js 是刻意做成「三端同构」的共享模块；public/js 其余模块
+  // 是浏览器专属（顶层摸 document/window、语义按浏览器写）。node 侧一旦图省事 import 了
+  // 浏览器模块，本地 dev 可能能跑（Node 容忍度高），部署到 Workers 才炸，且常被
+  // try/catch 吞成静默失败。白名单有新增共享模块时必须显式改这里。
+  {
+    const SHARED_OK = new Set(['shared-const.js', 'shared-text.js']);
+    const noCmt = (s) => s.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:\\])\/\/[^\n]*/gm, '$1 '); // 只去注释、保字符串（import 说明符会被 stripCode 吃掉）
+    const nodeSide = files.filter((f) => {
+      const rel = path.relative(ROOT, f);
+      return rel.startsWith('src' + path.sep) || rel.startsWith('scripts' + path.sep);
+    });
+    let cross = 0;
+    for (const f of nodeSide) {
+      const rel = path.relative(ROOT, f).split(path.sep).join('/');
+      const nc = noCmt(fs.readFileSync(f, 'utf8'));
+      const specs = [
+        ...[...nc.matchAll(/(?:^|[^\w$.])(?:import|export)\s[^;'"]*?from\s*['"]([^'"]+)['"]/g)].map((m) => m[1]),
+        ...[...nc.matchAll(/(?:^|[^\w$.])import\s*['"]([^'"]+)['"]/g)].map((m) => m[1]),
+      ];
+      for (const spec of specs) {
+        if (!spec.startsWith('.')) continue;
+        const target = path.resolve(path.dirname(f), spec);
+        const relT = path.relative(PUBLIC, target).split(path.sep).join('/');
+        if (relT.startsWith('..') || path.isAbsolute(relT)) continue; // 目标不在 public/ 下
+        if (!SHARED_OK.has(relT.split('/').pop())) {
+          say('CROSS LAYER', `${rel} 反向导入浏览器模块 public/${relT}（node 侧只允许 import 白名单共享模块）`);
+          cross++;
+        }
+      }
+    }
+    if (!cross && nodeSide.length) console.log(`CROSS_LAYER_OK · node 侧 ${nodeSide.length} 文件反向导入全部落在白名单`);
 }
 
 if (problems) {

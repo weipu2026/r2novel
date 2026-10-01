@@ -27,8 +27,18 @@ function loadDevVars() {
   try {
     const t = fs.readFileSync(path.join(ROOT, '.dev.vars'), 'utf8');
     for (const line of t.split('\n')) {
-      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
-      if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
+      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!m || m[1] in process.env) continue;
+      let v = m[2];
+      // 剥引号 + 去内联注释（2026-10-01 审计）：此前整行原样塞进 env，
+      // `SESSION_SECRET="xxx"` 会带着引号当密钥用、`X=yyy # 注释` 带着尾巴，全部静默失配。
+      const q = /^"(.*)"\s*(?:#.*)?$/.exec(v) || /^'(.*)'\s*(?:#.*)?$/.exec(v);
+      if (q) v = q[1]; // 引号整包：剥引号，行尾注释一并去掉
+      else {
+        const c = /\s+#/.exec(v); // 裸值：# 前有空白才算注释（# 本身是合法口令字符）
+        if (c) v = v.slice(0, c.index);
+      }
+      process.env[m[1]] = v;
     }
   } catch {
     /* 没有 .dev.vars 也能跑（用环境变量） */
@@ -126,9 +136,13 @@ const fsStore = {
     }
   },
   /** 遍历对象清单（与生产 R2 list 同形）；walk 全树后按前缀过滤。
-   *  返回 { objects, truncated, pages }：fs 无分页，恒 pages=1、truncated=false。 */
-  async list(prefix = '') {
-    const out = [];
+   *  分页语义与 worker.js 对齐（2026-10-01 审计）：按 R2 页大小（≤1000/页）切片，
+   *  maxPages=0 不限；超出页数即置 truncated 并回传下一窗游标（Number 偏移量，opaque）。
+   *  此前 dev 恒一页不分页，diag 分窗扫描的语义在本地永远走不到，上线才暴露分页 BUG。
+   *  已知边界：walk 顺序是目录枚举序，非 R2 的字典序；单进程内两次调用间无并发写则
+   *  游标切片稳定，与生产「游标窗口内一致性」语义在 dev 规模下等价。 */
+  async list(prefix = '', maxPages = 0, startCursor = '') {
+    const all = [];
     const walk = (dir, rel) => {
       let entries;
       try {
@@ -142,12 +156,26 @@ const fsStore = {
         else if (relKey.startsWith(prefix) && !relKey.endsWith('.tmp')) {
           // 跳过写入中断残留的 .tmp（putText 先写 tmp 再 rename，崩溃会留下）
           const st = fs.statSync(path.join(dir, e.name));
-          out.push({ key: relKey, size: st.size });
+          all.push({ key: relKey, size: st.size });
         }
       }
     };
     walk(DATA, '');
-    return { objects: out, truncated: false, pages: 1, cursor: null };
+    const PAGE = 1000; // 与生产 R2 list 单页上限一致
+    let cursor = Number(startCursor) || 0;
+    const out = [];
+    let pages = 0;
+    let truncated = false;
+    do {
+      if (maxPages > 0 && pages >= maxPages) {
+        truncated = true;
+        break;
+      }
+      out.push(...all.slice(cursor, cursor + PAGE));
+      pages++;
+      cursor = cursor + PAGE < all.length ? cursor + PAGE : 0; // 0 ≡ 生产语义的「已扫完」（返回 null）
+    } while (cursor);
+    return { objects: out, truncated, pages, cursor: cursor || null };
   },
 };
 
@@ -261,7 +289,10 @@ function fromWeb(res, r) {
   }
 }
 
-server.listen(PORT, () => {
-  console.log(`r2novel dev server: http://localhost:${PORT}   数据目录: ${DATA}`);
+// 只绑回环（2026-10-01 审计）：此前听全网卡，局域网内任何机器都能直连这个带完整
+// 管理能力的 dev 实例。Node fetch / 浏览器 / curl 对 localhost 会自动回退另一栈，
+// 本地访问不受影响；smoke 默认 BASE 也已同步改为 127.0.0.1。
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`r2novel dev server: http://127.0.0.1:${PORT}   数据目录: ${DATA}`);
   console.log(`  浏览器打开上方地址，口令即 ADMIN_PASSWORD`);
 });

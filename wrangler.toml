@@ -5,16 +5,21 @@ compatibility_date = "2026-08-01"
 
 # 静态资源（前端 SPA 外壳）：由 Cloudflare 边缘直出，不消耗 Workers 请求数。
 # run_worker_first 挂所有走 Worker 鉴权门的路径：/api/*（数据）、/opds 与 /export/*（OPDS 阅读器通道）。
+# ⚠️ /opds 与 /opds/ 都要列：路由正则接受尾斜杠（/^\/opds\/?$/），但这里不匹配 /opds/ 的话，
+#    订阅地址带尾斜杠时请求直达 ASSETS 吃 404，Worker 鉴权门根本不经过（2026-10-01 审计）。
 [assets]
 directory = "./public"
 binding = "ASSETS"
-run_worker_first = ["/api/*", "/opds", "/export/*"]
+run_worker_first = ["/api/*", "/opds", "/opds/", "/export/*"]
 
 # 自定义域（可选）：GitHub Actions 部署时从 Secret CUSTOM_DOMAIN 注入；
 # 本地命令行部署则取消下面注释并填域名（需托管在同一 Cloudflare 账号下）。
+# ⚠️ 注释里刻意写成 "custom_domain = ..." 而不是 "custom_domain = true"：
+#    deploy.yml 的幂等判据 grep 的是后者（子串匹配不看 #），注释里出现真值串会让
+#    注入步骤永远「已注入过，跳过」——CUSTOM_DOMAIN 静默失效且 CI 全绿（2026-10-01 审计实锤）。
 # [[routes]]
 # pattern = "novel.example.com"
-# custom_domain = true
+# custom_domain = ...
 
 # R2：正文 + 元数据。bucket_name 用随机串避免被枚举（非凭据）。
 [[r2_buckets]]

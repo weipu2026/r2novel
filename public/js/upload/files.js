@@ -16,6 +16,13 @@ import { setProg, uploadChapters } from './upload.js';
 import * as upSession from './session.js';
 
 export function openUpload(opts = {}) {
+  // 上传/批量导入在飞：此刻 begin 新会话会顶掉正在用的那份 —— 重洗的原件下载回调会被
+  // 静默丢弃（用户的重洗无声死亡），批量循环也会反复重绘上传页控件。长任务不锁界面
+  // （可以离开上传页），但重入必须挡（2026-10-01 审计实锤）。
+  if (upSession.isBusy()) {
+    toast('上传/导入进行中，请等它结束后再操作', 2200);
+    return;
+  }
   host().showView('upload');
   host().refreshPresetTags(); // 每次进上传页后台刷新 top20（快照先显示，不阻塞；打了新标签立刻跟进）
   els.upForm.reset();
@@ -133,6 +140,9 @@ async function importBatch(files) {
         upSession.begin(sess);
         runPreview();
         els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
+        // 冻结章节数组（与单文件 onConfirm 同一判据）：uploadMany 在 createBook 的 await
+        // 窗口后才读正文，期间控件切换会就地替换 preview 造成标题/正文错位
+        sess.frozenChapters = sess.preview.chapters;
         const preview = upSession.current().preview;
         if (!preview || !preview.chapters.length) {
           fail++;
@@ -169,7 +179,8 @@ async function importBatch(files) {
   upSession.clear();
   els.upFile.value = '';
   toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : '', rawFail ? `原件缺失 ${rawFail} 本（重洗不可用）` : ''].filter(Boolean).join(' · '), 3200);
-  host().showView('shelf');
+  // 批量是分钟级长任务，用户可能中途点「取消」回书架读书了：只刷新数据，别把人从阅读页拽走
+  if (!els.upload.classList.contains('hidden')) host().showView('shelf');
   if (lastBooks) await host().loadShelf({ books: lastBooks }).catch(() => {});
   else await host().loadShelf().catch(() => {}); // 刷新失败不吞结果提示
 }

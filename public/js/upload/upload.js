@@ -45,6 +45,11 @@ export async function onConfirm() {
   // 即便期间当前会话被换文件/重置，本次上传仍用当初确认的那份，从根上杜绝串台。
   const session = cur;
   const payload = collectPayload(session);
+  // 冻结章节数组：uploadMany 在 createBook/updateChapters 的 await 窗口**之后**才读正文，
+  // 期间用户切换清洗控件会让 runPreview 就地替换 session.preview（会话快照只防「会话被换」，
+  // 防不了这种就地改写）→ 章节标题（已按旧表建书）与正文（才读新表）错位，产出「第 N 章标题
+  // 配第 M 章正文」的坏书且全程无报错（2026-10-01 审计实锤）。冻结后 uploadMany 只认这份。
+  session.frozenChapters = session.preview.chapters;
   const keepRaw = els.upKeepRaw.checked;
   upSession.setCreatedId(null);
   upSession.setUploading(true);
@@ -74,7 +79,9 @@ export async function onConfirm() {
     toast(pub && pub.rawFailed ? '《' + payload.title + '》已入库，但原件上传失败，重洗不可用' : '《' + payload.title + '》已入库', 2200);
     upSession.clear();
     els.upFile.value = '';
-    host().showView('shelf');
+    // 用户可能早已点「取消」离开上传页去读书了（长任务不锁界面）：此时只刷新数据，
+    // 别把人从阅读页强行拽回书架（2026-10-01 审计 P3）
+    if (!els.upload.classList.contains('hidden')) host().showView('shelf');
     // 服务端为让发布开销与书库规模无关，已不再回传 books 快照（P2-5）→ 走下面的 loadShelf() 兜底；
     // 分支保留：旧版 worker 仍会回传快照，此时省一次 GET /api/books（慢链路 ≈2s）
     if (pub && pub.books) await host().loadShelf({ books: pub.books }).catch(() => {});
@@ -88,6 +95,8 @@ export async function onConfirm() {
     }
     els.upProgWrap.classList.add('hidden');
     els.upConfirm.disabled = false;
+    // 用户在同名弹窗里点「取消」是主动放弃，不是失败：静默复位即可，别打红色失败文案误导
+    if (e && e.message === '已取消') return;
     toast('上传失败：' + (e.message || e), 3200);
   } finally {
     upSession.setUploading(false); // 无论成败都解冻上传会话
@@ -165,7 +174,9 @@ async function uploadBulkAndRaw(id, keys, keepRaw, session) {
   if (rawP) setProg(0, `上传章节 0/${keys.length}（原件传输中…）`);
   let bulkErr = null;
   try {
-    await uploadMany(id, keys, session.preview.chapters);
+    // 只认确认时刻冻结的章节数组（frozenChapters）：preview 可能已被在飞窗口内的控件
+    // 切换就地替换，直接读它会造成标题/正文错位（见 onConfirm 的冻结注释）
+    await uploadMany(id, keys, session.frozenChapters || session.preview.chapters);
   } catch (e) {
     bulkErr = e;
   }

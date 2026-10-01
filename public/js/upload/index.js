@@ -30,13 +30,27 @@ export function init(caps) {
   els.upCancel.addEventListener('click', () => caps.showView('shelf'));
   els.upFile.addEventListener('change', onFileChosen);
   els.upConfirm.addEventListener('click', onConfirm);
+  // 清洗控件统一加 isBusy 守卫：上传/批量导入在飞时改控件会触发 runPreview 就地替换
+  // session.preview —— 章节标题已按旧表建书、正文才按新表上传，会产出标题/正文错位的坏书
+  //（2026-10-01 审计实锤）。数据面已在 onConfirm/importBatch 冻结 frozenChapters 兜底，
+  // 这里拦的是「改了不生效」的困惑面：在飞期间控件一律不动。
   els.upClean.addEventListener('change', () => {
+    if (upSession.isBusy()) return;
     els.upCleanOpts.classList.toggle('off', !els.upClean.checked);
     runPreview();
   });
-  els.upCleanOpts.addEventListener('change', () => runPreview());
-  els.upNoSplit.addEventListener('change', () => runPreview());
-  els.upEncoding.addEventListener('change', () => runPreview());
+  els.upCleanOpts.addEventListener('change', () => {
+    if (upSession.isBusy()) return;
+    runPreview();
+  });
+  els.upNoSplit.addEventListener('change', () => {
+    if (upSession.isBusy()) return;
+    runPreview();
+  });
+  els.upEncoding.addEventListener('change', () => {
+    if (upSession.isBusy()) return;
+    runPreview();
+  });
   els.encManual.addEventListener('click', openEncPick);
   els.upForm.addEventListener('submit', (e) => e.preventDefault());
   // 拖拽

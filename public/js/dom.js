@@ -11,7 +11,9 @@ export const $ = (sel, scope) => (scope || document).querySelector(sel);
 export const $$ = (sel, scope) => Array.from((scope || document).querySelectorAll(sel));
 
 /** HTML 转义（拼 innerHTML 时必须走它） */
-export const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/* 单引号一并转义（2026-10-06 审计 P3）：当前全站插值都在双引号属性里，缺 ' 不构成漏洞，
+   但只要有人写单引号属性就会静默失守 —— 属于零成本纵深防御。 */
+export const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 /** 书名归一化（判重用：忽略所有空白）—— 实现单点在 shared-text.js（router.js 也 import 同一份） */
 export { normTitle } from './shared-text.js';

@@ -106,7 +106,9 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, 'HTTP ' + res.status);
     return new Uint8Array(await res.arrayBuffer());
   },
-  getProgress: (id) => request('/api/progress/' + encodeURIComponent(id)).catch(() => ({ ch: 0, ratio: 0, updatedAt: 0 })),
+  // ⚠️ 这里**不要**再加「吞错版」进度读取器（2026-10-06 审计 P3 移除）：原 getProgress 把读失败
+  // 伪造成「服务端没有进度」（ch:0/ratio:0），任何照它写的调用方都会在首次写入时被服务端按
+  // 「拿旧认知来写」永久拒掉（见下面 getProgressStrict 的注释）。全站进度读取一律用 strict 版。
   /** 严格版（不吞错）：需要区分「服务端就是没有进度」与「这次读失败」时必须用它。
    *  阅读器的 OCC 基线只能来自「真的读到了」——把读失败当成「服务端没有进度」（updatedAt 0），
    *  会让这台设备的首次写入被服务端判成「拿旧认知来写」而永久拒掉（见 router.js 的 apiProgressPut）。 */

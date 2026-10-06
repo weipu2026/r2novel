@@ -215,7 +215,10 @@ async function boot() {
     await loadShelf(data);
     refreshPresetTags(); // 已确认登录 → 云端标签覆盖本地快照（打新标签/治理后 chips 跟进）
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) showView('login');
+    // 走 finishLogout（而非裸 showView）：上面已把 snap 写进 books 并 renderShelf()，
+    // 裸切视图会把上个会话的完整书架 + localStorage 快照留在登录页之后，登录成功瞬间
+    // 还会闪一下上次的书架（2026-10-06 审计 P3，与 L18「登出清痕迹」同一出口）。
+    if (e instanceof ApiError && e.status === 401) await finishLogout();
     else if (snap) {
       // 网络失败但有快照 → 留在快照书架（可离线浏览，操作时会再报网络错误）
       toast('网络异常，当前显示本地缓存的书架', 2600);
@@ -272,7 +275,8 @@ function renderShelfError(err) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.textContent = '重试';
-  btn.addEventListener('click', () => loadShelf().catch((e2) => renderShelfError(e2)));
+  // 重试也可能撞 401：会话已死时必须收敛，否则停在「书架加载失败：unauthorized」死循环
+  btn.addEventListener('click', () => loadShelf().catch((e2) => (handleAuth(e2) ? null : renderShelfError(e2))));
   box.append(strong, p, btn);
   grid.appendChild(box);
   els.filterNote.textContent = '';
@@ -311,8 +315,20 @@ async function finishLogout() {
   // 星标筛选残留会让新书架显示「没有匹配的书」，用户误以为书丢了（2026-10-01 审计实锤）
   ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
   els.searchInput.value = '';
+  // 排序下拉框是**静态 DOM**，不在任何会被重建的容器里 —— 不同步复位的话，ui.sort 已回
+  // 'recent' 而下拉框仍显示「字数」，此后任何筛选操作都按 recent 排、与显示永久矛盾
+  // 且用户无从察觉（2026-10-06 审计 P2）。
+  if (els.sortSel) els.sortSel.value = 'recent';
   presetTags = []; presetTagsAt = 0; presetTagsInflight = null;
   els.grid.innerHTML = '';
+  // ⚠️ 必须关弹层再切视图（2026-10-06 审计 P1-6）：showView 只切 5 个视图容器，**不碰
+  // modalMask / busyMask**。会话过期走 handleAuth → finishLogout 时，若当时正开着弹层
+  // （如诊断面板点「重新扫描」→ 401），遮罩（position:fixed; inset:0; z-index:70）会留在
+  // 登录页之上：登录框点不到、界面无提示，被遮住的还是含书名 / R2 对象 key 完整路径 /
+  // 字节数 / 章节数的诊断内容（共享设备上的隐私残留）。closeModal 自带 modalSeq++，
+  // 顺带作废在途弹层内容。一处修复覆盖全部 401 路径。
+  closeModal();
+  busyDone();
   showView('login');
 }
 
@@ -1232,6 +1248,8 @@ async function openTagMgr() {
   try {
     data = await api.tags();
   } catch (e) {
+    if (handleAuth(e)) return; // 会话过期：收敛到登录页（store.js 抛的 message 是英文 'unauthorized'，
+                                // 直接展示等于让用户对着一个永不消失的英文错误反复重试）
     if (seq !== modalSeq) return; // 已被关掉/换成别的弹层：整体作废，不得覆盖
     openModal(`<h3>标签管理</h3><p class="modal-sub">加载失败：${esc(e.message || e)}</p>
       <div class="m-acts"><button class="ghost" id="tmErrClose" type="button">关闭</button></div>`);
@@ -1302,6 +1320,10 @@ async function tagMergeRun(from, to) {
   let left = 0;
   try {
     for (let guard = 0; guard < 60; guard++) {
+      const before = updated; // 本轮增量判据：后端存在「remaining>0 但 updated=0」的返回
+      // （router.js:2350 注释已记录：目标数 ≥20 时恒零进展），此时若不退出就是白跑 60 轮
+      // 全库扫描（每轮一次 GET 标签清单），busy 遮罩又无关闭钮 → 用户被锁死看 0% 进度条。
+      // 判据与 batch-queue.js 的零进展守卫同源。
       const r = await api.tagsMerge(from, to);
       updated += r.updated || 0;
       left = r.remaining || 0;
@@ -1309,9 +1331,13 @@ async function tagMergeRun(from, to) {
       const total = updated + left;
       busy(total ? updated / total : 1, total ? `更新书籍标签… ${updated}/${total}` : '更新书籍标签…');
       if (!left) break;
+      if (updated === before) break; // 零进展：不再空转，落到下方「仍有 N 本未处理——请重试一次」
     }
   } catch (e) {
     busyDone();
+    // 会话过期：收敛到登录页，且**必须在这里 return** —— 下面的 openTagMgr() 必然再 401 一次，
+    // 用户会看到 toast 与弹层两条互相矛盾的错误（2026-10-06 审计 P1-7）
+    if (handleAuth(e)) return;
     toast('失败：' + (e.message || e), 2600);
     // 确认弹层已把标签管理弹层顶掉并关闭：失败时若不重建，用户会被留在
     // 「没有任何弹层」的书架上，看不到标签、也不知从哪重试
@@ -1387,6 +1413,7 @@ async function openDiag() {
     if (seq !== modalSeq || els.modalMask.classList.contains('hidden')) return; // 已换层/已关闭
     renderDiag();
   } catch (e) {
+    if (handleAuth(e)) return; // 会话过期：收敛（finishLogout 已关弹层并切登录页）
     if (seq !== modalSeq || els.modalMask.classList.contains('hidden')) return;
     els.modalBox.innerHTML = `<h3>残留检查</h3>
       <p class="modal-sub">扫描失败：${esc(e.message || e)}</p>
@@ -1652,7 +1679,10 @@ async function clearTrashFlow() {
     while (remaining > 0 && guard++ < 1000) {
       const r = await api.clearTrash();
       remaining = r.remaining || 0;
-      if (!total) total = Math.max(remaining, 1);
+      // 后端每轮清 1 本再返回 remaining（router.js apiTrashClear：remaining = trash.books.length - 1），
+  // 所以首次响应里的 remaining 已是「清完 1 本后」的剩余数，直接当总数会少算 1 本、进度条从
+  // 5% 起步且永远到不了 100%（2026-10-06 审计 P3）。
+  if (!total) total = Math.max(remaining + 1, 1);
       busy(Math.min(0.99, Math.max(0.05, 1 - remaining / total)), remaining ? `清空中…剩余 ${remaining} 本` : '完成');
     }
     toast(remaining ? '清空未完成，请重试' : '回收站已清空', 1500);

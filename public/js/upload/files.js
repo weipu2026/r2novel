@@ -130,6 +130,10 @@ async function importBatch(files) {
   els.upConfirm.disabled = true;
   let lastBooks = null;
   try {
+    // 清上一条链路残留的半成品 id（2026-10-06 审计 P0）：本循环每本书都在 createBook 成功后
+    // setCreatedId，catch 里按它删书。循环前不清 → 第一本就失败时 catch 读到的是**上一次成功入库的
+    // 书**，把它移进回收站。单文件路径靠 onConfirm 开头那次清零侥幸掩盖，批量这里没有这道清场。
+    upSession.setCreatedId(null);
     for (let i = 0; i < n; i++) {
       const file = files[i];
       const title = file.name.replace(/\.(txt|text)$/i, '').trim() || ('未命名_' + (i + 1));
@@ -142,7 +146,9 @@ async function importBatch(files) {
         els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
         // 冻结章节数组（与单文件 onConfirm 同一判据）：uploadMany 在 createBook 的 await
         // 窗口后才读正文，期间控件切换会就地替换 preview 造成标题/正文错位
-        sess.frozenChapters = sess.preview.chapters;
+        // 深拷贝而非同引用：同引用时用户在上传中改标题/删章会就地改写冻结数组 → 标题已按旧值发给
+        // 服务端、正文却按新表读 → 错配；splice 更是整体错位一格（2026-10-06 审计 P1-3）
+        sess.frozenChapters = sess.preview.chapters.map((c) => ({ ...c }));
         const preview = upSession.current().preview;
         if (!preview || !preview.chapters.length) {
           fail++;

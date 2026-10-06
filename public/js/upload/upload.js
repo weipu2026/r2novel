@@ -49,7 +49,10 @@ export async function onConfirm() {
   // 期间用户切换清洗控件会让 runPreview 就地替换 session.preview（会话快照只防「会话被换」，
   // 防不了这种就地改写）→ 章节标题（已按旧表建书）与正文（才读新表）错位，产出「第 N 章标题
   // 配第 M 章正文」的坏书且全程无报错（2026-10-01 审计实锤）。冻结后 uploadMany 只认这份。
-  session.frozenChapters = session.preview.chapters;
+  // 深拷贝而非同引用：用户在上传中仍可能改预览（UI 侧另有 isBusy 禁用兜底，见 preview.js
+  // renderPreviewChapters），同引用会让改动穿透进本次上传 → 标题与正文错配、删章导致错位
+  // （2026-10-06 审计 P1-3）
+  session.frozenChapters = session.preview.chapters.map((c) => ({ ...c }));
   const keepRaw = els.upKeepRaw.checked;
   upSession.setCreatedId(null);
   upSession.setUploading(true);
@@ -76,6 +79,11 @@ export async function onConfirm() {
       }
     }
     upSession.setUploading(false); // 上传已成功：先解冻再刷书架，loadShelf 期间用户即可开始下一次上传
+    // 必须在此清半成品 id（2026-10-06 审计 P0 实锤）：createdId 的语义是「本次创建出来的书」，
+    // 成功后即作废。残留它会被**下一次**批量导入的失败分支（files.js catch）当成「本次刚创建的半成品」
+    // → deleteBook(残留 id) 把上一本已成功入库、正在书架上阅读的书移进回收站，30 天后彻底删除 = 静默真丢。
+    // ARCHITECTURE.md 写的「publish 成功置 null」此前从未在代码里落地。
+    upSession.setCreatedId(null);
     toast(pub && pub.rawFailed ? '《' + payload.title + '》已入库，但原件上传失败，重洗不可用' : '《' + payload.title + '》已入库', 2200);
     upSession.clear();
     els.upFile.value = '';

@@ -221,12 +221,21 @@ if (!process.env.SESSION_SECRET) {
   console.warn('· 未设置 SESSION_SECRET：本地开发暂用 ADMIN_PASSWORD 作 Cookie 签名密钥（生产必须单独设，见 .dev.vars.example）');
 }
 fs.mkdirSync(DATA, { recursive: true });
+// ⚠️ env 键集必须与 wrangler.toml [vars] 对齐（2026-10-06 审计 P2）：原先缺 BRUTE_LIMIT /
+// BRUTE_LOCK_MS / BRUTE_LOCK_MAX_MS / TRASH_DAYS，本地恒走 router.js 里的硬编码兜底。
+// 当前两处数值恰好相同（5 / 10min / 1h / 15 天），属**巧合对齐** —— 运维一旦调
+// wrangler.toml，本地 dev 仍按旧值跑，防爆破与保留期测试结论失真且无任何提示。
+// 这里显式从环境变量取（缺省交给 router 的兜底），本地要试不同值时直接设环境变量即可。
 const env = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
   SESSION_SECRET: process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD,
   SESSION_DAYS: '30',
   MAX_UPLOAD: String(MAX_UPLOAD_BYTES),
   MAX_CHAPTER: String(MAX_CHAPTER_BYTES),
+  BRUTE_LIMIT: process.env.BRUTE_LIMIT,
+  BRUTE_LOCK_MS: process.env.BRUTE_LOCK_MS,
+  BRUTE_LOCK_MAX_MS: process.env.BRUTE_LOCK_MAX_MS,
+  TRASH_DAYS: process.env.TRASH_DAYS,
   serveStatic,
 };
 

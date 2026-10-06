@@ -285,8 +285,10 @@ async function runAll() {
 
   // 重新软删 → 彻底删除
   await api(`/api/books/${idTrash}`, { method: 'DELETE' });
+  // 轮询必须带上限（与 purgeBook 的 i<60 同一纪律）：服务端若出现 remaining>0 但零进展的
+  // 异常态，无上限的 while 会永久自旋 → 冒烟步骤跑到全局超时（2026-10-06 审计 P3）
   let pr = await api(`/api/trash/${idTrash}`, { method: 'DELETE' });
-  while (pr && pr.data && pr.data.remaining > 0) {
+  for (let i = 0; pr && pr.data && pr.data.remaining > 0 && i < 60; i++) {
     pr = await api(`/api/trash/${idTrash}`, { method: 'DELETE' });
   }
   check('M2 彻底删除至 remaining=0', pr.data.done === true && pr.data.remaining === 0);

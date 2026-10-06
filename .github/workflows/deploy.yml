@@ -31,6 +31,8 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # 上限必须有：默认 360 分钟 = 冒烟卡死时白烧 6 小时额度（2026-10-06 审计 P1）
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -105,11 +107,27 @@ jobs:
           # 匹配式放宽为「任意版本串」并**替换后自校验**：原先写死 '...-v[0-9]*'，
           # 一旦仓库里的字面量格式被改动（如去掉 v），sed 会静默不匹配 →
           # SW 版本号永不变化 → 用户长期跑旧前端，且没有任何报错提示。
-          sed -i -E "s|const CACHE = '[^']*';|const CACHE = 'r2novel-shell-$(date +%s)';|" public/sw.js
-          if ! grep -q "const CACHE = 'r2novel-shell-" public/sw.js; then
+          # ⚠️ 自校验必须比对**本次期望值**而不是固定前缀（2026-10-06 审计 P1）：原判据
+          # `grep -q "const CACHE = 'r2novel-shell-"` 在「sed 未生效」的失败态下同样为真 ——
+          # 只要字面量没被改到结尾的 ';'（如写成 `'r2novel-shell-v14' + suffix`），守卫就失效，
+          # 恰好是它注释里声称要防的场景。现改为先算期望值、再整行精确比对（-xF）。
+          NEW_CACHE="r2novel-shell-$(date +%s)"
+          sed -i -E "s|const CACHE = '[^']*';|const CACHE = '${NEW_CACHE}';|" public/sw.js
+          if ! grep -qxF "const CACHE = '${NEW_CACHE}';" public/sw.js; then
             echo "::error::public/sw.js 的 CACHE 版本号替换失败（字面量格式已变？）"
+            grep -n "const CACHE" public/sw.js || true
             exit 1
           fi
+          # ⚠️ 部署前 fail-fast（2026-10-06 审计 P1）：密钥同步在**部署之后**（下方步骤），
+          # 若 ADMIN_PASSWORD secret 未配置，登录会恒 401 → 冒烟三次全败，但此时**新代码已经
+          # 上线**且 Worker 带着旧/空口令（router.js 对空口令直接 401）→ 站点直接不可用。
+          # 故在部署前先确认 Worker 上已有这两个 secret，缺则**不部署**。
+          for s in ADMIN_PASSWORD SESSION_SECRET; do
+            if ! npx wrangler secret list 2>/dev/null | grep -q "^ - ${s}$\|^ *- *${s}$"; then
+              echo "::error::Worker 缺少 ${s} secret：拒绝部署（否则上线一个无法登录的站）"
+              exit 1
+            fi
+          done
           npx wrangler deploy 2>&1 | tee deploy.log
 
       # 先部署代码（保证 Worker 存在，secret put 才有目标），再同步密钥；改 Secret 后跑一次部署即生效

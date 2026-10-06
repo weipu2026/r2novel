@@ -52,7 +52,14 @@ const HOST_CAPS = (() => {
   if (!fs.existsSync(p)) return [];
   const code = stripCode(fs.readFileSync(p, 'utf8')); // 函数声明会提升，可先用后定义
   const i = code.indexOf('initUpload(');
-  if (i < 0) return [];
+  if (i < 0) {
+    // ⚠️ 锚点找不到**必须报错**（2026-10-06 审计 P2）：静默 return [] 会让规则 c（upload 域
+    // 必须走 host()）整段空转、零告警 —— app.js 的 import 一旦改名（`init as initUpload`
+    // 变 `init as initUploadUp`），这道门禁就永久失效而 CI 全绿。
+    console.error('HOST CAPS 门禁失效：public/js/app.js 里找不到 initUpload( 实参，规则 c 已整体空转。'
+      + '若 app.js 改了注入入口名，请同步更新本锚点。');
+    process.exit(1);
+  }
   const open = code.indexOf('(', i);
   let depth = 0, close = -1;
   for (let k = open; k < code.length; k++) {
@@ -324,7 +331,7 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
     // 已知边界（有意不处理）：解构后再 Number(MAX || D) 静态不可判，靠 review。
     for (const mm of src.matchAll(/(?<![A-Za-z_$.\]])(?:Number|parseInt|parseFloat)\(\s*(?:process\.)?\s*env\s*(?:(?:\?\.\s*|\.\s*)[A-Za-z_$][\w$]*\s*|\[[^\]\n]*\]\s*)(?:\|\||\?\?)/g)) {
       const ln = src.slice(0, mm.index).split('\n').length;
-      say('ENV PARSE', `${path.relative(ROOT, f).split(path.sep).join('/')}:${ln} 用了 Number(env.X || D)：非数字串会变 NaN 使上限静默失效 → 改成 Number(env.X) || D`);
+      say('ENV PARSE', `${path.relative(ROOT, f).split(path.sep).join('/')}:${ln} 用了 Number(env.X ${mm[1]} D)：非数字串会变 NaN 使上限静默失效 → 改成 Number(env.X) || D`);
     }
   }
 }
@@ -394,8 +401,13 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
         if (e.isDirectory()) walkAssets(p);
         else {
           const rel = '/' + path.relative(PUBLIC, p).split(path.sep).join('/');
+          // ⚠️ 期望集用**排除法**而非扩展名白名单（2026-10-06 审计 P2）：白名单只认
+          // js/css/webmanifest/png/svg/woff2? + index.html，于是新增 public/img/x.webp
+          // 之类资源时 ① 不会被报 SW MISSING（离线壳缺文件，静默漏绿），
+          // ② 写进 SHELL 反而报 SW UNKNOWN 假阳性（作者会误删正确的清单条目）。
+          // 非页面资源只有两个，且都是配置/自身，都需要排除。
           if (rel === '/_headers' || rel === '/sw.js') continue;
-          if (/\.(js|css|webmanifest|png|svg|woff2?)$/.test(rel) || rel === '/index.html') assets.push(rel);
+          assets.push(rel);
         }
       }
     })(PUBLIC);

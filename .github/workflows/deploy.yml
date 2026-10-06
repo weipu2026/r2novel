@@ -123,8 +123,20 @@ jobs:
           # 上线**且 Worker 带着旧/空口令（router.js 对空口令直接 401）→ 站点直接不可用。
           # 故在部署前先确认 Worker 上已有这两个 secret，缺则**不部署**。
           for s in ADMIN_PASSWORD SESSION_SECRET; do
-            if ! npx wrangler secret list 2>/dev/null | grep -q "^ - ${s}$\|^ *- *${s}$"; then
+            # ⚠️ 「查询失败」与「真的缺 secret」必须分开报（2026-10-06 CI 实证）：
+            # 旧判据按 YAML 列表行（`^ - NAME$`）锚定，wrangler v4 实际输出 JSON/表格 →
+            # secret 明明在却永远不命中，假阳性拒绝部署；且 2>/dev/null 吞掉输出后
+            # 连「查询失败」和「判据没匹配上」都分不清。现改为：失败打印原始输出；
+            # 判据改词匹配（-w），JSON/表格/YAML 三种格式通吃。
+            LIST_OUT=$(npx wrangler secret list 2>&1) || {
+              echo "::error::wrangler secret list 查询失败（Token/网络？），原始输出："
+              printf '%s\n' "$LIST_OUT"
+              exit 1
+            }
+            if ! printf '%s\n' "$LIST_OUT" | grep -qw "$s"; then
               echo "::error::Worker 缺少 ${s} secret：拒绝部署（否则上线一个无法登录的站）"
+              echo "--- wrangler secret list 实际输出（判据误报时对照）---"
+              printf '%s\n' "$LIST_OUT"
               exit 1
             fi
           done

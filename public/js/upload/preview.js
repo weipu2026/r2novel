@@ -202,6 +202,11 @@ function appendPreview() {
   }
 }
 
+/** 上传在飞时把预览行的可交互控件全部禁用（标题/正文/编辑/插入/删除/末尾追加） */
+function lockPreviewRows(ul) {
+  for (const el of ul.querySelectorAll('input, textarea, button')) el.disabled = true;
+}
+
 function renderPreviewChapters() {
   const ul = els.upList;
   ul.innerHTML = '';
@@ -217,6 +222,11 @@ function renderPreviewChapters() {
   addLi.className = 'pv-add';
   addLi.appendChild(pvIconBtn('＋ 在末尾追加一章', '追加到末尾', appendPreview));
   ul.appendChild(addLi);
+  // 上传/导入在飞 → 预览区整体只读：这些控件都会**就地改写** session.preview.chapters，而本次上传的
+  // 正文正是在 await 窗口之后才读它 → 标题与正文错配、删章导致正文整体错位一格。集中在此锁（而非
+  // 逐个控件加守卫），新增控件自动纳入（2026-10-06 审计 P1-3）。
+  // ⚠️ 必须放在**所有行渲染完之后**（addLi 之后）：提前调用时一行都还没建，锁不到任何东西。
+  if (upSession.isBusy()) lockPreviewRows(ul);
   refreshPreviewStats();
   updateConfirmBtn();
 }

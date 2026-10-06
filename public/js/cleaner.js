@@ -115,10 +115,19 @@ export function detectEncoding(bytes) {
     return { encoding: bom, text, replaced, score, candidates: [{ encoding: bom, score, replaced }] };
   }
 
+  // 打分只取**统一样本字节**（2026-10-06 审计 P2）：readabilityScore 是逐字 codePointAt 的
+  // JS 热循环 + 累加式（分数随长度增长），旧实现对每个候选跑整篇（实测 2.75M 字符 515ms）。
+  // 口径必须是「所有候选解**同一段字节前缀**」而不是「各解前 N 个字符」——后者会让解码结果
+  // 较短的候选被系统性压低（不同编码的字符/字节比不同），排序不可比。
+  //   · score：样本字节上的分（排序判据）
+  //   · replaced：**整篇**口径（U+FFFD 计数是 utf-16 候选「零替换符」门槛的判据，
+  //     样本不算会让尾部截断的 UTF-16 文件被误判为合格）
+  //   · text：只对**胜出的那个编码**整篇解一次，其余候选只解样本 → 解码量从 3~5 遍降到 1 遍
+  const SAMPLE_BYTES = 96 * 1024;
+  const sample = bin.length > SAMPLE_BYTES ? bin.subarray(0, SAMPLE_BYTES) : bin;
   const labels = ['utf-8', 'gb18030', 'big5'];
   const cands = labels.map((lab) => {
-    const strict = decodeOnce(bin, lab); // fatal 试错：成功 ⇒ 该编码下「完全合法」
-    let text = strict && strict.ok ? strict.text : null;
+    let text = decodeText(sample, lab); // 样本：fatal 优先，失败退宽容（与整篇同一套语义）
     if (text == null) {
       // M3：三路 fatal 全失败时**绝不能返回空文本**。含 0xFF（GB18030 非法字节）或下载被
       // 截断（悬空多字节前导）时，三个 fatal 解码器全抛 → 旧实现返回 ''，预览页于是
@@ -126,9 +135,15 @@ export function detectEncoding(bytes) {
       // → 用户无任何站内自救途径。这里退回宽容解码（坏字节 → U+FFFD）交给打分排序：
       // readabilityScore 对每个 U+FFFD 扣 60 分，足以分辨「整体乱码」与「仅个别坏字节」。
       const len = getLenientDecoder(lab);
-      text = len ? len.decode(bin) : '';
+      text = len ? len.decode(sample) : '';
     }
-    return { encoding: lab, score: readabilityScore(text), replaced: (text.match(/\uFFFD/g) || []).length, text };
+    return {
+      encoding: lab,
+      score: readabilityScore(text),
+      // 整篇口径：样本上的 U+FFFD 计数会漏掉尾部坏字节（test/cleaner.test.mjs 钉死 replaced=1）
+      replaced: countReplaced(decodeText(bin, lab)),
+      text, // 仅样本；真正的全文在选出胜者后单独解
+    };
   });
   // 无 BOM 的 UTF-16 兜底（M3 之后的最后死角）：三路 fatal 候选解 UTF-16 文本全是乱码，
   // 手动编码池原本也没有 utf-16 → 用户站内完全无解。这里把两端序的宽容解码**有门槛地**
@@ -141,7 +156,7 @@ export function detectEncoding(bytes) {
   for (const lab of ['utf-16le', 'utf-16be']) {
     const len = getLenientDecoder(lab);
     if (!len) continue;
-    const text = len.decode(bin);
+    const text = len.decode(sample);
     const replaced = (text.match(/\uFFFD/g) || []).length;
     const score = readabilityScore(text);
     if (replaced === 0 && score >= 60) {
@@ -150,14 +165,29 @@ export function detectEncoding(bytes) {
   }
   // 稳定排序：同分时保持 utf-8 → gb18030 → big5 优先级（全 ASCII 文本默认 utf-8）
   cands.sort((a, b) => b.score - a.score);
-  const top = cands[0]; // 每个候选都必有 text（fatal 失败已由宽容解码兜底）
+  const top = cands[0]; // 胜者：candidates 里只有 encoding/score/replaced 对外有用（preview.js 的
+  // 手动编码池按 score > -100 过滤），cands 里的 text 只是样本，不对外也不复用。
   return {
     encoding: top.encoding,
-    text: top.text,
+    // 整篇只解这一次（fatal 优先 → 失败退宽容，M3 语义不变）
+    text: decodeText(bin, top.encoding) || '',
     replaced: top.replaced || 0,
     score: top.score,
     candidates: cands.map(({ encoding, score, replaced }) => ({ encoding, score, replaced })),
   };
+}
+
+/** 按指定编码解一段字节：fatal 优先（完全合法），失败退宽容解码（M3：绝不返回空串）。 */
+function decodeText(bytes, label) {
+  const strict = decodeOnce(bytes, label);
+  if (strict && strict.ok) return strict.text;
+  const len = getLenientDecoder(label);
+  return len ? len.decode(bytes) : '';
+}
+
+/** 整篇里的 U+FFFD 个数（readabilityScore 对每个扣 60 分，replaced 是对外契约字段） */
+function countReplaced(text) {
+  return text ? (text.match(/\uFFFD/g) || []).length : 0;
 }
 
 /** 按指定编码重解（预览页手动切换时用）
@@ -213,6 +243,29 @@ function stripMarkdown(text) {
 const QUOTE_RE = /[「『]([^」』]*)[」』]/g;
 
 /** 主清理入口 */
+/* 「整行就是一个网址」：可带书站前缀括注（【笔趣阁】www.x.com）。段中夹带叙述文字的一律不算。 */
+const URL_ONLY = /^(?:\s*[【\[（(《<]?[^】\]）)》<>\s]{0,12}[】\]）)》>]?\s*)?(?:https?:\/\/|www\.)[^\s]+$/i;
+/* 「网址在行首」：后面可能跟一小截广告语（https://www.xx.com 阅读更多）。 */
+const URL_LEAD = /^(?:https?:\/\/|www\.)\S+(?:\s+(\S.*))?$/i;
+/** 是否属于「要删的 URL 广告行」。分三档，判据是**网址在行中的位置**而非「有没有网址」：
+ *   ① 整行就是网址（可带括注前缀）→ 删；
+ *   ② 网址在**行首**且尾巴 ≤8 字、不含中文句读 → 判为「网址 + 点击查看」类广告 → 删；
+ *   ③ 网址出现在句中（叙述里提到链接）→ **保留**。
+ * 旧判据是「行内出现 www./http:// 即删」，会把角色发链接、贴微博的正文整段删掉，
+ * 而 stripSite 默认开启（2026-10-06 审计 P1-2）。 */
+function isUrlAdLine(l) {
+  if (l.length > 100) return false;
+  if (URL_ONLY.test(l)) return true;
+  const m = l.match(URL_LEAD);
+  if (!m) return false;
+  const tail = (m[1] || '').trim();
+  return tail.length <= 8 && !/[，。！？、；：""''（）【】]/.test(tail);
+}
+/* 括注形站点广告：整行被站点词括起来（【笔趣阁】、（本书来自…）、[顶点小说] …） */
+const SITE_BRACKET = /^[【\[（(][^】\]）)]{0,30}(?:笔趣阁|顶点|追书|搜读|小说阅读网|首发|无弹窗|阅读网址|欢迎访问|手机|请收藏|加入书签|收藏本站|下载txt|推荐票|月票|本书)[^】\]）)]{0,30}[】\]）)]?$/;
+/* 裸行站点广告：必须自带站点特征词，避免误伤「本书主角…」「月票好贵」这类正文 */
+const SITE_BARE = /^(?:本书(?:来自|由)|首发于|首发在|收藏本站|请收藏本站|下载txt)/;
+
 export function cleanText(raw, opts = {}) {
   const o = { ...DEFAULT_CLEAN_OPTS, ...opts };
   if (raw == null) return '';
@@ -231,29 +284,26 @@ export function cleanText(raw, opts = {}) {
   if (o.stripSite) {
     lines = lines.filter((l) => {
       if (!l) return true;
-      if (/\b(?:www\.|https?:\/\/)/i.test(l)) return false;
-      // 书站广告括注：短行 + 关键词
-      if (l.length <= 40 && /^[【\[(（]?(?:本书|笔趣阁|顶点|追书|搜读|小说阅读网|首发|无弹窗|阅读网址|欢迎访问|手机用户|请收藏|加入书签|收藏本站|下载txt|推荐票|月票)/.test(l)) return false;
+      // URL 行：**只删「整行就是一个网址」**（可带书站前缀的括注）。
+      // 旧判据是「行内出现 www./http:// 就删整行」，无长度与结构护栏 → 正文里任何提到网址的
+      // 段落（角色发链接、贴微博、引用）整段消失，且 stripSite 默认开启（2026-10-06 审计 P1-2）。
+      if (isUrlAdLine(l)) return false;
+      // 书站广告行：必须是**括注或整行就是广告语**才删。
+      // ① 括注形（【…】/（…）/[…]）：整行匹配，容许 30 字以内的站点词上下文；
+      // ② 裸行：只认「本书来自/本书由/首发于/首发在/收藏本站/请收藏本站/下载txt」这类
+      //    **自带站点特征词**的开头 —— 旧判据的括号是可选的（`^[【\[(（]?`），
+      //    于是正文首句「本书主角叫林风…」这类高频开头被当成广告整段删掉（2026-10-06 审计 P1-2）。
+      if (l.length <= 40 && (SITE_BRACKET.test(l) || SITE_BARE.test(l))) return false;
       if (/^={3,}\s*(?:完|全文完|全书完)/.test(l)) return false;
       return true;
     });
   }
 
-  if (o.collapseBlank) {
-    lines = lines.filter((l) => l.length > 0);
-  } else {
-    const out = [];
-    let prevBlank = false;
-    for (const l of lines) {
-      const blank = l.length === 0;
-      if (blank && prevBlank) continue;
-      out.push(l);
-      prevBlank = blank;
-    }
-    lines = out;
-  }
-
-  // 先合并断行、后缩进：避免段中拼接时把第二行原样的全角缩进带进段落中间
+  // ⚠️ 顺序要求（2026-10-06 审计 P1-2 实锤）：joinSoft 必须**先于** collapseBlank。
+  // joinSoft 靠空行断段（buf 遇空行才落段），而 collapseBlank 会把空行全滤掉 →
+  // 「合空行 + 合并断行」同开时段落边界证据被抹光，两段正文被粘成一坨且无任何报错。
+  // 合空行与合并断行是两个独立开关（index.html:153 与 :155），组合必须自洽。
+  // 另外保持「先合并断行、后缩进」：避免段中拼接时把第二行原样的全角缩进带进段落中间。
   if (o.joinSoft) {
     const SENT_END = /[。！？!?…：；;:"'「『（(《———]$/;
     const paras = [];
@@ -274,6 +324,20 @@ export function cleanText(raw, opts = {}) {
     }
     if (buf) paras.push(buf);
     lines = paras;
+  }
+
+  if (o.collapseBlank) {
+    lines = lines.filter((l) => l.length > 0);
+  } else {
+    const out = [];
+    let prevBlank = false;
+    for (const l of lines) {
+      const blank = l.length === 0;
+      if (blank && prevBlank) continue;
+      out.push(l);
+      prevBlank = blank;
+    }
+    lines = out;
   }
 
   if (o.indent) lines = lines.map((l) => (l.length > 0 ? '\u3000\u3000' + l : l));

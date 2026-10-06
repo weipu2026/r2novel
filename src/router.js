@@ -535,6 +535,7 @@ async function indexHas(store, id) {
 function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial, prunable = true) {
   let changed = false;
   const owner = new Set();
+  const mapIds = Object.keys(root.map); // 提到循环外：② 要遍历它，K 片不该物化 K 次（2026-10-06 审计 P2-3）
   for (let si = 0; si < shardBooks.length; si++) {
     const n = shardNo[si];
     const arr = shardBooks[si];
@@ -558,8 +559,12 @@ function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial, pruna
     // （实测：指针落后一代时 501 本被摘成 251 本）。prunable=false（调用方已查明盘上分片数
     // 大于 root.shards）时整段跳过。
     if (partial || !prunable || typeof shardRaw[si] !== 'string') continue;
-    for (const id of Object.keys(root.map)) {
-      if (root.map[id] === n && !owner.has(id)) {
+    // ② 必须遍历整个 map，但**每片重建一次 Object.keys(root.map) 是 O(K×N)**：40 片 / 2 万本
+    // = 80 万次（实测 135ms），而 Workers Free 单请求 CPU 预算只有 10ms —— 净效果是把
+    // 「2 万本」从「能跑」变成「CPU 顶格」（2026-10-06 审计 P2-3）。改用循环外的 mapIds；
+    // map 会在循环内被 delete，故用 `in` 复查存在性（不缓存值）。
+    for (const id of mapIds) {
+      if (id in root.map && root.map[id] === n && !owner.has(id)) {
         delete root.map[id];
         changed = true;
       }
@@ -1106,7 +1111,7 @@ const ORPHAN_BATCH = 24; // replace 遗留孤儿惰性清理单批（publish/更
  * 那一份上）。调用方要判断「这本书删完没有」请看返回的 done，**别**去看自己那份 books.length
  * ——旧实现靠这里 splice 的副作用，CAS 化之后那个副作用就没有了。
  */
-async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
+async function purgeOnce(store, id, maxDel = PURGE_BATCH) {
   // 防恢复竞态（2026-10-01 审计 P2）：调用方传入的 trash 快照可能已过时，而下面的删除动作是
   // 无条件 store.delete —— 若并发「恢复」恰好在此窗口把书放回书架（它读到的 trash 还没有
   // purge 标记），这里会把**在架书**的正文乃至 meta/progress 删光，书架留下一本点不开的空壳。
@@ -1119,6 +1124,11 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
   if (i0 < 0) return { entry: null, deleted: 0, done: true, remaining: 0 };
   let entry = t0.books[i0];
   let keys = Array.isArray(entry.purge) && entry.purge.length ? entry.purge : null;
+  // 续扫游标（2026-10-06 审计 P2-1）：meta 已丢失且章节数超过单窗列取上限时，剩余章节靠
+  // cursor 逐窗接着列。游标存在**条目字段**上而非塞进 purge 数组当哨兵 —— 哨兵会被当章 key
+  // 删掉（删了个不存在的对象）且随本批丢失 → 下一轮从头列 → 永不推进（死循环）。
+  const purgeCursor = typeof entry.purgeCursor === 'string' ? entry.purgeCursor : '';
+  let nextCursor = '';
   if (!keys) {
     const meta = await readBook(store, id);
     if (meta) {
@@ -1127,9 +1137,16 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
     } else {
       // meta 已丢失（手工删除/损坏）：不能空手交差——否则 text/<id>/ 下所有正文永久残留，
       // 而回收站条目却已被摘除，只能靠 diag 兜底。按前缀列全量回收（上限 50 页≈5 万章）
+      // ⚠️ 页数必须受限（2026-10-06 审计 P2-1）：每页 list 就是一个子请求，maxPages=50
+      // 意味着最多 50 次，加 PURGE_BATCH=30 个 delete 与 trash/meta/raw/progress 的固定开销
+      // 必然超限 → 500，且每次都卡在同一处 = 这本书永远清不掉（实测 2 万章即 54 个子请求，
+      // 而 CHAPTER_MAX 的设计上限就是 2 万）。降到 8 页（8000 章）：列到的进本批 keys，
+      // 没列到的用 meta 里可能存在的 orphans 无从得知 → 靠 list 返回的 cursor 续扫窗登记。
       const prefix = `text/${id}/`;
-      const listed = await store.list(prefix, 50).catch(() => ({ objects: [] }));
+      const listed = await store.list(prefix, 8, purgeCursor).catch(() => ({ objects: [] }));
       keys = (listed.objects || []).map((o) => o.key.slice(prefix.length).replace(/\.txt$/, ''));
+      // 还有没列到的：游标随 CAS 标记写进条目，下一轮从这里续（幂等：已删的 key 删第二次无害）
+      nextCursor = (listed && listed.truncated && listed.cursor) || '';
     }
   }
   const batch = keys.slice(0, maxDel);
@@ -1141,7 +1158,12 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
     (t) => {
       const i = t.books.findIndex((b) => b.id === id);
       if (i < 0) return { dirty: false, out: { gone: true } }; // 已被并发恢复摘走 → 放弃本次删除
-      t.books[i] = { ...t.books[i], purge: left };
+      if (nextCursor) t.books[i] = { ...t.books[i], purge: left, purgeCursor: nextCursor };
+      else {
+        const { purgeCursor: _drop, ...rest } = t.books[i]; // 全部列完 → 丢弃游标（别留脏字段）
+        void _drop;
+        t.books[i] = { ...rest, purge: left };
+      }
       return { out: { gone: false } };
     },
     3,
@@ -1153,8 +1175,10 @@ async function purgeOnce(store, trash, id, maxDel = PURGE_BATCH) {
   await Promise.all(batch.map((k) => store.delete(KEY.text(id, k))));
   let deleted = batch.length;
   let done = false;
-  if (left.length) {
-    done = false; // 标记已写（purge: left），下次续删
+  // 「还有待清」= 本窗没删完（left 非空）**或** 还有没列到的章节（nextCursor 非空）。
+  // 只看 left 会让「本窗恰好删完、后面还有 1 万章」被判成 done → 摘掉条目 → 正文永久残留。
+  if (left.length || nextCursor) {
+    done = false; // 标记已写（purge: left / purgeCursor），下次续删
   } else {
     done = true;
     await Promise.all([store.delete(KEY.raw(id)), store.delete(KEY.book(id)), store.delete(KEY.progress(id)), store.delete(KEY.st(id))]);
@@ -1178,7 +1202,7 @@ async function sweepTrash(store, env, maxBooks = 1) {
   const now = Date.now();
   const expired = trash.books.filter((b) => now - (b.deletedAt || 0) > ttl);
   for (const b of expired.slice(0, maxBooks)) {
-    await purgeOnce(store, trash, b.id);
+    await purgeOnce(store, b.id);
   }
 }
 
@@ -1468,7 +1492,13 @@ async function apiUpdateChapters(req, env, store, id) {
   // 活键 = 清完后**仍会被章表引用**的 key：append=现有章（一本都不删）；replace=新表 key。
   // 传给 sweepOrphansBatch 让「活键防御」在这条路径也生效（F2，见该函数注释）。
   const sweepLive = newKeySet ? Array.from(newKeySet) : oldCh.map((c) => c.key);
-  const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), op === 'append' ? Infinity : ORPHAN_BATCH, sweepLive);
+  // ⚠️ 上限一律 ORPHAN_BATCH，append 也不例外（2026-10-06 审计 P1-4）。曾对 append 传
+  // Infinity「一次清完」，但每章一次 store.delete 就是一个**子请求**：300 章书 replace 成
+  // 3 章（orphans≈273）后点「追加章节」→ 单请求发 276 个 delete → 撞穿 50 硬顶 → 500，
+  // 且 mutateMeta 从未执行、章表不变（用户只看到「追加失败」）。
+  // 正确性不依赖「一批删完」：下面的 append key 起点已把 sweptA.left 纳入 maxNum 避让，
+  // 清不完的 key 会被避让并留在 mm.orphans 里续清。
+  const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), ORPHAN_BATCH, sweepLive);
 
   // 阶段 B（副作用，只做一次）：replace 的进度迁移（读—写 progress，best-effort，不进 CAS）。
   // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
@@ -1657,8 +1687,14 @@ async function apiBookMeta(store, id) {
     // 必须在**每次重试里重跑** → 违反「纯内存可重放」不变式（见 mutateMeta 的注释）。 */
     // 语义与 mutateMeta 一致：冲突重读重放、用尽即止。
     let etag = got.etag;
+    // ⚠️ 每轮 sweepOrphans 最多 24 个 delete，且删除**不会**让重读的 orphans 变短（key 仍在表里
+    // 直到 CAS 成功写回）→ 3 轮冲突 ≈ 3×(24+1) + 2 次重读 ≈ 77 子请求 → 目录 GET 直接 500
+    //（2026-10-06 审计 P2-2）。按剩余预算逐轮收窄批量；预算不足即停止重放
+    //（与下面「重试用尽时残留 orphans 不影响读取」的既有语义一致）。
     for (let attempt = 0; ; attempt++) {
-      await sweepOrphans(store, meta);
+      const room = 46 - (attempt + 1) * 2; // 每轮为「重读 + putIf」预留 2 次
+      if (attempt > 0 && room < 8) break; // 预算不足：不再重放
+      await sweepOrphans(store, meta, Math.max(1, Math.min(ORPHAN_BATCH, room)));
       const res = await putIf(store, KEY.book(id), JSON.stringify(meta), etag);
       if (res.ok) break;
       // 重试用尽：孤儿正文已删，meta 里残留的 orphans 字段不影响读取（下次 GET/PATCH 会再扫）
@@ -2166,14 +2202,39 @@ async function apiBatchBooks(req, store) {
     const raw = cur ? cur.text : null;
     const rootEtag = cur ? cur.etag : null;
     const root = tryParseJson(raw);
+    // 廉价路径的判据只认「**这些 id 在 map 里都指向某个片**」（2026-10-06 审计 P1-5）。
+    // 已软删/幽灵 id 在下面 shardNoOf 里会被归入 offShelf（不占预算、不进 deferred），
+    // 却曾让 `batch.every(...)` 为假 → 强制全量 openIndex → extra = 1 + shardCount →
+    // 37 分片时 budget=10 < 单本估算 11 → break → processed=[] → **整批一本都没打标**
+    //（实测 shards=37 时 ok:0 fail:4）。
+    // ⚠️ 判据必须区分两种「不在 map」：
+    //   · `undefined`（map 里根本没这个键）→ 指针落后一代，**书可能仍在架**（既有 P2-3
+    //     回归用例钉的就是这个：片里有、map 缺，全量打开后由对账 ① 补回）→ 必须走全量；
+    //   · 有值但不是整数（脏值）→ 同上也走全量。
+    // 把 undefined 当「离架」会重新引入 P2-3 的静默跳过，故这里只看「值不是合法片号」。
     if (looksRoot(root) && batch.every((id) => Number.isInteger(root.map[id]))) {
-      return { root, raw, rootEtag, extra: 0, handle: null }; // 廉价路径：map 覆盖了全部目标，可当在架名单用
+      return { root, raw, rootEtag, extra: 0, handle: null, rebuilt: false };
     }
     // 全量打开（rootRaw/rootEtag 复用上面那次读，省 1 读）：root 不可解析时顺带走 root.bak → 由分片重建。
     const h = await openIndex(store, { rootRaw: raw, rootEtag });
     // 预扣已花的子请求：1（root 读）+ K（全量片读）+ 不可解析时 1（root.bak）+ 重建 1（list）+ 2（root/root.bak 写）
-    const extra = 1 + h.shardCount + (looksRoot(root) ? 0 : 4);
-    return { root: h.root, raw: null, rootEtag: null, extra, handle: h };
+    // ⚠️ 但要**按需退差**，且只在 **root 健康**（looksRoot 为真）时退（2026-10-06 审计 P1-5）：
+    // 全量打开后本批真正需要的片只有「目标 id 所在的那些片」，其余是为离架 id / map 缺条目
+    // 白读的。大库（≥37 片）时按 `1 + shardCount` 计费会把 budget 压到个位数 → 连一本都
+    // 处理不了（实测 ok:0 fail:4，整批静默全灭）。
+    // **自愈路径（root 深度坏）不退差**：那里 rebuildIdxRoot 真的把 40 片全读了一遍
+    // （1 root + 1 bak + 1 list + K 片读 + 2 写 = 4 + K），退差会让预算虚高 → 实测 53 > 50
+    // 越顶（既有 P2-4 回归用例钉的就是这个）。
+    const needShards = new Set();
+    for (const id of batch) {
+      const n = h.root.map[id];
+      if (Number.isInteger(n)) needShards.add(n);
+    }
+    const healthy = looksRoot(root);
+    const extra = healthy ? 1 + (needShards.size > 0 ? needShards.size : 1) : 1 + h.shardCount + 4;
+    // rebuilt 只在「root 深度坏、被 rebuildIdxRoot 确定性重建」时为真。openIndex 对健康 root
+    // 也可能因目标不在 map 而全量打开（extra>0 但没重建）——那不是自愈（2026-10-06 审计 P1-5）
+    return { root: h.root, raw: null, rootEtag: null, extra, handle: h, rebuilt: !looksRoot(root) };
   })();
   const shardNoOf = (id) => (Number.isInteger(rootInfo.root.map[id]) ? rootInfo.root.map[id] : null);
   const budget = Math.max(0, 48 - rootInfo.extra); // 预扣掉的（自愈/全量读）不再给本批用
@@ -2203,7 +2264,11 @@ async function apiBatchBooks(req, store) {
   const deferred = deferredInBatch.concat(ids.slice(BATCH_BOOKS_MAX)); // 预算裁掉的 + 超单批上限的尾巴
   // 自愈轮：本批的预算全花在修 root 上了（大库下预扣直接吃光）→ 一本没动，但盘面已修好。
   // 明确告诉客户端「这一批退回不是死局，再发一次」，否则 runBatched 会把整批退回当零进展收手（P2-4）。
-  const retry = rootInfo.extra > 0 && processed.length === 0;
+  // 「自愈轮」只认**真自愈**（root 深度坏、被确定性重建过）。判据不能是 extra>0 ——
+  // 离架 id 导致的正常全量打开同样 extra>0（2026-10-06 审计 P1-5），会把「本批因预算裁剪
+  // 而正常续跑」误报成自愈轮：客户端 batch-queue.js 只容忍一次 retry，第二轮拿到同样的
+  // retry:true 就 break → 把整批（含完全正常的书）报成失败。
+  const retry = rootInfo.rebuilt === true && processed.length === 0;
   // 已经全量打开的 handle 直接复用（是 { ids } 模式的超集），绝不第二次开索引
   const openOpts = { ids: processed, ...(rootInfo.raw != null ? { rootRaw: rootInfo.raw, rootEtag: rootInfo.rootEtag } : {}) };
   const idx = rootInfo.handle || (await openIndex(store, openOpts));
@@ -2453,7 +2518,8 @@ async function apiTrashList(store, env) {
     wordCount: b.wordCount,
     deletedAt: b.deletedAt,
     purge: Array.isArray(b.purge) ? b.purge.length : 0,
-    restorable: !b.purge,
+        // 与 apiRestore 判据一致：purge 非空或还有续扫游标 ⇒ 不可恢复
+    restorable: !(Array.isArray(b.purge) && b.purge.length) && !b.purgeCursor,
   }));
   return json({ books: view });
 }
@@ -2468,7 +2534,16 @@ async function apiRestore(store, id) {
   const trashIdx = trash.books.findIndex((b) => b.id === id);
   if (trashIdx < 0) return json({ error: '回收站里没有这本书' }, 404);
   const entry = trash.books[trashIdx];
-  if (entry.purge) return json({ error: '该书的正文已部分清除，无法完整恢复' }, 409);
+  // 判据必须是「**有剩余待清**」而不是「purge 字段存在」（2026-10-06 审计 P3-1）：
+  // purgeOnce 的写序是「先 CAS 写占用标记 purge:left → 删正文 → 最后摘条目」，本批一次删完时
+  // left 是空数组 `[]`，标记写的就是 `purge: []`。若 Worker 恰在这两条子请求之间被回收，
+  // 条目残留 purge:[] —— `if (entry.purge)` 因空数组为真 → 409「无法完整恢复」，而正文完好。
+  // purgeOnce 自身判空用的是 `.length`，两处判据不一致本身就是信号。
+  // 判据 = 「还有待清」：purge 数组非空（已删一部分）**或** purgeCursor 非空（还有没列到的
+  // 章节因而没删）。与 purgeOnce 的 done 判据同源，两处只看 purge 数组会漏判续扫中的书。
+  if ((Array.isArray(entry.purge) && entry.purge.length) || entry.purgeCursor) {
+    return json({ error: '该书的正文已部分清除，无法完整恢复' }, 409);
+  }
   // 软删自半成品（第三轮起可软删 creating 书）：trash 条目来自 indexEntryFromMeta，无 status 字段。
   // 一律以 meta 本体为准：只有已发布书恢复才有阅读/继续编辑入口，其余只会变书架孤儿。
   const meta = await readBook(store, id);
@@ -2508,7 +2583,7 @@ async function apiRestore(store, id) {
 async function apiTrashPurge(store, id) {
   const trash = await readTrash(store);
   if (!trash.books.some((b) => b.id === id)) return json({ error: '回收站里没有这本书' }, 404);
-  const r = await purgeOnce(store, trash, id);
+  const r = await purgeOnce(store, id);
   return json({ ok: true, done: r.done, remaining: r.remaining, deleted: r.deleted });
 }
 
@@ -2518,7 +2593,7 @@ async function apiTrashPurge(store, id) {
 async function apiTrashClear(store) {
   const trash = await readTrash(store);
   if (!trash.books.length) return json({ ok: true, deleted: 0, remaining: 0 });
-  const r = await purgeOnce(store, trash, trash.books[0].id, PURGE_BATCH);
+  const r = await purgeOnce(store, trash.books[0].id, PURGE_BATCH);
   // 剩余数自己算：purgeOnce 不再改调用方的副本（见其文档注释）→ done=true 即「这本已彻底删完、条目已摘」
   const remaining = r.done ? trash.books.length - 1 : trash.books.length;
   return json({ ok: true, deleted: r.deleted, remaining });
@@ -2586,11 +2661,23 @@ async function doDiagScan(store, textCursor = '') {
   // 注意 meta/ 续扫窗也要重列：无主书 id 集合必须每窗重推，否则无主书的跨窗正文会被
   // 误判成「可直接删的 residue」（无主书本应移入回收站保全正文）——只多花 1-3 个子请求。
   const NO_LIST = { objects: [], truncated: false, pages: 0, cursor: null };
+  // ⚠️ 页预算必须在**发起前**按剩余额度裁剪（2026-10-06 审计 P2-4）：四个 list 是无条件并发
+  // 发出、事后才 budget.used += pages，于是守卫管不到已发出去的请求 → 上界
+  // 1(root) + shards + (3+3+3+12) 在 40 分片时 = 62 > 50 → 502，「检查残留」在大库直接不可用
+  //（而这正是大库最需要的运维工具）。余量不足时按优先级压页数（text/ 是章数级大头，先压它）。
+  const room = Math.max(0, 47 - budget.used);
+  const pageCap = (want) => (room <= 0 ? 0 : Math.max(1, Math.min(want, room)));
+  const wantText = pageCap(DIAG_TEXT_PAGE_BUDGET);
+  const metaRoom = pageCap(0); // meta/raw/progress 各要 1 页起（后面按实际剩余再收）
+  const wantMeta = Math.max(0, Math.min(DIAG_META_PAGE_BUDGET, room - wantText));
+  const wantSide = Math.max(0, Math.min(DIAG_META_PAGE_BUDGET, room - wantText - wantMeta));
+  if (room < 4) budget.incomplete = true; // 连四个 list 的最低页预算都不够 → 本窗标不完整，别谎报「扫完了」
+  void metaRoom;
   const [lMeta, lRaw, lProg, lText] = await Promise.all([
-    store.list('meta/', DIAG_META_PAGE_BUDGET),
-    cont ? NO_LIST : store.list('raw/', DIAG_META_PAGE_BUDGET),
-    cont ? NO_LIST : store.list('progress/', DIAG_META_PAGE_BUDGET),
-    store.list('text/', DIAG_TEXT_PAGE_BUDGET, textCursor),
+    wantMeta > 0 ? store.list('meta/', wantMeta) : Promise.resolve(NO_LIST),
+    cont || wantSide <= 0 ? NO_LIST : store.list('raw/', wantSide),
+    cont || wantSide <= 0 ? NO_LIST : store.list('progress/', wantSide),
+    wantText > 0 ? store.list('text/', wantText, textCursor) : Promise.resolve(NO_LIST),
   ]);
   budget.used += lMeta.pages + lRaw.pages + lProg.pages + lText.pages;
   if (lMeta.truncated || lRaw.truncated || lProg.truncated) budget.incomplete = true;
@@ -2907,8 +2994,17 @@ const OPDS_PAGE = 100;
 async function opdsCatalog(req, env, store) {
   const auth = await opdsAuth(req, env, store);
   if (!auth.ok) return auth.status === 429 ? opdsLocked(auth.retryAfterMs) : opds401();
-  const index = await readIndex(store);
-  const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  // ⚠️ 子请求预算（2026-10-06 审计 P2-5）：全量读索引 = 1 + K（K=分片数），而这条路径原先
+  // **零预算核算**（注释只考虑了 XML 体积）→ 48 分片（≈2.4 万本）时 2 + 48 > 50 直接抛错，
+  // 且 /opds 不在 handleApi 的 try 内 → 冒到 Worker 顶层，第三方阅读器订阅整体失效。
+  // 超阈值直接回 409 + 可操作指引（先探 root，不额外读片）。
+  const probe = await getWithEtag(store, KEY_IDX.root);
+  const probed = tryParseJson(probe && probe.text);
+  if (looksRoot(probed) && Number(probed.shards) > 40) {
+    return json({ error: '书库过大，OPDS 目录已暂停订阅（分片数超限）。请改用网页端阅读。' }, 409);
+  }
+  const index = probe ? await openIndex(store, { rootRaw: probe.text, rootEtag: probe.etag }) : await readIndex(store);
+  const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.createdAt || a.updatedAt || 0));
   const page = Math.min(10000, Math.max(1, parseInt(new URL(req.url).searchParams.get('p'), 10) || 1));
   const slice = books.slice((page - 1) * OPDS_PAGE, page * OPDS_PAGE);
   const href = (n) => (n <= 1 ? '/opds' : `/opds?p=${n}`);

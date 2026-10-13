@@ -178,6 +178,8 @@ export function init() {
     openModal,
     closeModal,
     confirmModal,
+    modalGen,
+    modalTake,
     syncPresetChips,
     refreshPresetTags,
     parseTagInput,
@@ -1078,6 +1080,15 @@ function closeModal() {
   els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
 }
+/* 世代令牌对 upload/ 域开放的两个入口（upload/ 不 import app.js，经 initUpload 注入后
+ * 写 host().modalGen()）。章节编辑器（upload/editor.js）每个动作都是「先 await 服务端、
+ * 再照返回值写 DOM」，中间用户完全可能按 Esc / 点遮罩关掉弹层（modalDismiss → closeModal）：
+ * 旧实现此时 $() 返回 null，在 null 上写 textContent 抛 TypeError 被 catch 吞成
+ * 「保存失败 / 插入失败」——服务端其实已写成功，而「插入失败」还会诱导用户重试（真插两次）。
+ * ⚠️ 与 openEditModal 的分工：那边在 openModal **之前** ++ 抢占（最后一次点击获胜）；
+ * 这边在 openModal **之后**取只读号作基线（判「本弹层是否还活着」）。两者不可互换。 */
+function modalGen() { return modalSeq; }
+function modalTake() { return ++modalSeq; }
 /** 遮罩点击 / Esc 的统一退出：优先点「取消」按钮，让弹层自己把 Promise resolve 掉；其余直接关。
  *  ⚠️ 必须同时认 #dpCancel —— 那是「发现同名书籍」弹层（askDup）的取消键。只认 #cfNo 的话，
  *  用遮罩/Esc 关掉同名弹层时既不 resolve 也不复位上传态：onConfirm 永久卡在 await askDup 上，

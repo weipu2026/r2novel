@@ -16,7 +16,7 @@ public/
   index.html (278)      单页多视图：shelf / upload / read / trash / login，视图切换走 showView()
   js/
     main.js             入口：import { init } from './app.js'
-    app.js (1,512)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
+    app.js (1,714)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
     dom.js (28)         共享 DOM 薄层：els 元素表 + $ / $$ / esc / normTitle + IC（图标字面量，两端共用）
     reader.js (774)     阅读器（交互禁区密度全站最高，改动前必读 §3）
     store.js (255)      api（fetch 封装）+ local（localStorage）+ fmtWords
@@ -24,20 +24,21 @@ public/
     offline.js (143)    离线队列（进度/操作的回网补传）
     ui.js (61) / exporter.js / shared-const.js   通用薄层（bindBusy/bindToast/busy/toast）/ 导出 / 前后端共享常量
     sw.js (107)         PWA shell 缓存（CACHE 版本号由 CI 部署时 sed 替换成时间戳，本地字面量是占位符）
-    upload/ (1,141)     上传域（2026-09-13 拆分完成）：
-      index.js (59)       唯一对外入口：再导出 openUpload/rewashConfirm/openChapterEditor + init(caps) 注入宿主能力
+    upload/ (1,343)     上传域（2026-09-13 拆分完成）：
+      index.js (76)       唯一对外入口：再导出 openUpload/rewashConfirm/openChapterEditor + init(caps) 注入宿主能力
       session.js (76)     上传会话状态唯一事实源（原 app.js 的 5 个上传裸变量，见 §2）
       ctx.js (21)         宿主注入点 provide(host) / host()（未注入即 fail loud）
-      files.js (192)      上传页入口 openUpload + handleFiles（选文件/拖入/粘贴）+ importBatch
-      prepare.js (36)     读字节建会话 / 编码选择
-      preview.js (205)    预览面板（runPreview / 分章表 / 清洗选项）
-      upload.js (256)     上传核心链路（onConfirm / 建书 / 逐章上传 / 原件 / 重试）
-      editor.js (266)     编辑章节弹层
+      files.js (211)      上传页入口 openUpload + handleFiles（选文件/拖入/粘贴）+ importBatch
+      prepare.js (37)     读字节建会话 / 编码选择
+      preview.js (232)    预览面板（runPreview / 分章表 / 清洗选项）
+      upload.js (277)     上传核心链路（onConfirm / 建书 / 逐章上传 / 原件 / 重试）
+      payload.js (23)     建书 payload 的单一组装点（单文件上传与批量导入共用）
+      editor.js (362)     编辑章节弹层（就地改标题/正文/插删章）
       rewash.js (28)      重洗确认 + 转交上传链路
   css/style.css (1,057) 设计令牌化完毕（--accent 等），断点两套：移动 / ≥900px 桌面
 scripts/dev-server.mjs  本地 :8088，自动读 .dev.vars；R2NOVEL_DATA=<不含斜杠的相对名> 换数据目录
 scripts/verify-deploy.mjs 部署后核验：拉生产静态文件与仓库哈希比对（CI 最后一步自动跑）
-test/                   146 项单测（14 文件；index-shards.test.mjs = 分片专项）；.ui-tests/（gitignored）多套 Playwright 回归
+test/                   314 项单测（27 文件；index-shards.test.mjs = 分片专项；_dom-stub.mjs = 前端 UI 模块的零依赖 DOM 桩）；.ui-tests/（gitignored）多套 Playwright 回归
 数据布局（R2）: meta/idx/{root,s<N>}.json(+.bak) 书架索引 v2 分片 + meta/<id>.json + meta/sec/st/<id> + text/<id>/<key>.txt
                 + raw/<id>.txt + progress/<id>.json + meta/trash.json + meta/index.json(v1 冻结快照)
 ```
@@ -109,6 +110,20 @@ test/                   146 项单测（14 文件；index-shards.test.mjs = 分�
   只查语法、`IC` 只有 2 字符、旧版大写常量正则要求总长 ≥4；`verify-review-fixes` 不碰标签管理，
   唯一覆盖它的 `batch-tags-ui` 报红却被当成「既有不稳定」。**判据：搬任何模块级声明前，先 grep 全仓库
   数一遍它的引用点，逐个确认引用方能拿到它**（本轮已把 `IC` 移到共享层 `dom.js`）
+- **`ceBusy` 解锁会把控件还原成「加锁前的原值」**：所以「await 之后要设定按钮终态」必须写在
+  `ceBusy('')` **之后**，写在之前会被解锁悄悄覆盖。editor.js 的「保存本章」栽在这 —— 保存成功后
+  按钮被重新解锁，再点就对**零变化**内容发一次 PATCH（正文对象重写 + `cleanVer` 空转 +1 + 索引写）。
+  也不能提到 `ceBusy` 之前：那样失败重试会被永久禁用（比原缺陷更严重）
+- **弹层世代令牌对 upload/ 域开放**（`modalGen`/`modalTake`，经 `initUpload` 注入）：editor.js
+  每个动作都是「先 await 服务端、再照返回值写 DOM」，用户中途 Esc / 点遮罩关弹层
+  （`modalDismiss → closeModal`）时 `$()` 返回 null，在 null 上写 textContent 抛 TypeError 被 catch
+  吞成「保存失败 / 插入失败」——服务端其实已成功，而「插入失败」会诱导用户重试（真插两次）。
+  ⚠️ `ceAliveAt(gen)` 必须比较**入口捕获的**世代号，不能每次重读模块级 `ceGen`：「关掉编辑器 →
+  又打开同一个」时模块级值已被刷新，旧请求会误判成还活着（新弹层里同样有 `#ceStat`/`#ceList`），
+  于是迟到重绘改写新弹层 —— 空值守卫 `if (el)` 挡不住这一类
+- **正文编辑态必须分「基线」与「草稿」两层存**（`ceBase` / `ceDraft`）：合成一个缓存会让
+  「插章/删章整表重绘」后的未保存改动静默丢失，且重绘后重新展开不回填（空白框 —— 在其中输入
+  再保存等于把整章正文替换掉）。「保存本章」可点判据 = 草稿存在且 ≠ 基线
 
 **UI/CSS（改元素位置或容器时必查）**
 - 安全区：`.read-top`/`.read-bar` 的 env(safe-area-inset-*) 必须加在 **height** 上
@@ -152,7 +167,7 @@ npm run check          # 门禁一次跑完五段，任一有问题即 CHECK_FAI
 #      必须完全相同（任一端漏实现一个原语，症状是测试静默失真、零覆盖）
 #   ⑤ SW SHELL 双向比对（SHELL_OK）：public/ 全部静态资源必须在 SHELL 预缓存清单里
 #      （SW MISSING），SHELL 条目必须真实存在（SW UNKNOWN）——手写清单漂移在此被拦
-npm test               # 206 项单测（含 index-shards 分片专项、cleaner 清洗 32 项、#135 收口 3 项）
+npm test               # 314 项单测（含 index-shards 分片专项、cleaner 清洗、editor-ui 章节编辑器 DOM 桩回归）
 # UI 回归（每套独立数据目录、串行跑）：一条命令 `.ui-tests/run-full-regression.sh`
 #   （启服 + 冒烟 + 15 套 UI 同一进程树；⚠️ 沙箱守卫会拦「一次删 >50 文件」，`data-*` 上千文件必撞
 #    → 需 CODEBUDDY_SAFE_DELETE_ENABLED=0。该变量写在脚本**内部 export 无效**（守卫在工具层看

@@ -45,6 +45,10 @@ test('CI：部署前必须 fail-fast 校验 secret（否则先上线空口令站
   assert.ok(secretAt > 0 && secretAt < deployAt,
     'wrangler secret list 预检必须在 deploy 之前');
   assert.match(y, /拒绝部署/, '预检失败必须显式拒绝部署');
+  // #144 P3：查询失败需区分「Worker 不存在」（首次部署放行，否则 fail-fast 死锁——
+  // 全新账号永远无法完成首次部署）与其他错误（fail loud）
+  assert.match(y, /grep -qi "not found"/, 'not found（首次部署）必须放行');
+  assert.match(y, /secret list 查询失败/, '其他查询失败必须 fail loud');
   // 同步密钥步骤仍应在部署之后（Worker 要先存在）
   assert.ok(y.indexOf('secret put') > deployAt, 'secret put 仍需在 deploy 之后（保证 Worker 已存在）');
 });

@@ -209,9 +209,13 @@ test('P3 esc 必须转义单引号（纵深防御）', async () => {
 
 test('P3 boot 的 401 分支必须走 finishLogout（清快照而不是裸切视图）', () => {
   const src = read('public/js/app.js');
-  const body = src.slice(src.indexOf('async function boot()'), src.indexOf('async function boot()') + 1400);
+  // 窗口 3000：boot 内视图守卫注释较长（#144），401 分支已超出旧窗口 1400
+  const body = src.slice(src.indexOf('async function boot()'), src.indexOf('async function boot()') + 3000);
   assert.match(body, /if \(e instanceof ApiError && e\.status === 401\) await finishLogout\(\);/,
     'boot 的 401 分支未走 finishLogout');
+  // #144 P2-6：boot() 调用点必须有兜底 catch（快照渲染已内层 try，但 boot 是 async ——
+  // 裸调用任何未捕获 rejection 都会静默丢失）
+  assert.match(src, /boot\(\)\.catch\(/, 'boot() 裸调用无兜底 catch');
 });
 
 test('P3 clearTrashFlow 进度条总数要算上已清的那 1 本', () => {

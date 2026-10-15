@@ -179,16 +179,18 @@ test('P2-1 回归：45 章大书彻底删除仍分批收敛（purge 预算护栏
 
 /* ============ P2-2：孤儿清扫重放预算 ============ */
 
-test('P2-2 孤儿清扫的 CAS 重放必须按剩余预算收窄批量（否则 3 轮 ≈77 子请求 → 500）', () => {
+test('P2-2 孤儿清扫的子请求预算必须跨轮分配（否则 3 轮 ≈77 子请求 → 500）', () => {
   const src = routerSrc();
   const i = src.indexOf('async function apiBookMeta(');
   const body = src.slice(i, i + 3200);
-  assert.match(body, /const room = 46 - \(attempt \+ 1\) \* 2;/,
-    '必须按轮次预留「重读 + putIf」预算');
-  assert.match(body, /Math\.min\(ORPHAN_BATCH, room\)/,
-    '每轮批量必须被剩余预算收窄');
-  assert.match(body, /if \(attempt > 0 && room < 8\) break;/,
-    '预算不足必须停止重放（残留 orphans 不影响读取）');
+  // #144 P2-4 重写：旧公式「46-(attempt+1)*2」三轮都 ≥40 > ORPHAN_BATCH，收窄分支不可达。
+  // 新实现 = 总预算扣减：budget 起始 45（入口读已花 1），每轮 batch+putIf、冲突再扣重读。
+  assert.match(body, /let budget = 46 - 1;/, '必须有跨轮总预算（入口读已花 1 次）');
+  assert.match(body, /Math\.min\(ORPHAN_BATCH, budget - 1\)/,
+    '每轮批量必须被剩余预算收窄（留 1 给 putIf）');
+  assert.match(body, /budget -= batch \+ 1;/, '删除与写回都要记账');
+  assert.match(body, /if \(batch < 1\) break;/, '预算不足必须停止删扫（残留 orphans 不影响读取）');
+  assert.match(body, /if \(budget < 2\) break;/, '凑不出「重读+最小写」必须停止重放');
 });
 
 /* ============ P2-3：reconcileIdx 复杂度 ============ */
@@ -221,10 +223,14 @@ test('P2-4 残留扫描的 list 页数必须在发起前按剩余预算裁剪', 
   const i = src.indexOf('async function apiDiagOrphans(');
   const body = src.slice(i, i + 4200);
   const listAt = body.indexOf('await Promise.all([');
-  const capAt = body.indexOf('pageCap(');
-  assert.ok(capAt > 0 && capAt < listAt, '页数裁剪必须发生在 Promise.all 之前（事后记账管不到已发请求）');
-  assert.match(body, /wantMeta > 0 \? store\.list\('meta\/', wantMeta\)/,
-    'meta 前缀的 list 必须用裁剪后的页数');
+  // #144 P2-5 重写：分配逻辑改为 meta/raw/progress 优先、text 拿剩余（旧 pageCap 先给
+  // text 分配 room，40 分片时书数级前缀一页不列还谎报扫完）。
+  const allocAt = body.indexOf('const wantMeta =');
+  assert.ok(allocAt > 0 && allocAt < listAt, '页数分配必须发生在 Promise.all 之前（事后记账管不到已发请求）');
+  assert.match(body, /const wantText = room > wantMeta \+ wantSide \?/,
+    'text/ 必须拿「书数级三个前缀之后」的剩余预算（它有 textCursor 续扫）');
+  assert.match(body, /room < 4 \|\| wantText === 0\) budget\.incomplete = true;/,
+    '预算不够四页、或本窗没发起 text list，都必须标 incomplete（否则静默漏扫谎报扫完）');
 });
 
 test('P2-5 OPDS 目录必须有子请求预算护栏（48 分片 ≈2.4 万本时 2+48 > 50）', () => {

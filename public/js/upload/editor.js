@@ -226,11 +226,17 @@ function ceBuildRow(ch, i, gen) {
     let ok = false;
     ceBusy('保存正文…'); // 加锁（此刻记下各控件的原值，解锁时照此还原）
     save.disabled = true; // 保存中必须禁用：防连点发出双请求
+    // #144 P1-3：请求体与基线推进必须用**同一份快照**。原实现两处各读一次 ta.value，
+    // 而加锁选择器不含 textarea —— 在飞期间打字时：新字上不了送，却被基线推进登记为
+    // 「已保存」，静默丢失。捕获快照后，在飞期新输入只进草稿（下方条件保留）。
+    const content = ta.value;
     try {
-      const r = await api.patchChapter(ceState.id, ch.key, { content: ta.value });
-      // 基线推进到刚保存的内容、草稿落地清掉 → 此后「与库内一致、无改动可存」
-      ceBase.set(ch.key, ta.value);
-      ceDraft.delete(ch.key);
+      const r = await api.patchChapter(ceState.id, ch.key, { content });
+      // 基线推进到刚保存的内容 → 此后「与库内一致、无改动可存」。
+      // 草稿只在**恰好等于刚保存内容**时清掉：若在飞期又打了新字（草稿 ≠ content），
+      // 无条件 delete 会把它们连着「已保存」的假象一起丢掉。
+      ceBase.set(ch.key, content);
+      if (ceDraft.get(ch.key) === content) ceDraft.delete(ch.key);
       ceState.words = r.wordCount;
       ceState.dirty = true;
       ceStatRefresh(gen); // 世代已失配则自动跳过（缺陷 3：不让迟到写把成功误报成失败）
@@ -309,6 +315,10 @@ async function ceDelete(ch) {
   ceBusy('删除中…');
   try {
     const r = await api.deleteChapter(ceState.id, ch.key);
+    // #144 P2-9：ceState 是模块级且 ceState.chapters 的 key 全书通用 —— 弹层已关/已换书
+    //（世代失配）时迟到返回的删除响应会直写 ceState，污染下一本书的编辑弹层章表
+    //（stat 行的 ceStatRefresh(gen) 有守卫，ceState 本体没有）。失配即整体放弃。
+    if (!ceAliveAt(gen)) return;
     ceState.chapters = ceState.chapters.filter((c) => c.key !== ch.key);
     ceState.count = r.chapterCount;
     ceState.words = r.wordCount;
@@ -332,7 +342,16 @@ async function ceInsert(afterKey) {
     const body = afterKey ? { after: afterKey, title: '新章', content: '' } : { title: '新章', content: '' };
     const r = await api.insertChapter(ceState.id, body);
     ceState.dirty = true;
-    await refreshCeFromServer(gen); // 以服务端为唯一事实源刷新顺序/编号/字数
+    // #144 P2-8：插入请求已成功（章已在服务端落位），随后的刷新失败**必须分段报错**——
+    // 二段 await 共用一个 catch 会把「已插入」报成「插入失败」，诱导用户重试 → 真插出两章
+    //（与 3cd06e7 修的「迟到写误报失败」同一族，只是失败点换到了刷新段）。
+    try {
+      await refreshCeFromServer(gen);
+    } catch {
+      if (ceAliveAt(gen)) toast('已插入，但章表刷新失败，请关闭弹层重新打开核对', 2800);
+      return;
+    }
+    if (!ceAliveAt(gen)) return; // #144 P2-9 同款守卫：刷新期间弹层已关/换书 → 不再写
     toast('已插入「' + r.title + '」，可改标题/正文', 1600);
   } catch (e) {
     toast('插入失败：' + (e.message || e), 2600);
@@ -344,6 +363,7 @@ async function ceInsert(afterKey) {
 /** 结构变化后以服务端为准刷新章表（顺序/编号/字数） */
 async function refreshCeFromServer(gen) {
   const meta = await api.bookMeta(ceState.id);
+  if (!ceAliveAt(gen)) return; // #144 P2-9：弹层已关/已换书 → ceState 是下一本书的，不能写
   ceState.chapters = (meta.chapters || []).map((c) => ({ key: c.key, title: c.title }));
   ceState.count = meta.chapterCount || ceState.chapters.length;
   ceState.words = meta.wordCount || 0;

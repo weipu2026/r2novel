@@ -258,20 +258,33 @@ async function uploadMany(id, keys, chapters) {
   }
 
   // 第二步：3 个 worker 从队列领批并发上传（单线程 JS，next 游标无竞态）
+  // #144 P2-10：旧实现 `Promise.all(workers)` 一失败就 reject，但其余 worker **不会停**——
+  // 继续领批把章节写进同一本书；而调用方（onConfirm）此刻正按「失败 → 删半成品」清理，
+  // 迟到批次会在已删书 id 下重建孤儿对象；且其余 rejection 无人接收（unhandled rejection）。
+  // 改为：任一批失败 → 置 aborted，worker 不再领新批，等齐在飞批次后把首个错误统一抛出
+  //（在飞批次无法取消，但收尾即停；调用方清理时已无在飞写）。
   let done = 0;
   let next = 0;
+  let aborted = false;
+  let firstErr = null;
   const worker = async () => {
-    while (next < bounds.length) {
+    while (!aborted && next < bounds.length) {
       const [s, e] = bounds[next++];
       const items = [];
       for (let k = s; k < e; k++) {
         const c = chapters[k];
         items.push({ key: keys[k], text: c && c.content != null ? c.content : '' });
       }
-      const r = await api.putChapters(id, items);
-      done += (r && r.count) || 0;
-      setProg(done / n, `上传章节 ${done}/${n}${rawInFlight() ? '（原件传输中…）' : ''}`);
+      try {
+        const r = await api.putChapters(id, items);
+        done += (r && r.count) || 0;
+        setProg(done / n, `上传章节 ${done}/${n}${rawInFlight() ? '（原件传输中…）' : ''}`);
+      } catch (err) {
+        if (!firstErr) firstErr = err;
+        aborted = true;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONC, bounds.length) }, worker));
+  if (firstErr) throw firstErr;
 }

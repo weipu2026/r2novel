@@ -845,6 +845,9 @@ async function loadIdxShard(store, n) {
  * 不走「逐本 append + 满片拆」——那会留下一串 251/250 的参差片；整块切布局确定、一次写齐。
  * root 首次落盘没有「写前状态」→ 不写 root bak（自愈链有「由分片重建」兜底）。 */
 async function migrateV1(store, { rootEtag = null } = {}) {
+  // #144 P3（天花板标注）：迁移是**全量一次性**写（每分片 2 写 + v1 bak + root），分片数 K
+  // 大时单请求放不下 → 依赖下方的幂等重跑续传（openIndex 见 root 缺失即重跑，已写的分片
+  // putIf 无条件覆盖、无害）。生产已在 v2 上，此路径只在全新库/回档时走到，未做分批化。
   const { json: legacy, raw } = await readIndexRaw(store);
   const books = (legacy.books || []).filter((b) => b && b.id);
   const chunks = [];
@@ -1148,6 +1151,12 @@ async function purgeOnce(store, id, maxDel = PURGE_BATCH) {
       // 还有没列到的：游标随 CAS 标记写进条目，下一轮从这里续（幂等：已删的 key 删第二次无害）
       nextCursor = (listed && listed.truncated && listed.cursor) || '';
     }
+  } else {
+    // #144 P1-1：上轮登记的续扫游标必须随条目带过来 —— 否则本窗 keys 恰好删完时
+    // nextCursor 落空、CAS else 分支剥掉游标并摘除条目，8000 章（list 8 页窗）之外的
+    // 正文永久残留。带上游标后：left 空 + 游标非空 → done=false（purge:[] + 游标保留），
+    // 下一轮 entry.purge 为空数组自然回落到上面的 listing 分支从游标续列。
+    nextCursor = purgeCursor;
   }
   const batch = keys.slice(0, maxDel);
   const left = keys.slice(batch.length);
@@ -1287,9 +1296,11 @@ function indexEntryFromMeta(meta, extra = {}) {
 const sweepTrashSafe = (store, env) => sweepTrash(store, env, 1).catch(() => {});
 
 /** 书架摘要（含置顶与进度镜像；排序由前端负责） */
-async function apiBooks(store) {
+async function apiBooks(store, env) {
   const idx = await openIndex(store);
-  return json({ books: idx.books });
+  // #144 P2-7：回收站保留期以服务端生效值为准（env.TRASH_DAYS 可覆盖默认），前端徽章/确认
+  // 文案不再硬编码 shared-const 的默认值 —— 运维调整后「剩 N 天」才不会系统性说谎。
+  return json({ books: idx.books, trashDays: Number(env.TRASH_DAYS) || TRASH_DAYS });
 }
 
 /**
@@ -1307,6 +1318,10 @@ async function apiCreateBook(req, env, store) {
   const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
 
+  // #144 P3（天花板标注）：判重走全量索引（openIndex = root + K 片，K≈ceil(本数/500)）。
+  // 2 万本 ≈ 41 片 → 1(root)+41(片)+固定开销已贴近 50 子请求硬顶；千本级（2 片）完全无忧。
+  // 若未来书库真到万级，需按 normTitle 建辅助映射而不是全量拉——当前规模不值得为此
+  // 多维护一个分片结构。
   const index = await readIndex(store);
   const nt = normTitle(title);
   const dup = (index.books || []).find((b) => normTitle(b.title) === nt);
@@ -1500,27 +1515,9 @@ async function apiUpdateChapters(req, env, store, id) {
   // 清不完的 key 会被避让并留在 mm.orphans 里续清。
   const sweptA = await sweepOrphansBatch(store, id, Array.from(preKeys), ORPHAN_BATCH, sweepLive);
 
-  // 阶段 B（副作用，只做一次）：replace 的进度迁移（读—写 progress，best-effort，不进 CAS）。
-  // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
-  // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
-  if (op !== 'append') {
-    let oldProg = null;
-    try {
-      const pt = await store.getText(KEY.progress(id));
-      if (pt) oldProg = JSON.parse(pt);
-    } catch {
-      /* 无进度或损坏则跳过迁移 */
-    }
-    if (oldProg && Number.isFinite(oldProg.ch) && oldProg.ch >= 1 && oldProg.ch <= oldCh.length) {
-      const newTitles = chapters.map((t, i) => safeStr(t, 120) || '第' + (i + 1) + '章');
-      const ni = newTitles.findIndex((t) => t === oldTitles[Math.floor(oldProg.ch) - 1]);
-      const next =
-        ni >= 0
-          ? { ch: ni + 1, ratio: Math.min(1, Math.max(0, Number(oldProg.ratio) || 0)), updatedAt: now }
-          : { ch: 1, ratio: 0, updatedAt: now };
-      await store.putText(KEY.progress(id), JSON.stringify(next));
-    }
-  }
+  // 阶段 B 已挪到 CAS 成功之后（#144 P3）：replace 的进度迁移原先放在 CAS **之前**，
+  // mutateMeta 因冲突 409/重试耗尽未生效时进度却已被改写（同名迁移失败还压回第 1 章）
+  // —— 章表没变、阅读进度先丢了。CAS 成功后才迁移，失败路径零副作用。
 
   // 阶段 C：CAS 变换（纯内存；冲突时会被**重放** —— 所有结果都从 meta 现推，绝不增量叠加）
   const m = await mutateMeta(
@@ -1579,8 +1576,32 @@ async function apiUpdateChapters(req, env, store, id) {
     gotCh
   );
   if (!m.ok) return metaFail(m);
-  // 状态副档单独写：它只是「可读性」的廉价判定，与 meta 短暂不一致的后果与原先同类
-  await putStatus(store, id, 'creating');
+  // 状态副档单独写：它只是「可读性」的廉价判定，与 meta 短暂不一致的后果与原先同类。
+  // 进度迁移（replace 专用）与它并行：CAS 已成功，章表必然变 → 迁移不会白做。
+  const progP =
+    op !== 'append'
+      ? (async () => {
+          // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
+          // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
+          let oldProg = null;
+          try {
+            const pt = await store.getText(KEY.progress(id));
+            if (pt) oldProg = JSON.parse(pt);
+          } catch {
+            /* 无进度或损坏则跳过迁移 */
+          }
+          if (oldProg && Number.isFinite(oldProg.ch) && oldProg.ch >= 1 && oldProg.ch <= oldCh.length) {
+            const newTitles = chapters.map((t, i) => safeStr(t, 120) || '第' + (i + 1) + '章');
+            const ni = newTitles.findIndex((t) => t === oldTitles[Math.floor(oldProg.ch) - 1]);
+            const next =
+              ni >= 0
+                ? { ch: ni + 1, ratio: Math.min(1, Math.max(0, Number(oldProg.ratio) || 0)), updatedAt: now }
+                : { ch: 1, ratio: 0, updatedAt: now };
+            await store.putText(KEY.progress(id), JSON.stringify(next));
+          }
+        })()
+      : Promise.resolve();
+  await Promise.all([progP, putStatus(store, id, 'creating')]);
   return json({ ok: true, op, cleanVer: m.meta.cleanVer, chapterKeys: m.out });
 }
 
@@ -1689,17 +1710,24 @@ async function apiBookMeta(store, id) {
     let etag = got.etag;
     // ⚠️ 每轮 sweepOrphans 最多 24 个 delete，且删除**不会**让重读的 orphans 变短（key 仍在表里
     // 直到 CAS 成功写回）→ 3 轮冲突 ≈ 3×(24+1) + 2 次重读 ≈ 77 子请求 → 目录 GET 直接 500
-    //（2026-10-06 审计 P2-2）。按剩余预算逐轮收窄批量；预算不足即停止重放
-    //（与下面「重试用尽时残留 orphans 不影响读取」的既有语义一致）。
+    //（2026-10-06 审计 P2-2）。子请求预算必须在**多轮之间分配**（#144 P2-4）：旧公式
+    // 「46-(attempt+1)*2」三轮都 ≥40 > ORPHAN_BATCH，Math.min 恒取 24、收窄分支永远不可达。
+    // 现按总预算扣减：入口读 meta 已花 1；每轮 batch(≤24) + putIf(1)，冲突再扣重读(1)。
+    // 46 = 1 入口读 + 24删 + 1写 + 1重读 + 18删 + 1写 = 46，第三轮预算见底即停
+    //（与「重试用尽时残留 orphans 不影响读取」的既有语义一致，下次 GET/PATCH 再扫）。
+    let budget = 46 - 1;
     for (let attempt = 0; ; attempt++) {
-      const room = 46 - (attempt + 1) * 2; // 每轮为「重读 + putIf」预留 2 次
-      if (attempt > 0 && room < 8) break; // 预算不足：不再重放
-      await sweepOrphans(store, meta, Math.max(1, Math.min(ORPHAN_BATCH, room)));
+      const batch = Math.min(ORPHAN_BATCH, budget - 1); // 留 1 给本轮 putIf
+      if (batch < 1) break; // 预算不足：不再删（残留 orphans 不影响读取）
+      await sweepOrphans(store, meta, batch);
+      budget -= batch + 1;
       const res = await putIf(store, KEY.book(id), JSON.stringify(meta), etag);
       if (res.ok) break;
       // 重试用尽：孤儿正文已删，meta 里残留的 orphans 字段不影响读取（下次 GET/PATCH 会再扫）
       if (attempt + 1 >= IDX_SAVE_TRIES) break;
+      if (budget < 2) break; // 凑不出「重读 1 + 下轮最少删 1 写 1」
       const again = await getWithEtag(store, KEY.book(id));
+      budget -= 1;
       const fresh = again ? tryParseJson(again.text) : null;
       if (!fresh) break; // 期间书被删了 → 不再写回
       // 并发 replace/publish 把 status 改回了 creating：既不能用这份半成品盘面写回，更不能把它
@@ -2011,7 +2039,11 @@ async function apiDeleteChapter(store, id, key) {
   if (gi < 0) return json({ error: '章节不存在' }, 404);
   if (gArr.length <= 1) return json({ error: '至少保留一章' }, 400);
   const oldWords = wordsOf(await store.getText(KEY.text(id, key)));
-  await store.delete(KEY.text(id, key));
+  // #144 P3：正文删除从 CAS **之前**挪到成功之后 —— 旧写序里并发把章删到只剩 1 章时
+  // mutateMeta 会短路（i>=0 且 arr.length<=1 → 返回 ok + chapterCount:1），而正文已在
+  // 前一步被删 → 客户端拿到「成功」、章表却仍引用已删正文（阅读 404）。改序后 CAS 成功
+  // 意味着该 key 必已不在章表，此时才删正文；若进程中断在两者之间，残留正文变成孤儿、
+  // 由孤儿清扫兜底（章表不含的 key 才会被清，方向安全）。
   const m = await mutateMeta(
     store,
     id,
@@ -2031,6 +2063,8 @@ async function apiDeleteChapter(store, id, key) {
   );
   if (!m.ok) return metaFail(m);
   if (!m.skipped) {
+    // 正文删除（见上：CAS 成功后才删）
+    await store.delete(KEY.text(id, key));
     // 进度迁移放在 CAS 成功之后、用**实际删除位** m.out.di（与插入路径的 F4 同一修法）：
     // 原先放在 CAS 之前用守卫读的 gi —— 409/冲突耗尽时章没删成、进度却已被白迁（阅读位置
     // 错一章）；并发双删时还会在已迁移的值上再迁一次。skipped（并发已删）则不迁——对方已迁。
@@ -2467,7 +2501,15 @@ async function apiTagsMerge(req, store) {
       return json({ ok: true, updated: 0, remaining: hit.length, retry: true });
     }
   }
-  return json({ ok: true, updated: patches.size - mergeSkip, remaining: Math.max(0, hit.length - targets.length) });
+  // #144 P3：meta CAS 失败（results 无 ok）的书既没生效、也不在 remaining 里 —— 剩余命中
+  // 恰好全是失败书时 remaining=0，前端（tagMergeRun）提前收手，这几本书的 from 标签永久残留。
+  // 失败数加回 remaining，让下一轮重调把它们再扫进来（meta 写入幂等，重算无害）。
+  const failed = targets.length - patches.size;
+  return json({
+    ok: true,
+    updated: patches.size - mergeSkip,
+    remaining: Math.max(0, hit.length - targets.length + failed),
+  });
 }
 
 /* ---------------- 回收站 API ---------------- */
@@ -2521,7 +2563,7 @@ async function apiTrashList(store, env) {
         // 与 apiRestore 判据一致：purge 非空或还有续扫游标 ⇒ 不可恢复
     restorable: !(Array.isArray(b.purge) && b.purge.length) && !b.purgeCursor,
   }));
-  return json({ books: view });
+  return json({ books: view, trashDays: Number(env.TRASH_DAYS) || TRASH_DAYS });
 }
 
 /** 恢复：trash → index（正文未删时）
@@ -2562,7 +2604,7 @@ async function apiRestore(store, id) {
   idx.upsert(id, { ...rest }); // 已在架（重复恢复）则原位覆盖，语义与 v1 的去重 push 一致
   await idx.save({ bak: true });
   // 入口那次读的版本号带下来复用（pre）：冲突时 updateTrash 自己重读重放，不会多花一次读
-  await updateTrash(
+  const marked = await updateTrash(
     store,
     (t) => {
       const i = t.books.findIndex((b) => b.id === id);
@@ -2570,12 +2612,31 @@ async function apiRestore(store, id) {
       // 我读快照之后它又被并发软删了一次（deletedAt 变了）→ 这次「摘除」不该生效：
       // 否则会把别人刚写回的条目吃掉，书既不在架也不在回收站（2026-09-17 复查 F1）。
       if (t.books[i].deletedAt !== entry.deletedAt) return { dirty: false };
+      // #144 P1-2：purgeOnce 的占用标记（purge:left / purgeCursor）**保留 deletedAt 不变**，
+      // 只比 deletedAt 的重放会穿透 —— 恢复这边刚把书 upsert 回索引，并发 purge 那边正在删
+      // 它的正文（本批 ≤30 章已删）。检出占用标记 ⇒ 放弃摘除并向调用方报 raced：
+      // 索引侧回滚 remove，状态收敛回「只在回收站、正文已部分清除（409）」。
+      if ((Array.isArray(t.books[i].purge) && t.books[i].purge.length) || t.books[i].purgeCursor) {
+        return { dirty: false, out: { raced: true } };
+      }
       t.books.splice(i, 1);
       return {};
     },
     3,
     trashCur
   );
+  if (marked && marked.raced) {
+    // 回滚刚 upsert 进索引的残缺副本（书架上点开必 404 数章，比「不在架」更糟）。
+    // 索引 CAS 冲突这里不再重试重放——竞态窗口本就极窄，尽力回滚即可，trash 里的
+    // 条目（带占用标记）始终是权威记录。
+    try {
+      idx.remove(id);
+      await idx.save({ bak: true });
+    } catch {
+      /* 回滚失败不掩盖主结果：409 照常返回，diag 的孤儿清扫可兜底 */
+    }
+    return json({ error: '该书正在被彻底删除，恢复已中止' }, 409);
+  }
   return json({ ok: true });
 }
 
@@ -2666,13 +2727,16 @@ async function doDiagScan(store, textCursor = '') {
   // 1(root) + shards + (3+3+3+12) 在 40 分片时 = 62 > 50 → 502，「检查残留」在大库直接不可用
   //（而这正是大库最需要的运维工具）。余量不足时按优先级压页数（text/ 是章数级大头，先压它）。
   const room = Math.max(0, 47 - budget.used);
-  const pageCap = (want) => (room <= 0 ? 0 : Math.max(1, Math.min(want, room)));
-  const wantText = pageCap(DIAG_TEXT_PAGE_BUDGET);
-  const metaRoom = pageCap(0); // meta/raw/progress 各要 1 页起（后面按实际剩余再收）
-  const wantMeta = Math.max(0, Math.min(DIAG_META_PAGE_BUDGET, room - wantText));
-  const wantSide = Math.max(0, Math.min(DIAG_META_PAGE_BUDGET, room - wantText - wantMeta));
-  if (room < 4) budget.incomplete = true; // 连四个 list 的最低页预算都不够 → 本窗标不完整，别谎报「扫完了」
-  void metaRoom;
+  // #144 P2-5：分配优先级必须是 meta/raw/progress（书数级，每窗至少各 1 页）**优先**、
+  // text/ 拿剩余 —— 旧实现先把 room 分给 text（pageCap 先算 wantText），40 分片时 room=6
+  // 被 text 吃满 → meta/raw/progress 一页不列，且 room≥4 不标 incomplete → 静默漏扫还谎报
+  // 「扫完」。text 预算不足没关系：textCursor 续扫就是为它设计的。
+  const wantMeta = room > 0 ? Math.min(DIAG_META_PAGE_BUDGET, room) : 0;
+  const wantSide = room > wantMeta ? Math.min(DIAG_META_PAGE_BUDGET, room - wantMeta) : 0;
+  const wantText = room > wantMeta + wantSide ? Math.min(DIAG_TEXT_PAGE_BUDGET, room - wantMeta - wantSide) : 0;
+  // #144 P2-5：连四个 list 的最低页预算（1+1+1+1）都不够，或本窗根本没发起 text/ 的 list
+  //（wantText=0 → NO_LIST.cursor=null，前端会把「没扫」当成「扫完」停循环）→ 都必须标不完整。
+  if (room < 4 || wantText === 0) budget.incomplete = true;
   const [lMeta, lRaw, lProg, lText] = await Promise.all([
     wantMeta > 0 ? store.list('meta/', wantMeta) : Promise.resolve(NO_LIST),
     cont || wantSide <= 0 ? NO_LIST : store.list('raw/', wantSide),
@@ -3004,7 +3068,9 @@ async function opdsCatalog(req, env, store) {
     return json({ error: '书库过大，OPDS 目录已暂停订阅（分片数超限）。请改用网页端阅读。' }, 409);
   }
   const index = probe ? await openIndex(store, { rootRaw: probe.text, rootEtag: probe.etag }) : await readIndex(store);
-  const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.createdAt || a.updatedAt || 0));
+  // #144 P3：两侧口径必须一致 —— 旧写法 b 侧 updatedAt 优先、a 侧却 createdAt 优先，
+  // 「a 从未更新、b 更新过」这类组合会排出与时间无关的伪序。降序（新在前）。
+  const books = (index.books || []).slice().sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
   const page = Math.min(10000, Math.max(1, parseInt(new URL(req.url).searchParams.get('p'), 10) || 1));
   const slice = books.slice((page - 1) * OPDS_PAGE, page * OPDS_PAGE);
   const href = (n) => (n <= 1 ? '/opds' : `/opds?p=${n}`);
@@ -3071,7 +3137,7 @@ async function handleApi(req, env, store, url, p) {
   if (p === '/api/logout' && req.method === 'POST') return apiLogout(req);
 
   if (p === '/api/books') {
-    if (req.method === 'GET') return apiBooks(store);
+    if (req.method === 'GET') return apiBooks(store, env);
     if (req.method === 'POST') return apiCreateBook(req, env, store);
     await dropBody(req);
     return json({ error: 'method' }, 405);

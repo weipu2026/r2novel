@@ -129,9 +129,18 @@ jobs:
             # 连「查询失败」和「判据没匹配上」都分不清。现改为：失败打印原始输出；
             # 判据改词匹配（-w），JSON/表格/YAML 三种格式通吃。
             LIST_OUT=$(npx wrangler secret list 2>&1) || {
-              echo "::error::wrangler secret list 查询失败（Token/网络？），原始输出："
-              printf '%s\n' "$LIST_OUT"
-              exit 1
+              # #144 P3：首次部署时 Worker 尚不存在，secret list 必然报「not found」——
+              # 若与其他查询失败一起 fail，全新账号将永远无法完成首次部署（死锁：要先部署
+              # 才有 Worker，要先查 secret 才肯部署）。区分处理：not found 放行（deploy
+              # 会创建 Worker，下方「同步密钥」补 secret；口令真没配的话生产冒烟会以
+              # 明确报错拦住坏版本上线），其余错误照旧 fail loud。
+              if printf '%s\n' "$LIST_OUT" | grep -qi "not found"; then
+                echo "· Worker 尚不存在（首次部署）：跳过 secret 预检，部署后由「同步密钥」补齐"
+              else
+                echo "::error::wrangler secret list 查询失败（Token/网络？），原始输出："
+                printf '%s\n' "$LIST_OUT"
+                exit 1
+              fi
             }
             if ! printf '%s\n' "$LIST_OUT" | grep -qw "$s"; then
               echo "::error::Worker 缺少 ${s} secret：拒绝部署（否则上线一个无法登录的站）"
@@ -178,8 +187,10 @@ jobs:
           else
             SMOKE_BASE=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1 || true)
             if [ -z "$SMOKE_BASE" ]; then
-              echo "· 未能从部署输出解析 workers.dev 地址，跳过冒烟"
-              exit 0
+              # #144 P2-11：解析失败必须 fail loud —— 旧实现 exit 0 会静默跳过生产冒烟与
+              # 版本核验，CI 照样全绿（验证链上唯一的静默旁路：冒烟/核验蒸发无人知晓）。
+              echo "::error::未能从部署输出解析 workers.dev 地址——拒绝跳过生产冒烟，请检查 deploy.log"
+              exit 1
             fi
           fi
           # 日志脱敏：域名/地址是 Secret 派生的，公开仓库的 Actions 日志可见

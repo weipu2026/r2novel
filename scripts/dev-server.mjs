@@ -229,7 +229,9 @@ fs.mkdirSync(DATA, { recursive: true });
 const env = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
   SESSION_SECRET: process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD,
-  SESSION_DAYS: '30',
+  // #144 P3：SESSION_DAYS 不再手写镜像 '30'（router.js 兜底改值时这里必然忘同步 → 本地
+  // 与生产会话时长静默漂移）。缺省交给 router 兜底；本地要试不同值时设 SESSION_DAYS 环境变量。
+  SESSION_DAYS: process.env.SESSION_DAYS,
   MAX_UPLOAD: String(MAX_UPLOAD_BYTES),
   MAX_CHAPTER: String(MAX_CHAPTER_BYTES),
   BRUTE_LIMIT: process.env.BRUTE_LIMIT,

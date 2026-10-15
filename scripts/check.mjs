@@ -49,7 +49,12 @@ const PUBLIC = path.join(ROOT, 'public');
  *  不再手写镜像（手写的那份在 app.js 改了注入名单后极易忘记同步）。识别 ES6 简写与 `k: v` 两种写法。 */
 const HOST_CAPS = (() => {
   const p = path.join(PUBLIC, 'js', 'app.js');
-  if (!fs.existsSync(p)) return [];
+  // #144 P3：文件缺失/括号配对失败都必须 fail loud —— 静默 return [] 会让「upload 域必须
+  // 走 host()」的规则 c 整段空转、CI 照样全绿（与下方锚点缺失同罪）。
+  if (!fs.existsSync(p)) {
+    console.error('HOST CAPS 门禁失效：找不到 ' + p);
+    process.exit(1);
+  }
   const code = stripCode(fs.readFileSync(p, 'utf8')); // 函数声明会提升，可先用后定义
   const i = code.indexOf('initUpload(');
   if (i < 0) {
@@ -66,7 +71,10 @@ const HOST_CAPS = (() => {
     if (code[k] === '(') depth++;
     else if (code[k] === ')') { depth--; if (!depth) { close = k; break; } }
   }
-  if (close < 0) return [];
+  if (close < 0) {
+    console.error('HOST CAPS 门禁失效：initUpload( 实参括号配对失败（app.js 可能被截断或语法损坏）。');
+    process.exit(1);
+  }
   const out = new Set();
   for (const m of code.slice(open + 1, close).matchAll(/(?:^|[,{\s])([A-Za-z_$][\w$]*)\s*(?=[:,}]|$)/g)) out.add(m[1]);
   return [...out];
@@ -137,7 +145,10 @@ function getExports(abs) {
 /** app.js 顶层「函数」名（函数声明 + 箭头函数常量）：这些是上传域只能经 host() 访问的宿主能力 */
 const appTopFns = (() => {
   const p = path.join(PUBLIC, 'js', 'app.js');
-  if (!fs.existsSync(p)) return [];
+  if (!fs.existsSync(p)) {
+    console.error('appTopFns 门禁失效：找不到 ' + p);
+    process.exit(1);
+  }
   const code = stripCode(fs.readFileSync(p, 'utf8'));
   const out = new Set();
   for (const m of code.matchAll(/(?:^|\n)(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)) out.add(m[1]);
@@ -282,6 +293,26 @@ for (const f of publicFiles) {
         if (!SHARED_OK.has(relT.split('/').pop())) {
           say('CROSS LAYER', `${rel} 反向导入浏览器模块 public/${relT}（node 侧只允许 import 白名单共享模块）`);
           cross++;
+          continue;
+        }
+        // #144 P3：白名单共享模块的**命名导入**也要校验名字存在性 —— node --check 只查语法，
+        // src/ 里 import { X } from shared-const.js 的 X 写错（或目标模块改名/漏导出）会一路
+        // 拖到 Workers 部署才炸（本地 node --check 与 CROSS_LAYER 全绿）。与 public 侧 ②
+        // 的 getExports 同一判据。
+        const exp = getExports(target);
+        if (!exp || exp.starReexport) continue;
+        const esc = spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const imRe = new RegExp(`(?:import|export)\\s*\\{([^}]*)\\}\\s*from\\s*['"]${esc}['"]`, 'g');
+        for (const m of nc.matchAll(imRe)) {
+          for (const part of m[1].split(',')) {
+            const t = part.trim();
+            if (!t) continue;
+            const n = t.split(/\s+as\s+/)[0].trim();
+            if (n && n !== 'default' && !exp.names.has(n)) {
+              say('CROSS LAYER', `${rel} 从 public/${relT} 导入了不存在的名字「${n}」`);
+              cross++;
+            }
+          }
         }
       }
     }

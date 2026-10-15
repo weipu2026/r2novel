@@ -60,9 +60,22 @@ export class El {
     for (const c of this.childNodes) c.parentNode = null; // 真实 DOM：被替换的子树与父节点解链
     this.childNodes = [];
     this._html = String(v);
+    // #144 P3：与浏览器一致 —— 赋值即解析出真实子树。原先只存字符串，被测代码若不经
+    // setModalHTML 而直接赋 innerHTML，querySelector 会静默落空、行为断言假绿。
+    for (const el of parseHTML(v)) this.appendChild(el);
   }
   get innerHTML() { return this._html; }
-  setAttribute(k, v) { if (k === 'id') this._id = String(v); this.attributes[k] = String(v); }
+  setAttribute(k, v) {
+    if (k === 'id') this._id = String(v);
+    // #144 P3：reflected boolean 属性联动 —— 浏览器里 setAttribute('disabled', …) 会把
+    // el.disabled 变 true（存在即 true）。桩里两者独立 → 「经 attr 禁用后事件照发」的假绿。
+    if (k === 'disabled') this._disabled = true;
+    this.attributes[k] = String(v);
+  }
+  removeAttribute(k) {
+    delete this.attributes[k];
+    if (k === 'disabled') this._disabled = false;
+  }
   getAttribute(k) { return this.attributes[k]; }
   appendChild(n) { n.parentNode = this; this.childNodes.push(n); return n; }
   append(...ns) { ns.forEach((n) => this.appendChild(n)); }
@@ -120,7 +133,10 @@ export function matchesSimple(el, selRaw) {
     const sel2 = sel.trim();
     if (!sel2) continue;
     const m = /^([a-zA-Z][\w]*)?(?:#([\w-]+))?((?:\.[\w-]+)*)$/.exec(sel2);
-    if (!m) continue;
+    // #144 P3：桩不认识的选择器必须 fail-fast —— 静默 false 会让 querySelector 恒 null、
+    // 断言静默假绿（ceApplyLock 事故同根）。遇到属性/子代/伪类等未支持语法显式抛错，
+    // 提示扩展桩或改用受支持语法，而不是让测试假装通过。
+    if (!m) throw new Error(`_dom-stub: 尚不支持的选择器「${sel2}」——请扩展桩或改用 tag/#id/.class 语法`);
     const [, tag, id, classes] = m;
     if (tag && el.tagName !== tag.toUpperCase()) continue;
     if (id && el._id !== id) continue;
@@ -175,12 +191,10 @@ export function parseHTML(html) {
   return roots;
 }
 
-/** 模拟 app.js 的 openModal(html)：整块替换内容（真实实现是 modalBox.innerHTML = html） */
+/** 模拟 app.js 的 openModal(html)：整块替换内容（真实实现是 modalBox.innerHTML = html）
+ *  #144 P3：innerHTML setter 现在自身就解析子树 → 这里收敛为同一入口，两处语义永不漂移 */
 export function setModalHTML(box, html) {
-  for (const c of box.childNodes) c.parentNode = null;
-  box.childNodes = [];
-  box._html = String(html);
-  for (const el of parseHTML(html)) box.appendChild(el);
+  box.innerHTML = html;
   return box;
 }
 

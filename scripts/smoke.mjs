@@ -69,11 +69,15 @@ async function api(path, { method = 'GET', body } = {}) {
 }
 
 /** 软删 + 彻底删除一本书（收尾清理用；对已删/不存在的 id 幂等无害） */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function purgeBook(id) {
   if (!id) return;
   await api(`/api/books/${id}`, { method: 'DELETE' }).catch(() => {});
   let r = await api(`/api/trash/${id}`, { method: 'DELETE' });
+  // #144 P3：轮询间隔 200ms —— 零间隔连打是纯本地风暴（服务端每轮已清满一批，
+  // 本地立刻重发只会把「批次推进」变成「排队洪峰」），也放大误判 remaining>0 的窗口。
   for (let i = 0; r && r.data && r.data.remaining > 0 && i < 60; i++) {
+    await sleep(200);
     r = await api(`/api/trash/${id}`, { method: 'DELETE' });
   }
 }
@@ -170,8 +174,10 @@ async function runAll() {
   r = await api('/api/login', { method: 'POST', body: { password: PASS } });
   const sc2 = r.headers.get('set-cookie') || '';
   const m2 = /rn_session=([^;]+)/.exec(sc2);
-  cookie = 'rn_session=' + m2[1];
-  check('M2 登录', r.status === 200);
+  // #144 P3：先空判再取 —— 登录失败（无 set-cookie）时 m2 为 null，旧写法直接 TypeError
+  // 崩掉整个冒烟，而不是输出一条「M2 登录失败」。
+  cookie = m2 ? 'rn_session=' + m2[1] : '';
+  check('M2 登录', r.status === 200 && !!m2);
 
   // 建 3 本书，分别用于 duplicate / 替换 / 回收站测试
   async function mkBook(title, n = 3) {
@@ -289,6 +295,7 @@ async function runAll() {
   // 异常态，无上限的 while 会永久自旋 → 冒烟步骤跑到全局超时（2026-10-06 审计 P3）
   let pr = await api(`/api/trash/${idTrash}`, { method: 'DELETE' });
   for (let i = 0; pr && pr.data && pr.data.remaining > 0 && i < 60; i++) {
+    await sleep(200);
     pr = await api(`/api/trash/${idTrash}`, { method: 'DELETE' });
   }
   check('M2 彻底删除至 remaining=0', pr.data.done === true && pr.data.remaining === 0);

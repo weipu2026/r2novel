@@ -213,7 +213,17 @@ async function boot() {
   }
   try {
     const data = await api.books(); // 一次拉取，鉴权预检 + 首屏数据共用
-    showView('shelf');
+    // ⚠️ 视图守卫（2026-10-15 用户实测两 BUG 同根）：books() 在飞期间用户可能已点书卡
+    // 进入阅读页（有本地快照时书架秒开，窗口很大）——此处无条件 showView('shelf') 会：
+    // ① 把人从阅读页踢回书架（「有时自动跳回首页」）；
+    // ② 更糟的交错：openBook 尾部裸 remove readRoot 的 hidden（不走 showView）会把阅读页
+    //    重新揭开，而 shelf 的 hidden 已被本行摘掉 → 两视图同屏（.view 是 height:100% 流式
+    //    布局，纵向堆叠），书架卡片数字「浮现」在阅读页上；首访无缓存时 books() 慢，最易中招。
+    // 故：用户已进入 read/upload/trash 视图时只更新数据、不抢视图。401 分支不受影响（该踢照踢）。
+    const inOtherView = !els.readRoot.classList.contains('hidden')
+      || !els.upload.classList.contains('hidden')
+      || !els.trash.classList.contains('hidden');
+    if (!inOtherView) showView('shelf');
     await loadShelf(data);
     refreshPresetTags(); // 已确认登录 → 云端标签覆盖本地快照（打新标签/治理后 chips 跟进）
   } catch (e) {

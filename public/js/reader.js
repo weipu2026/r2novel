@@ -164,6 +164,9 @@ export function closeReader() {
   state.cache.clear();
   state.inflight.clear();
   state.lastSave = 0;
+  // #144 P3：正文区一并清空 —— 换书窗口（openBook 的 meta/进度还在拉）里旧书正文仍挂着，
+  // 新书渲染完成前用户会先看到上一本书的正文闪现。openBook 渲染前会重填，无需保留。
+  els.art.innerHTML = '';
   progConfirmIdx = -1; // 确认态跨书残留的话，新书里第一次轻点进度线就会直接跳章（违反「轻点只预览」契约）
 }
 
@@ -335,7 +338,9 @@ async function loadChapter(idx) {
   try {
     return await task;
   } finally {
-    state.inflight.delete(ck);
+    // #144 P3：closeReader 会整表 clear；旧会话任务迟到收尾时若直接 delete(ck)，会把
+    // 新会话挂在同一章 key 上的在飞表项误删（同章合并失效、重复请求）。只删仍属于自己的项。
+    if (state.inflight.get(ck) === task) state.inflight.delete(ck);
   }
 }
 

@@ -202,7 +202,12 @@ export const local = {
   getShelfCache() {
     try {
       const s = JSON.parse(localStorage.getItem(LS.shelf));
-      return s && Array.isArray(s.books) ? s : null;
+      if (!s || !Array.isArray(s.books)) return null;
+      // #144 P2-6：残缺条目（旧版本写入/损坏）会让 renderShelf 的 colorOf(b.title) 抛
+      // TypeError —— boot 里快照渲染在 try 外，首屏就此瘫死且零提示。过滤掉缺 id/title
+      // 的条目；全军覆没则宁可不启用快照（走正常网络加载）。
+      s.books = s.books.filter((b) => b && typeof b.id === 'string' && typeof b.title === 'string' && b.title);
+      return s.books.length ? s : null;
     } catch {
       return null;
     }

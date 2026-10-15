@@ -20,6 +20,9 @@ let presetTagsAt = 0; // 上次云端刷新时间（导航切换时去重，避�
 let presetTagsInflight = null;
 
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
+// #144 P2-7：回收站保留期以服务端生效值为准（apiBooks/apiTrashList 随响应带 trashDays，
+// env.TRASH_DAYS 可覆盖默认值）——徽章「剩 N 天」与删除确认文案不再硬编码默认 15。
+let trashDays = TRASH_DAYS;
 let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
 
 export function init() {
@@ -158,7 +161,7 @@ export function init() {
   els.bbTags.addEventListener('click', batchEditTags);
   els.bbDone.addEventListener('click', () => batchRun('setFinished', { finished: true }, `把 ${selected.size} 本书标记为「已完结」？`));
   els.bbOngoing.addEventListener('click', () => batchRun('setFinished', { finished: false }, `把 ${selected.size} 本书标记为「连载中」？`));
-  els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？${TRASH_DAYS} 天内可恢复`));
+  els.bbDelete.addEventListener('click', () => batchRun('delete', {}, `把 ${selected.size} 本书移入回收站？${trashDays} 天内可恢复`));
   els.trashBack.addEventListener('click', () => { showView('shelf'); loadShelf().catch(() => {}); });
   els.trashClear.addEventListener('click', clearTrashFlow);
   // 搜索防抖：千本规模下每次按键全量过滤+重建网格，150ms 合并输入更顺滑
@@ -189,7 +192,7 @@ export function init() {
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
   presetTags = local.getPresetTags();
   renderPresetChips();
-  boot(); // 预设标签的云端刷新挪进 boot 登录校验成功之后（登录前调用必 401，白费一个请求）
+  boot().catch((e) => console.error('boot 异常', e)); // 预设标签的云端刷新挪进 boot 登录校验成功之后（登录前调用必 401，白费一个请求）
 }
 
 function onNavBack() {
@@ -208,8 +211,13 @@ async function boot() {
   if (snap) {
     books = snap.books;
     tagCache = null;
-    showView('shelf');
-    renderShelf();
+    try {
+      showView('shelf');
+      renderShelf();
+    } catch {
+      // 快照渲染失败（损坏/旧版形状漏网）：弃快照回到空架，不挡后面的网络校验与 loadShelf
+      books = [];
+    }
   }
   try {
     const data = await api.books(); // 一次拉取，鉴权预检 + 首屏数据共用
@@ -339,6 +347,10 @@ async function finishLogout() {
   // 登录页之上：登录框点不到、界面无提示，被遮住的还是含书名 / R2 对象 key 完整路径 /
   // 字节数 / 章节数的诊断内容（共享设备上的隐私残留）。closeModal 自带 modalSeq++，
   // 顺带作废在途弹层内容。一处修复覆盖全部 401 路径。
+  // #144 P3：阅读器也要一并收敛 —— closeReader 清 state.book、停 visibilitychange 写进度、
+  // 收起抽屉/面板/书名。会话过期时若正在阅读页，漏掉这步会让阅读器状态跨会话残留
+  //（重登后抽屉/悬浮层里还是上一会话的书与章节）。
+  reader.closeReader();
   closeModal();
   busyDone();
   showView('login');
@@ -385,6 +397,7 @@ async function loadShelf(data) {
     }
     data = await api.books();
   }
+  if (Number(data.trashDays) > 0) trashDays = Number(data.trashDays);
   // 等待期间又发起了新的 loadShelf（连点品牌/操作后立即刷新等）：本次响应已过期，
   // 丢弃——否则旧数据会把刚 PATCH 的星标/置顶「点了又没了」，刷新才恢复
   if (seq !== shelfSeq) return;
@@ -914,7 +927,7 @@ function openSheet(b, anchor) {
       text: '移入回收站',
       danger: true,
       act: async () => {
-        if (await confirmModal(`把《${b.title}》移入回收站？${TRASH_DAYS} 天内可恢复。`)) {
+        if (await confirmModal(`把《${b.title}》移入回收站？${trashDays} 天内可恢复。`)) {
           try {
             await api.deleteBook(b.id);
             toast('已移入回收站', 1600);
@@ -942,6 +955,12 @@ function clearSheetPos() {
 }
 
 function placeSheet(anchor) {
+  // #144 P3：renderGrid 重建网格后旧锚点按钮已被 detach —— 对不在文档里的节点
+  // getBoundingClientRect 全 0，操作单会飞到视口左上角。锚点失效即整个关掉。
+  if (anchor && !anchor.isConnected) {
+    closeSheet();
+    return;
+  }
   const s = els.sheet;
   if (window.innerWidth < 900 || !anchor) {
     sheetAnchor = null;
@@ -1026,8 +1045,14 @@ async function openEditModal(b) {
       if (typeof meta.finished === 'boolean') finished = meta.finished;
       metaLoaded = true;
     }
-  } catch {
-    /* meta 拉取失败：备注框留空但**禁写**（见 metaLoaded 分支）——不提交 ≠ 清空 */
+  } catch (e) {
+    // #144 P3：401 必须进统一出口（handleAuth → finishLogout）——原实现把一切吞掉，
+    // 会话过期后弹层照常打开，用户填完保存才发现全部失败。其余错误维持原语义：
+    // 备注框留空但**禁写**（见 metaLoaded 分支）——不提交 ≠ 清空。
+    if (e instanceof ApiError && e.status === 401) {
+      handleAuth(e);
+      return;
+    }
   }
   // 元信息是 RTT 之后才到的：期间用户可能已点了另一本书（或关掉了弹层）。没有这道闸门时，
   // 迟到的响应会直接 openModal 覆盖已显示的表单——用户看着甲书的表单，但他最后点的是乙；
@@ -1036,13 +1061,13 @@ async function openEditModal(b) {
   openModal(`
     <h3>编辑信息</h3>
     <p class="modal-sub">《${esc(b.title)}》 · ${b.chapterCount || 0} 章</p>
-    <div class="m-field"><label>书名</label><input id="mdTitle" value="${esc(b.title)}"></div>
-    <div class="m-field"><label>作者</label><input id="mdAuthor" value="${esc(b.author || '')}"></div>
-    <div class="m-field"><label>标签（逗号分隔，可点选）</label><input id="mdTags" value="${esc((b.tags || []).join(', '))}">
+    <div class="m-field"><label for="mdTitle">书名</label><input id="mdTitle" value="${esc(b.title)}"></div>
+    <div class="m-field"><label for="mdAuthor">作者</label><input id="mdAuthor" value="${esc(b.author || '')}"></div>
+    <div class="m-field"><label for="mdTags">标签（逗号分隔，可点选）</label><input id="mdTags" value="${esc((b.tags || []).join(', '))}">
       <div id="mdTagChips" class="tag-chips"></div>
     </div>
     <div class="m-field"><label class="finish-row"><span>已完结</span><input type="checkbox" id="mdFinished" ${finished ? 'checked' : ''}></label></div>
-    <div class="m-field"><label>备注</label><input id="mdNote" value="${esc(note)}" placeholder="${metaLoaded ? '这本书的备注（个人备忘）' : '备注加载失败，本次保存不会改动备注'}"${metaLoaded ? '' : ' disabled'}></div>
+    <div class="m-field"><label for="mdNote">备注</label><input id="mdNote" value="${esc(note)}" placeholder="${metaLoaded ? '这本书的备注（个人备忘）' : '备注加载失败，本次保存不会改动备注'}"${metaLoaded ? '' : ' disabled'}></div>
     <div class="m-acts">
       <button class="ghost" id="mdCancel" type="button">取消</button>
       <button class="primary" id="mdOk" type="button">保存</button>
@@ -1148,11 +1173,13 @@ function enterBatchMode() {
   toast('批量模式：点书勾选，再点取消', 2000);
 }
 
-function exitBatchMode() {
+function exitBatchMode(rerender = true) {
   batchMode = false;
   selected.clear();
   els.batchBar.classList.add('hidden');
-  renderShelf();
+  // #144 P3：batchRun 传 rerender=false —— 批量完成后紧接着 loadShelf() 会用服务端新数据
+  // 渲染；这里先用**旧 books** 重渲染会让已删/已改的书闪现旧状态一帧（先闪现再刷新）。
+  if (rerender) renderShelf();
 }
 
 /** 顶栏「⋯」收纳菜单：低频治理入口统一收进来，顶栏只留「＋ 上传」+「⋯」 */
@@ -1199,7 +1226,7 @@ async function batchRun(action, payload, confirmText) {
   } finally {
     busyDone();
   }
-  exitBatchMode();
+  exitBatchMode(false); // #144 P3：不重渲染，后面 loadShelf 拉新数据只渲一次（避免旧状态闪现）
   // 会话过期优先处理：报「N 本失败（可能是半成品书）」会引导用户反复重试，而重试永远不会
   // 成功（cookie 已失效）。收敛到登录页并说明原因。
   if (expired) {
@@ -1602,6 +1629,7 @@ async function openTrash() {
 
 async function loadTrash() {
   const data = await api.trash();
+  if (Number(data.trashDays) > 0) trashDays = Number(data.trashDays); // 服务端生效值（env 可覆盖默认）
   const list = data.books || [];
   els.trashCount.textContent = list.length ? `${list.length} 本` : '';
   const wrap = els.trashList;
@@ -1636,8 +1664,8 @@ function trashRow(b) {
   const acts = document.createElement('div');
   acts.className = 't-acts';
   if (b.restorable) {
-    // 保留期徽章：还剩几天可恢复（≤3 天红色警示）——免去用户心算 15 天期限
-    const left = Math.max(0, TRASH_DAYS - Math.floor((Date.now() - (b.deletedAt || 0)) / 86400000));
+    // 保留期徽章：还剩几天可恢复（≤3 天红色警示）——免去用户心算保留期限
+    const left = Math.max(0, trashDays - Math.floor((Date.now() - (b.deletedAt || 0)) / 86400000));
     const ttl = document.createElement('span');
     ttl.className = 'ttl-badge' + (left <= 3 ? ' warn' : '');
     ttl.textContent = left > 0 ? `剩 ${left} 天` : '即将清除';
@@ -1647,12 +1675,15 @@ function trashRow(b) {
     restore.className = 'ghost';
     restore.textContent = '恢复';
     restore.addEventListener('click', async () => {
+      if (restore.disabled) return; // #144 P3：防连点 —— 恢复在飞时再点会重复 POST
+      restore.disabled = true;
       try {
         await api.restore(b.id);
         toast('已恢复', 1400);
         await loadTrash();
       } catch (e) {
         if (handleAuth(e)) return;
+        restore.disabled = false; // 失败放行重试（成功则列表已重建，无需还原）
         toast('恢复失败：' + (e.message || e), 2500);
       }
     });

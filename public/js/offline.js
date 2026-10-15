@@ -123,11 +123,19 @@ export const offline = {
     });
   },
   /** 清空全部离线数据（登出）：正文缓存 + 书目快照 + 待上送队列。
-   *  共享设备上退出了还能断网读已下载正文，是真实的隐私缺口。 */
+   *  共享设备上退出了还能断网读已下载正文，是真实的隐私缺口。
+   *  #144 P3：三个库逐个清、失败继续清下一个 —— 原实现串行 await，第一个 clear 失败
+   *  （如该库事务被占用）后面两个就不清了，「登出清痕」半途而废且无感知。 */
   async clearAll() {
-    await inTx('chapters', 'readwrite', (os) => os.clear());
-    await inTx('books', 'readwrite', (os) => os.clear());
-    await inTx('progQueue', 'readwrite', (os) => os.clear());
+    const errs = [];
+    for (const name of ['chapters', 'books', 'progQueue']) {
+      try {
+        await inTx(name, 'readwrite', (os) => os.clear());
+      } catch (e) {
+        errs.push(name);
+      }
+    }
+    if (errs.length) throw new Error('离线数据清理失败：' + errs.join(','));
   },
   /** 回网上送离线进度；send(bookId,{ch,ratio,updatedAt,cleanVer}) 抛错则保留 */
   async drainProgress(send) {

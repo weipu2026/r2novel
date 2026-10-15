@@ -157,9 +157,13 @@ export function detectEncoding(bytes) {
     const len = getLenientDecoder(lab);
     if (!len) continue;
     const text = len.decode(sample);
-    const replaced = (text.match(/\uFFFD/g) || []).length;
     const score = readabilityScore(text);
-    if (replaced === 0 && score >= 60) {
+    // replaced 用**整篇**口径（#144 P3，与上面注释及三路 fatal 候选同标准）：样本口径会让
+    // 「前 96KB 干净、尾部截断/坏字节」的 UTF-16 文件在零替换符门槛上被误判为合格。
+    // 样本预判（零替换 + 得分）先挡掉绝大多数非 UTF-16 字节流，整篇解码只在预判通过后跑一次。
+    if ((text.match(/\uFFFD/g) || []).length !== 0 || score < 60) continue;
+    const replaced = countReplaced(decodeText(bin, lab));
+    if (replaced === 0) {
       cands.push({ encoding: lab, score, replaced, text });
     }
   }
@@ -320,7 +324,11 @@ export function cleanText(raw, opts = {}) {
       else if (SENT_END.test(buf)) {
         paras.push(buf);
         buf = line;
-      } else buf = buf + line;
+      } else {
+        // #144 P3：英文词间硬换行直接拼接会粘连成 helloworld —— 两侧都是 ASCII 字母/数字
+        // 时补一个空格；中文不受影响（汉字之间补空格反而破坏排版）。
+        buf = /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(line) ? buf + ' ' + line : buf + line;
+      }
     }
     if (buf) paras.push(buf);
     lines = paras;
@@ -552,8 +560,20 @@ export function splitChapters(text, opts = {}) {
 
 /** 一次到位：bytes → {encoding, chapters, detected, words, candidates}，供上传预览
  * cleanOpts.clean === false 时整链不做清理（只解码 + 分章）。 */
-export function processBook(bytes, { fallbackTitle, cleanOpts = {}, forceEncoding = null, pattern = 'auto' } = {}) {
+// #144 P3：编码检测 + 整篇解码只取决于 (bytes, forceEncoding)，与清洗选项/分章规则无关
+// —— 预览页每次勾选切换都会重跑 runPreview → processBook，大文件的检测+解码（百万字符级
+// 约 200ms）纯属重复。按 (bytes 引用, forceEncoding) 缓存上一次结果：同一会话内复用；
+// 新会话是新 Uint8Array 对象，引用不等天然失配重算。
+let detMemo = null;
+function detectCached(bytes, forceEncoding) {
+  if (detMemo && detMemo.bytes === bytes && detMemo.forceEncoding === forceEncoding) return detMemo.det;
   const det = forceEncoding ? { encoding: forceEncoding, text: decodeWith(bytes, forceEncoding) } : detectEncoding(bytes);
+  detMemo = { bytes, forceEncoding, det };
+  return det;
+}
+
+export function processBook(bytes, { fallbackTitle, cleanOpts = {}, forceEncoding = null, pattern = 'auto' } = {}) {
+  const det = detectCached(bytes, forceEncoding);
   if (!det.text) return { encoding: det.encoding, chapters: [], detected: null, words: 0, candidates: det.candidates || [] };
   const clean = cleanOpts.clean !== false;
   const sp = splitChapters(det.text, { pattern, clean, cleanOpts, fallbackTitle });

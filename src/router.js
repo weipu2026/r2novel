@@ -1531,6 +1531,22 @@ async function apiRawGet(store, id) {
   return new Response(buf, { status: 200, headers: { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' } });
 }
 
+/** append 幂等令牌的**章节签名**（#145 复验 R1）：客户端令牌只由文件内容派生
+ * （SHA-256 前 8 字节），覆盖不到「同一文件改分章再重试」——同令牌命中回放早退分支时，
+ * 老 keys 回给新 chapters：客户端 startKeyIdx = 旧keys数 − 新章数 把新正文写到老章上
+ * （老章被覆写），队尾新章拿不到 key（阅读 404）。签名随 meta.pending 登记，回放时比对；
+ * 不一致 → 409 指路「整本替换」（replace 不依赖令牌，天然 covers 这种重试）。 */
+const batchSig = (arr) => {
+  let h = 5381; // djb2：非加密散列，防「无意撞车」不防恶意构造（令牌本身也只是稳定性用途）
+  const list = Array.isArray(arr) ? arr : [];
+  for (const t of list) {
+    const str = String(t);
+    for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+    h = ((h * 33) ^ 10) >>> 0; // 章间分隔符：防 ['ab','c'] 与 ['a','bc'] 同哈希
+  }
+  return list.length + ':' + h.toString(16);
+};
+
 /**
  * 更新已有书章节表（DR-06）。POST /api/books/:id/chapters
  * body { op:'replace'|'append', chapters:[title...], wordCount?, cleanVer?, title?, author?, tags? }
@@ -1549,6 +1565,8 @@ async function apiUpdateChapters(req, env, store, id) {
   // 上传失败」之后用户重试会再选「追加」→ 服务端不幂等 → 章表尾部又追加同一批 → 书架两套
   // 相同章节、第一套全是空壳（阅读 404），且 creating 态的书进不了编辑器，只能整本 replace
   // 重传自救。令牌随 CAS 落到 meta.pending，同令牌再来直接回放已登记的 keys。
+  // ⚠️ 令牌只覆盖文件字节、不覆盖章节划分（R1）：回放要核对 batchSig，同一文件改过拆分
+  // 再重试必须拒绝回放（指路 replace），否则新正文覆写老章、队尾新章阅读 404。
   const batch = typeof body.batch === 'string' && /^[0-9a-f]{16}$/.test(body.batch) ? body.batch : '';
 
   if (!(await indexHas(store, id))) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
@@ -1583,6 +1601,9 @@ async function apiUpdateChapters(req, env, store, id) {
   // —— 章表没变、阅读进度先丢了。CAS 成功后才迁移，失败路径零副作用。
 
   // 阶段 C：CAS 变换（纯内存；冲突时会被**重放** —— 所有结果都从 meta 现推，绝不增量叠加）
+  // R1：章节签名与令牌一起登记/回放比对（见 batchSig）——只哈希文件字节的令牌拦不住
+  // 「同一文件改分章再重试」，那种重试回放老 keys 会把新正文写进老章、队尾新章 404。
+  const sig = batchSig(chapters);
   const m = await mutateMeta(
     store,
     id,
@@ -1593,6 +1614,12 @@ async function apiUpdateChapters(req, env, store, id) {
         // keys），只是正文没传完 → 这次不再追加、不重复计字数，直接把当时那批 keys 回给客户端
         // 续传正文。判据落在盘面（mm.pending）上，天然抗重放与并发。
         if (batch && mm.pending && mm.pending.batch === batch && Array.isArray(mm.pending.keys)) {
+          // R1：回放前核对章节签名。不一致说明客户端换过拆分（或换了文件撞了哈希）——
+          // 回放老 keys 会让新正文覆写老章、队尾新章拿不到 key（阅读 404）→ 拒绝并指路
+          // 整本替换（replace 全量重写章表，不依赖令牌，覆盖这种重试）。
+          if (mm.pending.sig !== sig) {
+            return { abort: json({ error: '章节划分与上次上传不一致，请改用「整本替换」重试' }, 409) };
+          }
           return { out: mm.pending.keys.slice() };
         }
         // key 起点在**当前盘面**上重算：并发 append 过的话，沿用旧起点会撞 key（新正文覆盖旧章）。
@@ -1611,7 +1638,7 @@ async function apiUpdateChapters(req, env, store, id) {
         const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
         mm.chapters = cur.concat(add);
         // 登记本批次（#145 P2-9）：publish 成功时清除；期间同令牌重放走上面的早退分支。
-        if (batch) mm.pending = { batch, keys: mm.chapters.map((c) => c.key) };
+        if (batch) mm.pending = { batch, keys: mm.chapters.map((c) => c.key), sig };
       } else {
         delete mm.pending; // replace 全量重写章表：旧批次的半成品登记一并作废
         const newCh = chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));

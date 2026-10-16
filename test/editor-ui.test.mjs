@@ -408,3 +408,125 @@ test('缺陷3 加固：连点两本书的「编辑章节」→ 只显示最后�
   assert.doesNotMatch(ceStatLine(), /书A/);
   assert.equal(rowsOf(els.modalBox).length, 2, '章表仍应是书B的 2 章');
 });
+
+/* ══════════════════ 缺陷 4：跨弹层的忙态残留与缓存污染（2026-10-16 审计修复） ══════════════════
+ * 忙态计数 ceLock 与正文缓存 ceBase / ceDraft 都是**模块级**的：弹层被关掉时若还有请求在飞，
+ * 状态会跨过「关闭 → 重开」这道边界漏到下一个弹层上。三条用例各钉一个后果。 */
+
+test('缺陷4：保存请求在飞时关闭并重开编辑器 → 新弹层不得被旧请求的忙态锁住', async () => {
+  const gate = deferred();
+  const calls = makeApi({ onPatch: () => gate.promise });
+  const { ta, saveBtn, bodyBtn } = await openEditor();
+  bodyBtn.dispatch('click');
+  await flush();
+  ta.value = '正文有改动';
+  ta.dispatch('input');
+  await flush();
+  saveBtn.dispatch('click'); // 请求在飞：ceLock = 1
+  await flush();
+  assert.equal(calls.patch.length, 1, '保存请求已在飞');
+
+  // 用户关掉编辑器（此刻 ceLock 仍为 1），紧接着重开同一本书
+  HOST.closeModal();
+  await flush();
+  const again = await openEditor();
+
+  // ★ 核心断言：新弹层一打开就必须可用。旧实现里 ceLock 残留 1 → renderCeList → ceApplyLock
+  //   把新弹层的输入框与按钮全部禁掉（最长等到旧请求超时，用户只会觉得界面坏了）。
+  assert.equal(els.modalBox.querySelector('#ceAppend').disabled, false, '★ 重开后「追加一章」不得被旧请求的残留锁禁掉');
+  assert.equal(els.modalBox.querySelector('#ceDone').disabled, false, '★ 重开后「完成」不得被禁');
+  assert.equal(again.row0.querySelector('input.ce-title').disabled, false, '★ 重开后标题输入框不得被禁');
+  assert.equal(again.saveBtn.disabled, true, '保存钮仍应是「无改动可存」的初始禁用，而不是被锁住');
+
+  // 旧请求此刻才返回：它的解锁既不得改新弹层的锁，也不得清新弹层的忙态文字
+  gate.resolve();
+  await flush();
+  assert.equal(els.modalBox.querySelector('#ceAppend').disabled, false, '旧请求返回后新弹层必须仍可用');
+  assert.doesNotMatch(toastText(), /失败/);
+});
+
+test('缺陷4：旧请求的解锁不得清掉新弹层的忙态文字', async () => {
+  const gateOld = deferred();
+  makeApi({ onPatch: () => gateOld.promise });
+  const { ta, saveBtn, bodyBtn } = await openEditor();
+  bodyBtn.dispatch('click');
+  await flush();
+  ta.value = '旧弹层的改动';
+  ta.dispatch('input');
+  await flush();
+  saveBtn.dispatch('click'); // 旧请求在飞
+  await flush();
+
+  HOST.closeModal();
+  await flush();
+
+  // 重开，并在新弹层里发起它自己的保存（忙态文字应当挂在 #ceBusy 上）
+  const gateNew = deferred();
+  api.patchChapter = async () => { await gateNew.promise; return { title: 'x', wordCount: 1 }; };
+  const again = await openEditor();
+  again.bodyBtn.dispatch('click');
+  await flush();
+  again.ta.value = '新弹层的改动';
+  again.ta.dispatch('input');
+  await flush();
+  again.saveBtn.dispatch('click');
+  await flush();
+  const busy = () => els.modalBox.querySelector('#ceBusy').textContent;
+  assert.equal(busy(), '保存正文…', '新弹层应显示自己的忙态');
+
+  // ★ 旧请求返回：els.modalBox 是共享容器，#ceBusy 取到的是新弹层的那个 —— 不得被旧解锁清空
+  gateOld.resolve();
+  await flush();
+  assert.equal(busy(), '保存正文…', '★ 旧请求的解锁不得清新弹层的忙态文字');
+
+  gateNew.resolve();
+  await flush();
+  assert.equal(busy(), '', '新弹层自己的请求结束后才清空');
+});
+
+test('缺陷4：关掉一本书的编辑器再开另一本 → 迟到响应不得把旧书正文写进新书缓存', async () => {
+  const gate = deferred();
+  makeApi({ onPatch: () => gate.promise });
+  const { ta, saveBtn, bodyBtn } = await openEditor(); // 书 n_1
+  bodyBtn.dispatch('click');
+  await flush();
+  ta.value = '书一的第一章正文';
+  ta.dispatch('input');
+  await flush();
+  saveBtn.dispatch('click');
+  await flush();
+
+  HOST.closeModal();
+  await flush();
+
+  // 换另一本书：章 key 同样是 '1' —— ceBase 是模块级 Map，重开时 clear 过
+  api.bookMeta = async () => ({
+    id: 'n_2', title: '另一本', cleanVer: 1, chapterCount: 1, wordCount: 3,
+    chapters: [{ key: '1', title: '乙书第一章' }],
+  });
+  api.chapter = async () => '书二的第一章正文';
+  await openChapterEditor({ id: 'n_2', title: '另一本' });
+  await flush();
+
+  gate.resolve(); // 旧书那个保存请求此刻才返回 → 不得写 ceBase['1']
+  await flush();
+
+  const row = rowsOf(els.modalBox)[0];
+  btnBy(row, (b) => b.textContent === '正文').dispatch('click');
+  await flush();
+  assert.equal(row.querySelector('textarea').value, '书二的第一章正文', '★ 必须显示新书自己的正文，而不是被旧书的迟到响应污染成「书一的第一章正文」');
+});
+
+test('契约哨兵：ceBusy 的每个调用点都必须显式传弹层世代号', () => {
+  const src = fs.readFileSync(new URL('../public/js/upload/editor.js', import.meta.url), 'utf8');
+  const bad = [];
+  src.split('\n').forEach((line, i) => {
+    const s = line.trim();
+    if (s.startsWith('//') || s.startsWith('*')) return; // 注释里的示例不算
+    if (s.includes('ceBusy(') && !s.includes('function ceBusy(') && !s.includes(', gen)')) bad.push((i + 1) + ': ' + s);
+  });
+  assert.equal(bad.length, 0, '漏传世代号会让忙态锁静默失效（永远不匹配 ceLockGen）：\n' + bad.join('\n'));
+  // 反向自检：确认真扫到了调用点，否则上面可能因为「一条都没匹配上」而假绿
+  const hit = src.split('\n').filter((l) => l.includes("ceBusy('") && !l.trim().startsWith('//'));
+  assert.ok(hit.length >= 8, '应扫到 8 个调用点，实际只扫到 ' + hit.length + ' —— 判据失效？');
+});

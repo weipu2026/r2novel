@@ -28,6 +28,11 @@ const ceDraft = new Map();
 // 忙态计数（>0 表示有请求在飞）。用**计数**而不是布尔：ceBusy('…') / ceBusy('') 成对出现，
 // 嵌套路径（插章 → 刷新章表）也会各带一对，布尔会被内层提前解锁。
 let ceLock = 0;
+// ceLock 所属的弹层世代（2026-10-16 审计修复）：关掉编辑器时若仍有请求在飞，ceLock 会残留 >0；
+// 不绑定世代的话，**重开**的新弹层一渲染就被这枚旧锁锁住（输入框与按钮全灰，最长等到旧请求
+// 超时），而且旧请求返回时的 ceBusy('') 还会去清新弹层的忙态文字 —— els.modalBox 是共享
+// 容器，$('#ceBusy') 取到的已是新弹层的那个。守卫：ceBusy 只在 gen === ceLockGen 时才动锁。
+let ceLockGen = 0;
 // 锁定前各控件的自有 disabled 原值：解锁时**只还原被本锁周期接管过的控件**。
 // 不能一刀切 disabled=false —— 「保存本章」有自己的禁用逻辑（内容未变/保存中必须禁用），
 // #140 复查实证：一刀切会把未改动那行的保存钮误启用，点一下就对零变化内容发出 PATCH（cleanVer 空转 +1）。
@@ -89,6 +94,11 @@ export async function openChapterEditor(b) {
       <button class="ghost" id="ceDone" type="button">完成</button>
     </div>`);
   ceGen = host().modalGen(); // ⚠️ 必须在 openModal **之后**取：openModal 自己会推进世代号
+  // 忙态随世代归零（2026-10-16）：上一个弹层的在飞请求不得锁住这个刚打开的新弹层。
+  // ⚠️ 复位点只此一处 —— 关闭路径有多条（完成 / Esc / 点遮罩 / 被别的弹层顶掉），在关闭侧
+  // 复位既漏又晚；在打开侧复位覆盖全部路径，且此刻旧控件早已脱离文档（WeakMap 记录自然失效）。
+  ceLock = 0;
+  ceLockGen = ceGen;
   els.modalBox.classList.add('ce');
   $('#ceAppend', els.modalBox).addEventListener('click', () => ceInsert(null));
   $('#ceDone', els.modalBox).addEventListener('click', finishChapterEditor);
@@ -96,7 +106,14 @@ export async function openChapterEditor(b) {
   renderCeList(ceGen);
 }
 
-function ceBusy(text) {
+function ceBusy(text, gen) {
+  // 世代守卫（2026-10-16）：本弹层已关 / 已被别的弹层顶掉时，迟到的解锁既不得改锁计数
+  // （会把新弹层的锁减掉），也不得写忙态文字（写的是新弹层的 #ceBusy）。
+  // ⚠️ gen 必传：漏传会让忙态锁**静默失效**（永远不匹配 ceLockGen）→ editor-ui.test.mjs
+  // 有一条「契约哨兵」用例逐个扫调用点。
+  // ⚠️ 两道判据都要：ceAliveAt 挡「弹层已关 / 已被顶掉」（不碰别人的 DOM），
+  // ceLockGen 挡「已换成新弹层」（新弹层的锁计数是它的，旧世代无权减）。
+  if (!ceAliveAt(gen) || gen !== ceLockGen) return;
   const el = $('#ceBusy', els.modalBox);
   if (el) el.textContent = text || '';
   ceLock = Math.max(0, ceLock + (text ? 1 : -1));
@@ -165,7 +182,7 @@ function ceBuildRow(ch, i, gen) {
     if (v === ch.title) return;
     const old = ch.title;
     input.value = ch.title; // 未成功前先回显旧值
-    ceBusy('保存标题…');
+    ceBusy('保存标题…', gen);
     try {
       const r = await api.patchChapter(ceState.id, ch.key, { title: v });
       ch.title = r.title; // 服务端兜底（空标题 → 第 N 章）后的规范值
@@ -178,7 +195,7 @@ function ceBuildRow(ch, i, gen) {
       input.value = old;
       toast('保存失败：' + (e.message || e), 2600);
     } finally {
-      ceBusy('');
+      ceBusy('', gen);
     }
   });
 
@@ -224,7 +241,7 @@ function ceBuildRow(ch, i, gen) {
   });
   save.addEventListener('click', async () => {
     let ok = false;
-    ceBusy('保存正文…'); // 加锁（此刻记下各控件的原值，解锁时照此还原）
+    ceBusy('保存正文…', gen); // 加锁（此刻记下各控件的原值，解锁时照此还原）
     save.disabled = true; // 保存中必须禁用：防连点发出双请求
     // #144 P1-3：请求体与基线推进必须用**同一份快照**。原实现两处各读一次 ta.value，
     // 而加锁选择器不含 textarea —— 在飞期间打字时：新字上不了送，却被基线推进登记为
@@ -235,17 +252,22 @@ function ceBuildRow(ch, i, gen) {
       // 基线推进到刚保存的内容 → 此后「与库内一致、无改动可存」。
       // 草稿只在**恰好等于刚保存内容**时清掉：若在飞期又打了新字（草稿 ≠ content），
       // 无条件 delete 会把它们连着「已保存」的假象一起丢掉。
-      ceBase.set(ch.key, content);
-      if (ceDraft.get(ch.key) === content) ceDraft.delete(ch.key);
-      ceState.words = r.wordCount;
-      ceState.dirty = true;
+      // ⚠️ 弹层已关 / 已换书时必须跳过：ceBase 的键是「章 key」，跨书同 key 必撞
+      //（各书都是 '1'/'2'…）→ 新书那一章展开时会显示**旧书**的正文，用户一保存就写坏。
+      // 「已保存」的反馈照旧要给（缺陷 3 的契约：服务端已成功就不能沉默）→ 只包状态写入。
+      if (ceAliveAt(gen)) {
+        ceBase.set(ch.key, content);
+        if (ceDraft.get(ch.key) === content) ceDraft.delete(ch.key);
+        ceState.words = r.wordCount;
+        ceState.dirty = true;
+      }
       ceStatRefresh(gen); // 世代已失配则自动跳过（缺陷 3：不让迟到写把成功误报成失败）
       toast('本章正文已保存', 1400);
       ok = true;
     } catch (e) {
       toast('保存失败：' + (e.message || e), 2600);
     } finally {
-      ceBusy('');
+      ceBusy('', gen);
       // ⚠️ 必须写在 ceBusy('') **之后**：解锁会把控件还原成加锁前记下的原值（此刻是 false），
       // 写在之前会被解锁悄悄覆盖 → 保存成功后按钮重新可点，再点就对**零变化**内容发一次
       // PATCH（服务端不比对内容：正文对象重写 + cleanVer 空转 +1 + 索引写）。
@@ -268,6 +290,9 @@ function ceBuildRow(ch, i, gen) {
       try {
         const meta0 = await api.bookMeta(ceState.id); // 拉最新 cleanVer 防缓存击穿失效
         const txt = await api.chapter(ceState.id, ch.key, meta0.cleanVer || 1);
+        // ⚠️ 守卫必须在写缓存**之前**：原实现在 ceBase.set 之后才判 → 拉取期间关弹层/
+        // 换到另一本书时，这份正文照样进了 ceBase（同 key 撞车 → 新书显示旧书正文）。
+        if (!ceAliveAt(gen)) return;
         ceBase.set(ch.key, txt);
       } catch (e) {
         toast('正文加载失败：' + (e.message || e), 2600);
@@ -312,7 +337,7 @@ function ceBuildRow(ch, i, gen) {
 
 async function ceDelete(ch) {
   const gen = ceGen; // 捕获本次操作所属的世代：await 之后的写以它为判据
-  ceBusy('删除中…');
+  ceBusy('删除中…', gen);
   try {
     const r = await api.deleteChapter(ceState.id, ch.key);
     // #144 P2-9：ceState 是模块级且 ceState.chapters 的 key 全书通用 —— 弹层已关/已换书
@@ -331,13 +356,13 @@ async function ceDelete(ch) {
   } catch (e) {
     toast('删除失败：' + (e.message || e), 2600);
   } finally {
-    ceBusy('');
+    ceBusy('', gen);
   }
 }
 
 async function ceInsert(afterKey) {
   const gen = ceGen; // 捕获本次操作所属的世代：await 之后的写以它为判据
-  ceBusy('插入中…');
+  ceBusy('插入中…', gen);
   try {
     const body = afterKey ? { after: afterKey, title: '新章', content: '' } : { title: '新章', content: '' };
     const r = await api.insertChapter(ceState.id, body);
@@ -356,7 +381,7 @@ async function ceInsert(afterKey) {
   } catch (e) {
     toast('插入失败：' + (e.message || e), 2600);
   } finally {
-    ceBusy('');
+    ceBusy('', gen);
   }
 }
 

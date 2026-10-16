@@ -2677,6 +2677,27 @@ const DIAG_SYS_PREFIXES = ['meta/idx/', 'meta/index.json'];
 const DIAG_META_PAGE_BUDGET = 3; // meta/raw/progress 各自翻页上限（每页 ≤1000 对象 → 覆盖约 3000 本）
 const DIAG_TEXT_PAGE_BUDGET = 12; // text/ 单请求翻页上限（每页 ≤1000 对象）；超预算回传 textCursor 由前端续扫
 const DIAG_SUB_BUDGET = 45; // 扫描/删除单请求子请求软预算
+
+/** 诊断扫描单窗的 list 页数分配（#144 复验修正）：抽成纯函数以便单测直接钉不变量。
+ *  计费口径：meta 1 份、raw 与 progress **各** 1 份（wantSide 要按 ×2 计；续扫窗 cont 两者都
+ *  不发起 → 0 份）、text 1 份。优先级 meta → raw/progress → text，但**保底 text ≥1 页**。
+ *  不变量：① 发出的 list 总数（侧前缀 ×2）绝不超 room；② room ≥ 4 时 text ≥ 1 页 ——
+ *  它为 0 时本窗 lText.cursor 恒 null，前端会把「没扫」当成「扫完」停循环；③ cont 时 wantSide 恒 0。 */
+export function diagPageAlloc(room, cont) {
+  const sideCap = cont ? 0 : DIAG_META_PAGE_BUDGET;
+  let meta = Math.min(DIAG_META_PAGE_BUDGET, Math.max(0, room));
+  let text = Math.min(DIAG_TEXT_PAGE_BUDGET, room > 0 ? 1 : 0); // 保底 1 页（见不变量 ②）
+  let side = 0;
+  const spare = () => room - meta - 2 * side - text;
+  meta += Math.max(0, Math.min(spare(), DIAG_META_PAGE_BUDGET - meta)); // 余量按 meta → 侧前缀 → text 补页
+  if (sideCap) side += Math.max(0, Math.min(Math.floor(spare() / 2), sideCap - side));
+  text += Math.max(0, Math.min(spare(), DIAG_TEXT_PAGE_BUDGET - text));
+  // 夹紧：实际会发出的 list 数（侧前缀两份）绝不超 room —— 宁可少列也不撞 50 子请求硬顶
+  while (text > 0 && meta + 2 * side + text > room) text--;
+  while (side > 0 && meta + 2 * side + text > room) side--;
+  while (meta > 0 && meta + 2 * side + text > room) meta--;
+  return { wantMeta: meta, wantSide: side, wantText: text };
+}
 // 回验预算比总预算更紧：旧实现回验与删除共用同一计数器，待删清单里活书 key 一多，
 // 回验就把预算吃满 → 删除阶段 `deleted=0`，本可零成本删除的非活书残留被白白跳过（清理变慢）。
 // 给回验单独设上限，余下预算留给删除。
@@ -2727,16 +2748,16 @@ async function doDiagScan(store, textCursor = '') {
   // 1(root) + shards + (3+3+3+12) 在 40 分片时 = 62 > 50 → 502，「检查残留」在大库直接不可用
   //（而这正是大库最需要的运维工具）。余量不足时按优先级压页数（text/ 是章数级大头，先压它）。
   const room = Math.max(0, 47 - budget.used);
-  // #144 P2-5：分配优先级必须是 meta/raw/progress（书数级，每窗至少各 1 页）**优先**、
-  // text/ 拿剩余 —— 旧实现先把 room 分给 text（pageCap 先算 wantText），40 分片时 room=6
-  // 被 text 吃满 → meta/raw/progress 一页不列，且 room≥4 不标 incomplete → 静默漏扫还谎报
-  // 「扫完」。text 预算不足没关系：textCursor 续扫就是为它设计的。
-  const wantMeta = room > 0 ? Math.min(DIAG_META_PAGE_BUDGET, room) : 0;
-  const wantSide = room > wantMeta ? Math.min(DIAG_META_PAGE_BUDGET, room - wantMeta) : 0;
-  const wantText = room > wantMeta + wantSide ? Math.min(DIAG_TEXT_PAGE_BUDGET, room - wantMeta - wantSide) : 0;
-  // #144 P2-5：连四个 list 的最低页预算（1+1+1+1）都不够，或本窗根本没发起 text/ 的 list
-  //（wantText=0 → NO_LIST.cursor=null，前端会把「没扫」当成「扫完」停循环）→ 都必须标不完整。
-  if (room < 4 || wantText === 0) budget.incomplete = true;
+  // #144 P2-5：分配优先级 meta/raw/progress（书数级）**优先**、text/ 吃剩余 —— 旧实现先把
+  // room 分给 text（pageCap 先算 wantText），40 分片时 room=6 被 text 吃满 → meta/raw/
+  // progress 一页不列，且 room≥4 不标 incomplete → 静默漏扫还谎报「扫完」。
+  // 页数分配见 diagPageAlloc（含「raw/progress 计费 ×2」与「text 保底 1 页」两条不变量，
+  // 前者防止大分片时账面漏算顶破 50 子请求硬顶，后者防止前端把「没扫」当「扫完」停循环）。
+  const { wantMeta, wantSide, wantText } = diagPageAlloc(room, cont);
+  // 不完整的判据：① 连四路最低页预算都不够；② 本窗根本没发起 text/ 的 list（wantText=0 →
+  // NO_LIST.cursor=null，前端会把「没扫」当成「扫完」停循环）；③ 首页却连书数级前缀
+  //（raw/progress）一页都没列到。三者都必须标，别谎报「扫完了」。
+  if (room < 4 || wantText === 0 || (!cont && wantSide === 0)) budget.incomplete = true;
   const [lMeta, lRaw, lProg, lText] = await Promise.all([
     wantMeta > 0 ? store.list('meta/', wantMeta) : Promise.resolve(NO_LIST),
     cont || wantSide <= 0 ? NO_LIST : store.list('raw/', wantSide),

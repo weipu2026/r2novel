@@ -169,3 +169,27 @@ test('P3 基建：dom-stub 三处 fail-fast/联动；smoke 轮询带间隔；dev
   assert.match(check, /导入了不存在的名字/, 'node 侧命名导入必须校验存在性');
   assert.ok((check.match(/process\.exit\(1\)/g) || []).length >= 4, 'HOST_CAPS/appTopFns 静默 return [] 必须 fail loud');
 });
+
+test('#144 复验：diag 单窗页数分配不超预算、续扫窗不吃侧前缀预算、text 恒保底 1 页', async () => {
+  const { diagPageAlloc } = await import('../src/router.js');
+  const META_MAX = 3; // DIAG_META_PAGE_BUDGET
+  const TEXT_MAX = 12; // DIAG_TEXT_PAGE_BUDGET
+  for (let room = 0; room <= 60; room++) {
+    const a = diagPageAlloc(room, false);
+    // ① raw/ 与 progress/ 是两次 list → 侧前缀页数必须按 ×2 计入总账，绝不超 room
+    assert.ok(a.wantMeta + 2 * a.wantSide + a.wantText <= room, `首页 room=${room} 发出的 list 数超预算`);
+    // ② 各路不超各自翻页上限
+    assert.ok(a.wantMeta <= META_MAX && a.wantSide <= META_MAX && a.wantText <= TEXT_MAX, `room=${room} 超单路上限`);
+    // ③ room ≥ 4 时 text 必须 ≥1 页：它为 0 时 lText.cursor 恒 null，前端会把「没扫」当「扫完」停循环
+    if (room >= 4) assert.ok(a.wantText >= 1, `room=${room} 未保底 text 页 → 大库正文残留永远扫不到`);
+    // ④ 预算充裕时 meta 必须吃满（书数级前缀优先于章数级 text）
+    if (room >= 21) assert.equal(a.wantMeta, META_MAX, `room=${room} meta 未按优先级吃满`);
+  }
+  for (let room = 0; room <= 60; room++) {
+    const c = diagPageAlloc(room, true);
+    // 续扫窗 raw/progress 不发起 list → 不得白占预算（旧实现在这里扣 2 份，把 text 挤成 0）
+    assert.equal(c.wantSide, 0, `续扫窗 room=${room} 仍给 raw/progress 留预算`);
+    assert.ok(c.wantMeta + c.wantText <= room, `续扫窗 room=${room} 超预算`);
+    if (room >= 5) assert.ok(c.wantText >= 1, `续扫窗 room=${room} 未保底 text 页`);
+  }
+});

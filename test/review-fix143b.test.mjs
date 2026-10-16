@@ -225,12 +225,17 @@ test('P2-4 残留扫描的 list 页数必须在发起前按剩余预算裁剪', 
   const listAt = body.indexOf('await Promise.all([');
   // #144 P2-5 重写：分配逻辑改为 meta/raw/progress 优先、text 拿剩余（旧 pageCap 先给
   // text 分配 room，40 分片时书数级前缀一页不列还谎报扫完）。
-  const allocAt = body.indexOf('const wantMeta =');
+  // #144 复验：分配抽成纯函数 diagPageAlloc(room, cont) —— 其内部不变量（总 list 数 ≤ room、
+  // raw/progress 计费 ×2、text 恒保底 1 页）由 review-fix144.test.mjs 直接调用该函数钉死；
+  // 本处只钉「必须在发起前算出」与「不完整判据完整」两端。
+  const allocAt = body.indexOf('const { wantMeta, wantSide, wantText } = diagPageAlloc(');
   assert.ok(allocAt > 0 && allocAt < listAt, '页数分配必须发生在 Promise.all 之前（事后记账管不到已发请求）');
-  assert.match(body, /const wantText = room > wantMeta \+ wantSide \?/,
-    'text/ 必须拿「书数级三个前缀之后」的剩余预算（它有 textCursor 续扫）');
-  assert.match(body, /room < 4 \|\| wantText === 0\) budget\.incomplete = true;/,
-    '预算不够四页、或本窗没发起 text list，都必须标 incomplete（否则静默漏扫谎报扫完）');
+  assert.match(body, /diagPageAlloc\(room, cont\)/, '分配必须同时按剩余预算与「是否续扫窗」计算');
+  assert.match(
+    body,
+    /room < 4 \|\| wantText === 0 \|\| \(!cont && wantSide === 0\)\) budget\.incomplete = true;/,
+    '预算不够四页、本窗没发起 text、或首页连书数级前缀都没列到，都必须标 incomplete（否则静默漏扫谎报扫完）'
+  );
 });
 
 test('P2-5 OPDS 目录必须有子请求预算护栏（48 分片 ≈2.4 万本时 2+48 > 50）', () => {

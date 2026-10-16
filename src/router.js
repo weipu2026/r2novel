@@ -1456,7 +1456,8 @@ async function apiPutChapter(req, env, store, id, key) {
 /** 批量上传正文（连续上传优化）：一次读 meta + 批量写。
  * 请求数从「每章 1 个」降到「每 BULK_CHAPTER_BATCH 章 1 个」（Free 计划硬配额是请求数/天），
  * 单章 PUT 保留兼容。规则与单章一致：只放行 creating、只收章表内 key、每章 ≤ MAX_CHAPTER。
- * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 1 读 + BULK_CHAPTER_BATCH 并发写。 */
+ * 全部校验通过后才落盘，避免超限造成半批次写。最坏子请求 = 2 读（meta + inTrash 的
+ * trash，#145 P3-3 起多一次）+ BULK_CHAPTER_BATCH 并发写 = 42（≤50）。 */
 async function apiPutChapters(req, env, store, id) {
   const T0 = Date.now();
   const maxTotal = 16 * 1024 * 1024; // 单批正文字节护栏（body/内存）
@@ -1812,11 +1813,18 @@ async function apiPublish(req, env, store, id) {
   // 判据要全量索引（1+K 读）→ 两重门控：① 只查**首次发布**（old 空）——重复发布时书早就在
   //   架，后来者想同名上架过不了它自己那次首刊，本处再查纯属重复劳动（restore 直通索引是
   //   唯一绕路，而恢复是用户显式动作、撞名由 create 期判重兜）；
-  //   ② K≤8（≈4000 本）才做：publish 自身开销 ~35 个子请求，加全量读 ≤9 仍守住 50 硬顶；
+  //   ② K≤4（≈2000 本）才做。账面最坏（不含全量读）44：入口 readBook 1 + 抽样 3 +
+  //      单书索引 2 + trash 1 + 孤儿删 ≤24 + mutateMeta 3 试 6 + 进度重读 1 + trash2 1 +
+  //      putStatus 1 + idx.save 4；再加全量读 1+K → K≤4 时 49，贴 50 硬顶。
+  //      （#145 复验 R5：原注释「~35 + ≤9」漏计孤儿批与 CAS 重试，实算 K≤8 时 52~53 > 50，
+  //      按错误算术放行；3500+ 本 + 24 孤儿 + 3 次 CAS 冲突的复合最坏会撞平台硬失败。）
   //   更大库跳过（create 期判重 + 客户端 askDup 已覆盖绝大部分，且万本级库上「读全量索引换
   //   重复卡检查」的代价高于收益 —— 与 opds 的熔断同一判据）。
+  //   ⚠️ idx.save 撞索引 CAS 冲突会自重放（openIndex 2 读 + 4 写/次，默认最多 2 次）——
+  //   那是并发彩票开销、不随 K 增长，此处不计；两个标签页同时发布时后发者可能撞 50 硬顶
+  //   回 500，重发即愈合（P2-6 的选择：宁可重放也不整片覆盖）。
   //   single 模式句柄没有全量 books（访问即抛），必须另开全量读。
-  if (!old && Number(idx.shardCount) <= 8) {
+  if (!old && Number(idx.shardCount) <= 4) {
     // R4：全量读瞬时故障 → fail-open。同名终判是 create 期判重 + 客户端 askDup 之外的
     // 纵深一环，丢一次检查好过在 meta 已 ready 之后冒 500（下一轮发布会再判）。
     let full = null;

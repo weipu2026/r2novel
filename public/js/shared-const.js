@@ -15,7 +15,7 @@ export const MAX_CHAPTER_BYTES = 2097152;
 export const FIT_CHAPTER_BYTES = 1900000;
 
 /** 批量上传正文单批上限（章）：POST /chapters/bulk 与前端 uploadMany 共用。
- * 预算：1 读 + 40 并发写 = 41 子请求 ≤50；批内写是并发的，批大小不拖慢单批耗时 */
+ * 预算：2 读（meta + inTrash 守卫）+ 40 并发写 = 42 子请求 ≤50；批内写是并发的，批大小不拖慢单批耗时 */
 export const BULK_CHAPTER_BATCH = 40;
 
 /** 书架批量操作单批上限（本）：POST /api/books/batch 与前端 BATCH_PAGE 共用 */

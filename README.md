@@ -79,7 +79,7 @@ cp .dev.vars.example .dev.vars  # 填 ADMIN_PASSWORD / SESSION_SECRET
 
 npm run dev                     # → http://localhost:8088（数据落 data-dev/）
 
-npm test                        # 单测 327 项（另开终端）
+npm test                        # 单测 328 项（另开终端）
 SMOKE_PASSWORD=<.dev.vars 里的 ADMIN_PASSWORD> npm run smoke    # 端到端冒烟 55 项
 SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自动清走测试书（可重复执行）
 ```
@@ -89,7 +89,7 @@ SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自
 | 命令 | 说明 |
 |---|---|
 | `npm run dev` | 本地联调服务器（端口 8088，与生产共用同一套路由核心代码） |
-| `npm test` | 327 项单测（`test/*.test.mjs`，28 个文件）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 + 请求体护栏 + 阅读状态 + 星标 + 索引分片 + CSS 规范 + 章节编辑器 DOM 桩回归 + 逐轮修复回归（review-fix*） |
+| `npm test` | 328 项单测（`test/*.test.mjs`，28 个文件）：编码清洗分章 + API 全链路 + OPDS + 书库管理 + 审计回归 + 残留诊断 + 批量/标签治理 + 请求体护栏 + 阅读状态 + 星标 + 索引分片 + CSS 规范 + 章节编辑器 DOM 桩回归 + 逐轮修复回归（review-fix*） |
 | `npm run smoke` | 端到端冒烟 55 项：M1 全链路 + M2 管理整套 + v1.1 章节编辑 + OPDS 通道；`SMOKE_CLEANUP=1` 结束自动清理测试书 |
 | `npm run check` | 五道门禁：① 跨平台语法检查 ② 跨层依赖白名单（node 侧反向导入）③ 模块一致性（命名导入/再导出存在性、全大写常量漏 import、上传域宿主能力、import/export 路径存在性）④ 三端存储原语同构（9 原语）⑤ SW SHELL 双向比对（静态资源必须预缓存、清单不得指向不存在文件），任一违规 RC=1 |
 | `npm run icons` | 重新生成 PWA 图标（零依赖 zlib 手写 PNG） |
@@ -250,7 +250,7 @@ r2novel/
 │   ├── check.mjs          五道门禁：语法 / 跨层依赖白名单 / 模块一致性 / 存储原语同构 / SW SHELL
 │   ├── verify-deploy.mjs  部署后核验：生产静态文件哈希比对（CI 自动跑）
 │   └── gen-icon.mjs       零依赖手写 PNG 图标
-├── test/                  28 个单测文件，327 项（`test/*.test.mjs`，公共脚手架见 _harness.mjs 与 _dom-stub.mjs）
+├── test/                  28 个单测文件，328 项（`test/*.test.mjs`，公共脚手架见 _harness.mjs 与 _dom-stub.mjs）
 ├── .github/workflows/deploy.yml   push main → 测试 → 部署 → 生产冒烟
 ├── wrangler.toml          Worker/R2/限额配置（无凭据无域名）
 └── .dev.vars.example      本地开发变量模板
@@ -281,7 +281,7 @@ r2novel/
 
 | 验证 | 结果 |
 |---|---|
-| 单测（`test/*.test.mjs`，28 个文件，含索引分片专项、章节编辑器 DOM 桩回归与逐轮修复回归） | 327/327 ✓ |
+| 单测（`test/*.test.mjs`，28 个文件，含索引分片专项、章节编辑器 DOM 桩回归与逐轮修复回归） | 328/328 ✓ |
 | 端到端冒烟（M1 全链路 + M2 管理整套 + v1.1 章节编辑 + OPDS 通道） | 55/55 ✓ |
 | 浏览器实测套件（`.ui-tests/` 脚本不入库，本地串行跑） | 全量回归 18 套件全过（含端到端冒烟 55 项） ✓ |
 | 五道门禁（语法 / 跨层依赖 / 模块一致性 / 存储原语同构 / SW SHELL）+ 部署后哈希核验 / wrangler 打包 dry-run | ✓ |

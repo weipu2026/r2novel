@@ -134,8 +134,16 @@ jobs:
               # 才有 Worker，要先查 secret 才肯部署）。区分处理：not found 放行（deploy
               # 会创建 Worker，下方「同步密钥」补 secret；口令真没配的话生产冒烟会以
               # 明确报错拦住坏版本上线），其余错误照旧 fail loud。
-              if printf '%s\n' "$LIST_OUT" | grep -qi "not found"; then
+              # ⚠️ 判据要认全「Worker 不存在」的几种写法（2026-10-16）：wrangler 的报错文案随
+              # 版本变，只认 "not found" 时换个写法（does not exist）就漏 → 首部署又死锁。
+              # 10007 是 Cloudflare 的「worker not found」错误码。
+              if printf '%s\n' "$LIST_OUT" | grep -qiE 'not found|does not exist|no such worker|10007'; then
                 echo "· Worker 尚不存在（首次部署）：跳过 secret 预检，部署后由「同步密钥」补齐"
+                # ⚠️ 必须 break（2026-10-16 修复）：这里只 echo 而不跳出的话，紧随其后的
+                # `grep -qw "$s"` 拿到的还是这段错误输出 → 必然不命中 → exit 1 → 首部署
+                # 照样死锁（「放行」等于没放；test/deploy-precheck.test.mjs 已钉死该行为）。
+                # 用 break 而非 continue：Worker 不存在对两个 secret 是同一个结论，不必再查一轮。
+                break
               else
                 echo "::error::wrangler secret list 查询失败（Token/网络？），原始输出："
                 printf '%s\n' "$LIST_OUT"

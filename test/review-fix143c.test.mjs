@@ -47,7 +47,18 @@ test('CI：部署前必须 fail-fast 校验 secret（否则先上线空口令站
   assert.match(y, /拒绝部署/, '预检失败必须显式拒绝部署');
   // #144 P3：查询失败需区分「Worker 不存在」（首次部署放行，否则 fail-fast 死锁——
   // 全新账号永远无法完成首次部署）与其他错误（fail loud）
-  assert.match(y, /grep -qi "not found"/, 'not found（首次部署）必须放行');
+  // 2026-10-16 修正：判据要认全「Worker 不存在」的几种文案与错误码 10007；且放行分支必须
+  // **整行 break** —— 只 echo 而不跳出的话，紧随其后的 grep -qw "$s" 拿到的还是那段错误
+  // 输出，必然不命中 → exit 1，「放行」等于没放（首部署死锁依旧）。行为级回归见
+  // test/deploy-precheck.test.mjs（用真实 bash 跑从本文件抠出的那段 for 循环）。
+  assert.match(y, /grep -qiE 'not found\|does not exist\|no such worker\|10007'/,
+    'not found（首次部署）必须放行：判据要认全 wrangler 的文案与错误码 10007');
+  // ⚠️ 判据落在**整行就是 break** 上：注释里也写着「必须 break」几个字，用子串匹配会被喂假绿
+  const yLines = y.split('\n').map((l) => l.trim());
+  const passAt = yLines.findIndex((l) => l.startsWith('echo "· Worker 尚不存在'));
+  assert.ok(passAt > 0, '找不到「首部署放行」的 echo 分支');
+  assert.ok(yLines.slice(passAt + 1, passAt + 12).includes('break'),
+    '放行分支必须真的 break 跳出该轮检查（只 echo 的话后面 grep -qw "$s" 仍会 exit 1）');
   assert.match(y, /secret list 查询失败/, '其他查询失败必须 fail loud');
   // 同步密钥步骤仍应在部署之后（Worker 要先存在）
   assert.ok(y.indexOf('secret put') > deployAt, 'secret put 仍需在 deploy 之后（保证 Worker 已存在）');

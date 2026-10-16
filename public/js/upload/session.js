@@ -17,6 +17,7 @@
 let _sess = null; // 当前上传会话（预览 / 确认 / 上传全程用它）
 let _uploading = false; // 单文件 / 重洗上传在飞 → 冻结「换文件 / 粘贴 / 拖入」
 let _importing = false; // 批量导入循环进行中 → 冻结「确认入库」按钮
+let _reading = false; // 选文件后「读字节 + 清洗预览」窗口（begin 之前）→ 同样冻结换文件
 let _createdId = null; // 本次「新建」出来的书 id：入库中途失败时用它把半成品移入回收站
 let _rawReq = null; // 在途的原件上传请求（仅用于进度文案）
 
@@ -36,9 +37,17 @@ export function clear() {
   _sess = null;
 }
 
-/** 是否有上传任务在飞：三个入场口的统一判据（uploading ∪ importing） */
+/** 是否有上传任务在飞：三个入场口的统一判据（uploading ∪ importing ∪ reading）
+ * #145 P2-7：reading 覆盖 prepareFile 的 await file.arrayBuffer() 窗口 —— 旧判据只管
+ * begin 之后，那段窗口里第二次选择/拖入可完整穿过 isBusy 并交错落地（A 填标题 + begin(A)，
+ * B 后落地 → 标题非空不覆盖 + begin(B) → 会话 = B 的正文 + A 的书名，静默坏书）。 */
 export function isBusy() {
-  return _uploading || _importing;
+  return _uploading || _importing || _reading;
+}
+
+/** 读字节窗口标记（prepareFile 前后由 handleFiles 成对置位） */
+export function setReading(v) {
+  _reading = !!v;
 }
 
 export function isUploading() {

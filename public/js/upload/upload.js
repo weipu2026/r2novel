@@ -155,7 +155,22 @@ async function createAndUpload(payload, keepRaw, session) {
 
 async function uploadToExisting(id, op, payload, keepRaw, session) {
   // append 不覆盖书名/作者/标签（保留旧书的）；replace 全量带
-  const body = op === 'append' ? { op, chapters: payload.chapters, wordCount: payload.wordCount } : { op, ...payload };
+  // #145 P2-9：append 带「文件内容批次令牌」（SHA-256 前 8 字节的十六进制）。同一文件重试 →
+  // 同令牌 → 服务端 meta.pending 命中 → 直接回放上次已登记的 chapterKeys，不再追加一批。
+  // 旧行为：章表已追加、正文 bulk 传失败 → 重试时书架又多一套相同章节、第一套全是空壳
+  // （阅读 404），且 creating 态的书进不了编辑器，只能整本 replace 重传自救。
+  let batch = '';
+  if (op === 'append' && session && session.bytes) {
+    try {
+      const d = await crypto.subtle.digest('SHA-256', session.bytes);
+      batch = [...new Uint8Array(d)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      /* 非安全上下文等取不到摘要 → 不带令牌退回旧行为，不阻断上传 */
+    }
+  }
+  const body = op === 'append'
+    ? { op, chapters: payload.chapters, wordCount: payload.wordCount, ...(batch ? { batch } : {}) }
+    : { op, ...payload };
   const updated = await api.updateChapters(id, body);
   const keys = updated.chapterKeys || [];
   const n = payload.chapters.length; // 本次实际要传的正文数

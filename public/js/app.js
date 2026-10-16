@@ -189,6 +189,8 @@ export function init() {
   });
 
   reader.bindReader(els.readRoot, onNavBack);
+  // #145 P2-3：reader 内 401 的统一收敛出口（下载/导出/翻章）—— 与 handleAuth 同一终点
+  reader.setOnExpire(() => expireSession());
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
   presetTags = local.getPresetTags();
   renderPresetChips();
@@ -324,6 +326,12 @@ async function logout() {
  *  books.length>0 走「已有快照」分支（doLogin），**永久停留**在前任书架、错误态永不触发。
  *  selected（批量栏计数）/ presetTags（上传页预设 chips）同理是跨会话残留。 */
 async function finishLogout() {
+  // #145 P2-5：推进 shelfSeq 作废在途 loadShelf。登出前若有一次 loadShelf 在飞，它的 200
+  // 响应会在 finishLogout 之后到达 → 世代校验（seq !== shelfSeq）形同虚设 → 把**前任**的
+  // 完整书架写回 local.setShelfCache 并 renderShelf。而 boot 是「有快照先渲染书架」→
+  // 共享设备上任何人打开页面秒显前任书架（L18 登出清痕迹的缺口，offline.js 把同类残留
+  // 定为隐私缺口）。与 loadShelf 自己的 seq 判据同一机制：这里主动推进世代丢弃旧响应。
+  shelfSeq++;
   await offline.clearAll().catch(() => {});
   local.clearAll();
   batchMode = false;
@@ -933,6 +941,7 @@ function openSheet(b, anchor) {
             toast('已移入回收站', 1600);
             await loadShelf();
           } catch (e) {
+            if (handleAuth(e)) return; // #145 P2-4：会话失效后重试永远失败，别弹误导性业务 toast
             toast('删除失败：' + (e.message || e), 2500);
           }
         }

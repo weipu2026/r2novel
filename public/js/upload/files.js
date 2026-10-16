@@ -90,24 +90,37 @@ export async function handleFiles(files) {
     toast('上传进行中，请等本次完成后再换文件', 2600);
     return;
   }
-  if (files.length > 1) {
-    // 「不分章」是逐本预览时的一次性选择（勾选前用户看到的是这一本的章数）。批量导入没有
-    // 逐本 UI：预览面板整段隐藏、确认弹窗又整屏遮罩住复选框 —— 沿用上一本的勾选态会**静默**
-    // 把整批都变成 1 章，用户既看不见也改不了。批量一律回到自动分章。
-    els.upNoSplit.checked = false;
-    await importBatch(files);
-    return;
+  // #145 P2-7：冻结窗口前移到同步段。isBusy() 以前只覆盖 begin 之后，而 prepareFile 读字节
+  // （大文件数百 ms）与 runPreview 清洗都在 begin **之前** —— 两次快速选择/拖入可并发重叠：
+  // A 先落地（标题框空 → 填 A 的文件名、begin(A)），B 后落地（标题非空不覆盖、begin(B)）
+  // → 会话 = B 的正文 + A 的书名。预览面板有部分可发现性，但同一本书两个版本几乎不可辨。
+  // setReading(true) 在此期间让第二个入口被 isBusy 拦下（粘贴入口的判据同在监听层）。
+  upSession.setReading(true);
+  try {
+    if (files.length > 1) {
+      // 「不分章」是逐本预览时的一次性选择（勾选前用户看到的是这一本的章数）。批量导入没有
+      // 逐本 UI：预览面板整段隐藏、确认弹窗又整屏遮罩住复选框 —— 沿用上一本的勾选态会**静默**
+      // 把整批都变成 1 章，用户既看不见也改不了。批量一律回到自动分章。
+      // #145 P3-12b：记住用户原勾选态 —— 弹窗**取消**时必须还原（#141 的复位发生在弹窗前，
+      // 取消后checkbox 停在false，用户下次单选发现「不分章」被悄悄关掉）。
+      const prevNoSplit = els.upNoSplit.checked;
+      els.upNoSplit.checked = false;
+      await importBatch(files, prevNoSplit);
+      return;
+    }
+    const f = files[0];
+    upSession.clear();
+    els.upPrev.classList.add('hidden');
+    await prepareFile(f);
+  } finally {
+    upSession.setReading(false);
   }
-  const f = files[0];
-  upSession.clear();
-  els.upPrev.classList.add('hidden');
-  await prepareFile(f);
 }
 
 /** 多文件批量导入（P1）：串行逐本 cleaner → 自动入库，一次一本避免浏览器内存峰值叠加。
  * 作者/标签/备注取上传表单当前值，作为这一批的统一默认值；书名取文件名；
  * 与书架同名的自动跳过（批量不逐本弹窗）。上传复用 bulk 通道。 */
-async function importBatch(files) {
+async function importBatch(files, prevNoSplit = false) {
   const n = files.length;
   const author = els.upAuthor.value.trim();
   const tags = host().parseTagInput(els.upTags.value);
@@ -118,6 +131,7 @@ async function importBatch(files) {
     // 取消：必须复位文件输入（L10）。否则 input.value 仍是这一批文件名，
     // 用户改主意后重选同一批文件不触发 change 事件 —— 表现为"点了没反应"。
     els.upFile.value = '';
+    els.upNoSplit.checked = !!prevNoSplit; // #145 P3-12b：还原「不分章」勾选态
     return;
   }
 
@@ -125,6 +139,8 @@ async function importBatch(files) {
   let skip = 0;
   let fail = 0;
   let rawFail = 0; // 原件上传失败本数（书仍入库，重洗不可用）
+  const failTitles = []; // #145 P3-12c：解析出 0 章的文件要留名 —— 只计 fail++ 时用户看到
+  // 「失败 N 本」却不知道哪本、为什么，只能对着一批文件名逐个猜。
   upSession.setImporting(true);
   els.upProgWrap.classList.remove('hidden');
   els.upConfirm.disabled = true;
@@ -152,6 +168,7 @@ async function importBatch(files) {
         const preview = upSession.current().preview;
         if (!preview || !preview.chapters.length) {
           fail++;
+          failTitles.push(title);
           continue;
         }
         // 字段来源（文件解析值，非 DOM）在此决定；组装单点在 payload.js，与单文件上传同一份
@@ -185,6 +202,8 @@ async function importBatch(files) {
   upSession.clear();
   els.upFile.value = '';
   toast([`成功 ${ok} 本`, skip ? `同名跳过 ${skip} 本` : '', fail ? `失败 ${fail} 本` : '', rawFail ? `原件缺失 ${rawFail} 本（重洗不可用）` : ''].filter(Boolean).join(' · '), 3200);
+  // #145 P3-12c：0 章文件逐本留名（通常是编码识别失败/空文件）。
+  if (failTitles.length) toast(`未解析出章节：${failTitles.join('、')}`, 4200);
   // 批量是分钟级长任务，用户可能中途点「取消」回书架读书了：只刷新数据，别把人从阅读页拽走
   if (!els.upload.classList.contains('hidden')) host().showView('shelf');
   if (lastBooks) await host().loadShelf({ books: lastBooks }).catch(() => {});

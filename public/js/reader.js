@@ -38,9 +38,23 @@ function defaultPref() {
 /* ---------- DOM ---------- */
 let els = {};
 let onNav = null;
+let onExpire = null; // 会话过期收敛回调（app.js 注入）—— reader 不 import app.js（避免环依赖）
 const mqDesktop = () => matchMedia('(min-width: 900px)').matches;
 
 let flushBound = false;
+
+/** app.js Boot 时注入：401 的统一出口（expireSession → finishLogout）。
+ *  #145 P2-3：reader 内的下载/导出/翻章以前对 401 只透传英文 'unauthorized'，
+ *  会话已死重试永远失败、用户被困阅读器。现在统一「中文提示 + 收敛到登录页」。 */
+export function setOnExpire(fn) {
+  onExpire = fn;
+}
+
+/** 会话已死的统一处置：提示 + 收敛（不跳转的提示等于没修 —— 重试永远不会成功）。 */
+function sessionExpired() {
+  showTip('会话过期，请重新登录', 2000);
+  if (onExpire) onExpire();
+}
 
 export function bindReader(root, navCb) {
   els = {
@@ -879,7 +893,9 @@ function goto(idx) {
   progConfirmIdx = -1; // 换章后挂起的「再点跳转」目标已失去上下文：不清的话下一次轻点会被当成第二击直接跳章
   saveProgress();
   renderChapter(idx, 0).catch((e) => {
-    if (e instanceof ApiError && e.status === 401) showTip('会话过期，请重新登录', 2000);
+    // #145 P2-3：原来只提示不收敛 —— 翻章 401 后用户还停在阅读器里，每次翻章都是新的一次
+    // 失败。提示保留（loadChapter 的范式），补上收敛。
+    if (e instanceof ApiError && e.status === 401) sessionExpired();
   });
   markCur();
   if (mqDesktop() && !els.root.classList.contains('side-collapsed')) {
@@ -973,6 +989,11 @@ async function downloadCurrent() {
     state.cache.clear(); // 离线缓存已含全部章
     showTip(missing ? `已离线《${meta.title}》，但有 ${missing} 章缺失，请重试` : `已离线《${meta.title}》共 ${meta.chapters.length} 章，断网也能读`, 2600);
   } catch (e) {
+    // #145 P2-3：401 单独收敛（showTip 的 'unauthorized' 是英文且不跳登录，用户被困阅读器）
+    if (e instanceof ApiError && e.status === 401) {
+      sessionExpired();
+      return;
+    }
     showTip('下载失败：' + (e.message || e), 2800);
   } finally {
     busyDone();
@@ -989,6 +1010,11 @@ async function exportCurrentText() {
     if (missing) showTip(`已导出《${title}》，但有 ${missing} 章未取到`, 3000);
     else showTip('已导出《' + title + '》，可在下载中查看', 2000);
   } catch (e) {
+    // #145 P2-3：同 downloadCurrent
+    if (e instanceof ApiError && e.status === 401) {
+      sessionExpired();
+      return;
+    }
     showTip('导出失败：' + (e.message || e), 2800);
   } finally {
     busyDone();

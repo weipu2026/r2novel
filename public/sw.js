@@ -78,7 +78,11 @@ self.addEventListener('fetch', (event) => {
   // 否则下面的 fetch 会抛 TypeError（被 catch 吞成 503，掩盖真实原因）
   if (req.cache === 'only-if-cached' && req.mode !== 'same-origin') return;
   // 动态/鉴权内容一律网络直走，绝不缓存（API、OPDS feed、整本导出——响应均 no-store）
-  if (url.pathname.startsWith('/api/') || url.pathname === '/opds' || url.pathname.startsWith('/export/')) {
+  // #145 P2-6：/opds 与 /opds/ 两种形态都要放过。服务端正则 /^\/opds\/?$/ 两种都服务、
+  // wrangler 的 run_worker_first 也同时列了两种；订阅地址常带尾斜杠。漏放 /opds/ → 已鉴权的
+  // 目录（含全部书名/章数/字数的 atom+xml）落入下面的 stale-while-revalidate，cache.put
+  // 不理会 no-store → 登出后乃至离线再访问仍从 SW 缓存返回完整目录，直到下次部署换版本。
+  if (url.pathname.startsWith('/api/') || url.pathname === '/opds' || url.pathname === '/opds/' || url.pathname.startsWith('/export/')) {
     event.respondWith(fetch(req).catch(() => new Response('', { status: 503 })));
     return;
   }

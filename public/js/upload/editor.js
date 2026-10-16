@@ -185,11 +185,17 @@ function ceBuildRow(ch, i, gen) {
     ceBusy('保存标题…', gen);
     try {
       const r = await api.patchChapter(ceState.id, ch.key, { title: v });
-      ch.title = r.title; // 服务端兜底（空标题 → 第 N 章）后的规范值
-      ceState.words = r.wordCount;
-      ceState.dirty = true;
-      input.value = ch.title;
-      ceStatRefresh(gen);
+      // #145 P2-8：状态写入包进世代守卫（与正文保存的 ceAliveAt 分支同一口径）。await 期间
+      // 弹层可能被关/被换书：迟到响应把旧书的字数覆写进 ceState.words —— 新弹层统计行显示
+      // 《B》· N 章 ·〈A 的字数〉，dirty=true 还引发无谓 loadShelf 与误弹离线同步提示。
+      // 「已保存」toast 保留（服务端已成功就不能沉默，与正文保存同一契约）。
+      if (ceAliveAt(gen)) {
+        ch.title = r.title; // 服务端兜底（空标题 → 第 N 章）后的规范值
+        ceState.words = r.wordCount;
+        ceState.dirty = true;
+        input.value = ch.title;
+      }
+      ceStatRefresh(gen); // 世代已失配则自动跳过（不让迟到写把成功误报成失败）
       toast('标题已保存', 1200);
     } catch (e) {
       input.value = old;
@@ -366,7 +372,7 @@ async function ceInsert(afterKey) {
   try {
     const body = afterKey ? { after: afterKey, title: '新章', content: '' } : { title: '新章', content: '' };
     const r = await api.insertChapter(ceState.id, body);
-    ceState.dirty = true;
+    if (ceAliveAt(gen)) ceState.dirty = true; // #145 P3-12a：同 P2-8 家族，迟到写不碰下一弹层
     // #144 P2-8：插入请求已成功（章已在服务端落位），随后的刷新失败**必须分段报错**——
     // 二段 await 共用一个 catch 会把「已插入」报成「插入失败」，诱导用户重试 → 真插出两章
     //（与 3cd06e7 修的「迟到写误报失败」同一族，只是失败点换到了刷新段）。

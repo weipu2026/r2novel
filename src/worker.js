@@ -81,8 +81,19 @@ export function r2Store(bucket) {
 
 export default {
   async fetch(req, env) {
-    const store = r2Store(env.NOVELS);
-    const serveStatic = async () => env.ASSETS.fetch(req);
-    return handleRequest(req, { ...env, serveStatic }, store);
+    // #145 P3-10：入口兜底。handleRequest 已给 /api、/opds、/export 分别包了 try，这里是最后
+    // 一道防线（env 绑定缺失、serveStatic 自身抛等）—— 必须回 JSON，不让平台默认 HTML 500
+    // 页冒给前端/第三方阅读器（它们都按 JSON 解）。
+    try {
+      const store = r2Store(env.NOVELS);
+      const serveStatic = async () => env.ASSETS.fetch(req);
+      return await handleRequest(req, { ...env, serveStatic }, store);
+    } catch (e) {
+      console.error('[worker] 未捕获异常:', e && e.stack ? e.stack : e);
+      return new Response(JSON.stringify({ error: '服务器内部错误' }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
   },
 };

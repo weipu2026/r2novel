@@ -2193,6 +2193,32 @@ async function apiInsertChapter(req, env, store, id) {
   try {
     await store.putText(KEY.text(id, key), content); // 空正文也落盘（阅读时提示无内容，不 404）
   } catch {
+    // R2 补偿：章已随 CAS 入表而正文没写上 → 悬挂章（阅读 404），且客户端重试插入会换
+    // 新 key（newId 每请求一次）→ 同章重复、先插的那套成空壳。尽力摘除条目回退字数，
+    // 把失败路径收敛到「什么都没发生」；补偿自身失败也不掩盖 409（编辑器可手删悬挂章，
+    // countWords(null)=0 已实测可删）。key 从未有正文落盘 → 不必登记 meta.orphans
+    // （孤儿清扫只扫登记过的 key，这里删条目就干净了）。
+    try {
+      await mutateMeta(
+        store,
+        id,
+        (meta) => {
+          const i = chIndex(meta, key);
+          if (i < 0) return { dirty: false }; // 已被并发删掉 → 无需补偿
+          const w = Number.isFinite(meta.chapters[i].words) ? meta.chapters[i].words : wordsOf(content);
+          meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) - w);
+          meta.chapters.splice(i, 1);
+          meta.chapterCount = meta.chapters.length;
+          meta.cleanVer = (Number(meta.cleanVer) || 1) + 1;
+          meta.updatedAt = Date.now();
+          return {};
+        },
+        null,
+        2 // 失败路径的尽力补偿：tries 收窄，别把罕见的 R2 抖动放大成额外子请求
+      );
+    } catch {
+      /* 补偿尽力而为：409 照常返回，客户端重试或进编辑器手删 */
+    }
     return json({ error: '正文写入失败，请重试' }, 409);
   }
   // 进度迁移放在 CAS 成功之后、用**实际插入位** m.out.at（F4）：原先放在 CAS 之前用守卫读的

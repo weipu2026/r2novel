@@ -1666,7 +1666,16 @@ function trashRow(b) {
   const sub = document.createElement('div');
   sub.className = 't-sub' + (b.restorable ? '' : ' warn');
   const when = new Date(b.deletedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  sub.textContent = b.restorable ? `删除于 ${when} · ${b.chapterCount} 章` : `正文已部分清除（${b.purge} 章待清），无法恢复`;
+  // R6：消费后端透出的 purging 占用标记 —— 在飞 purge（计数 0 + purging:true）时正文
+  // 其实完好，旧文案「正文已部分清除（0 章待清）」语义错误；purge 字段缺失（老数据/
+  // 游标残留）也不再显示「undefined 章待清」。
+  sub.textContent = b.restorable
+    ? `删除于 ${when} · ${b.chapterCount} 章`
+    : b.purging && !b.purge
+      ? '正在彻底删除，暂不可恢复'
+      : b.purge
+        ? `正文已部分清除（${b.purge} 章待清），无法恢复`
+        : '正文已部分清除，无法恢复';
   info.appendChild(t);
   info.appendChild(sub);
   row.appendChild(info);

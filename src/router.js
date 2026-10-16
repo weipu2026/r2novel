@@ -1798,7 +1798,13 @@ async function apiPublish(req, env, store, id) {
   // 正文与 meta（书架留幽灵）。复检放在 upsert 前最后一步，判据与入口一致、成本 1 次读。
   // 失败落点：CAS 已成功（meta 已 ready），书留在回收站里可恢复可重试 —— 安全侧。
   const trash2 = await readTrash(store).catch(() => ({ books: [] }));
-  if (trash2.books.some((b) => b.id === id)) return json({ error: '该书在回收站中，请先恢复再发布' }, 409);
+  if (trash2.books.some((b) => b.id === id)) {
+    // R4：meta.status 已在 CAS 里写成 ready，副档（st/<id>）滞后会让「目录能开、每章
+    // 409」——apiBookMeta 判 meta、apiChapter 判副档。拒绝前尽力同步副档；书留回收站
+    // 可恢复、可重发发布，失败落在安全侧。
+    await putStatus(store, id, 'ready').catch(() => {});
+    return json({ error: '该书在回收站中，请先恢复再发布' }, 409);
+  }
   // #145 P3-6：同名在架终判。createBook 的判重只读索引快照，两个标签页同书名并发新建时两份
   // creating 书互相不可见、都会通过判重；各自发布时这里才是第一处「两份都已在架可见」的
   // 判定点。命中 → 拒绝上架并指路（客户端失败分支会把半成品移入回收站，用户改名或删一本后
@@ -1811,9 +1817,21 @@ async function apiPublish(req, env, store, id) {
   //   重复卡检查」的代价高于收益 —— 与 opds 的熔断同一判据）。
   //   single 模式句柄没有全量 books（访问即抛），必须另开全量读。
   if (!old && Number(idx.shardCount) <= 8) {
-    const full = await readIndex(store);
-    const clash = (full.books || []).find((b) => b.id !== id && normTitle(b.title) === normTitle(meta.title));
-    if (clash) return json({ error: '书架已有同名的《' + clash.title + '》，请改名或删除其中一本后再发布' }, 409);
+    // R4：全量读瞬时故障 → fail-open。同名终判是 create 期判重 + 客户端 askDup 之外的
+    // 纵深一环，丢一次检查好过在 meta 已 ready 之后冒 500（下一轮发布会再判）。
+    let full = null;
+    try {
+      full = await readIndex(store);
+    } catch {
+      /* 瞬时抖动：跳过终判，不阻断发布 */
+    }
+    if (full) {
+      const clash = (full.books || []).find((b) => b.id !== id && normTitle(b.title) === normTitle(meta.title));
+      if (clash) {
+        await putStatus(store, id, 'ready').catch(() => {}); // 同 trash2 分支：副档对齐 meta
+        return json({ error: '书架已有同名的《' + clash.title + '》，请改名或删除其中一本后再发布' }, 409);
+      }
+    }
   }
   idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
   // 两个互不依赖的写并行：状态副档 ∥ 索引（脏分片 + bak + root 如有成员变化）。

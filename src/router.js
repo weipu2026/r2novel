@@ -2833,10 +2833,16 @@ async function apiRestore(store, id) {
     store,
     (t) => {
       const i = t.books.findIndex((b) => b.id === id);
-      if (i < 0) return { dirty: false };
+      // R3：条目消失 / deletedAt 变更都必须按 raced 上报。旧代码两条都只回
+      // { dirty: false }（无 out）→ 上层 raced 不触发 → 照常 ok:true，而索引里已
+      // upsert 的副本留着：purgeOnce 摘条目时正文/meta 已删光 → 点开 404 的幽灵书；
+      // deletedAt 变更则可能与回收站条目构成双态（日后 purge 删掉一本在架书）。
+      // vanished 留给调用方分流：另一台设备的恢复刚摘掉条目时书合法在架，
+      // 无脑回滚会把合法条目删掉（见下方 readBook 判据）。
+      if (i < 0) return { dirty: false, out: { raced: true, vanished: true } };
       // 我读快照之后它又被并发软删了一次（deletedAt 变了）→ 这次「摘除」不该生效：
       // 否则会把别人刚写回的条目吃掉，书既不在架也不在回收站（2026-09-17 复查 F1）。
-      if (t.books[i].deletedAt !== entry.deletedAt) return { dirty: false };
+      if (t.books[i].deletedAt !== entry.deletedAt) return { dirty: false, out: { raced: true, redo: true } };
       // #144 P1-2 + #145 P1-1：purgeOnce 的占用（purging / purge:left / purgeCursor）**保留
       // deletedAt 不变**，只比 deletedAt 的重放会穿透 —— 恢复这边刚把书 upsert 回索引，并发
       // purge 那边正在删它的正文（本批 ≤30 章已删）。#144 的判据只认 purge.length，对 ≤30 章
@@ -2852,16 +2858,25 @@ async function apiRestore(store, id) {
     trashCur
   );
   if (marked && marked.raced) {
-    // 回滚刚 upsert 进索引的残缺副本（书架上点开必 404 数章，比「不在架」更糟）。
-    // 索引 CAS 冲突这里不再重试重放——竞态窗口本就极窄，尽力回滚即可，trash 里的
-    // 条目（带占用标记）始终是权威记录。
-    try {
-      idx.remove(id);
-      await idx.save({ bak: true });
-    } catch {
-      /* 回滚失败不掩盖主结果：409 照常返回，diag 的孤儿清扫可兜底 */
+    // 条目消失（vanished）有两种成分，读一次 meta 分流：
+    //   · 本体没了 ⇒ purgeOnce 删光正文/meta 之后才摘的条目 → 我们的 upsert 是
+    //     幽灵，必须回滚（书架上点开 404，比「不在架」更糟）；
+    //   · 本体还在 ⇒ 另一台设备的恢复刚摘掉条目（书合法在架）→ 回滚反而删掉
+    //     合法条目 → 放行（幂等：两次恢复的upsert 内容相同）。
+    let rollback = true;
+    if (marked.vanished) rollback = !(await readBook(store, id));
+    if (rollback) {
+      // 索引 CAS 冲突这里不再重试重放——竞态窗口本就极窄，尽力回滚即可，trash 里的
+      // 条目（带占用标记）始终是权威记录。
+      try {
+        idx.remove(id);
+        await idx.save({ bak: true });
+      } catch {
+        /* 回滚失败不掩盖主结果：409 照常返回，diag 的孤儿清扫可兜底 */
+      }
+      return json({ error: marked.redo ? '该书已被再次删除，恢复已中止' : '该书正在被彻底删除，恢复已中止' }, 409);
     }
-    return json({ error: '该书正在被彻底删除，恢复已中止' }, 409);
+    return json({ ok: true }); // 并发恢复已达成同一目标，trash 条目已由它摘除
   }
   return json({ ok: true });
 }

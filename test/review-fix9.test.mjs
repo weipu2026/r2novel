@@ -111,7 +111,10 @@ test('F1：恢复×并发软删，trash 条目必须保留（不得书架回收�
     },
   };
   r = await call(store, req(`/api/books/${id}/restore`, { method: 'POST', cookie }));
-  assert.equal(r.status, 200);
+  // #145 复验 R3：deletedAt 变更升级为 raced（redo）→ 409 + 回滚索引。
+  // 旧实现重放 splice 只认 id 把 B 刚写回的条目吃掉（表面 200）——实际书既不在架也不在回收站。
+  assert.equal(r.status, 409, '恢复快照后该书被再次软删 → 拒绝恢复并回滚索引（不得吃掉 B 的条目）');
+  assert.equal(r.data.error, '该书已被再次删除，恢复已中止');
   const shelf = await call(base, req('/api/books', { cookie }));
   assert.equal(shelf.data.books.filter((x) => x.id === id).length, 0, '并发软删应赢下索引（最后一次索引写是 B 的 remove）');
   const trash = JSON.parse(base._map.get(TRASH)).books;

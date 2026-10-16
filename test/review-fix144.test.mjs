@@ -26,10 +26,12 @@ test('P1-2 apiRestore：CAS 重放必须检出 purge 占用标记并 409（只�
   const src = routerSrc();
   const i = src.indexOf('async function apiRestore(');
   const body = src.slice(i, i + 4000);
+  // #145 P1-1：判据加上 purging 独立字段 —— purgeOnce 保留 deletedAt 不变，在飞占用
+  // （≤30 章的书 left 恒为空数组）只比 purge.length 会被每一次在飞 purge 稳定穿透。
   assert.match(
     body,
-    /if \(\(Array\.isArray\(t\.books\[i\]\.purge\) && t\.books\[i\]\.purge\.length\) \|\| t\.books\[i\]\.purgeCursor\) \{\n\s*return \{ dirty: false, out: \{ raced: true \} \};/,
-    '重放 mutate 必须比对 purge 占用标记（purgeOnce 保留 deletedAt 不变 → 只比 deletedAt 会穿透）'
+    /if \(t\.books\[i\]\.purging \|\| \(Array\.isArray\(t\.books\[i\]\.purge\) && t\.books\[i\]\.purge\.length\) \|\| t\.books\[i\]\.purgeCursor\) \{\n\s*return \{ dirty: false, out: \{ raced: true \} \};/,
+    '重放 mutate 必须比对 purge 占用标记（含 purging：purgeOnce 保留 deletedAt 不变 → 只比 deletedAt 会穿透）'
   );
   assert.match(body, /if \(marked && marked\.raced\)/, 'raced 信号必须被消费');
   assert.match(body, /idx\.remove\(id\)/, '竞态检出后必须回滚刚 upsert 的索引副本');
@@ -98,12 +100,16 @@ test('P2-7 trashDays：前端徽章/文案改用服务端生效值', () => {
 
 test('P3 后端：进度迁移在 CAS 后 / 删章正文在 CAS 后 / tagsMerge 失败计回 remaining / opds 口径一致', () => {
   const src = routerSrc();
-  // P3-a：replace 进度迁移必须在 mutateMeta 之后
+  // P3-a：replace 进度迁移必须在 mutateMeta 之后（#145 P3-4 起还必须是 putIf 条件写）
   const u = src.indexOf('async function apiUpdateChapters(');
-  const uBody = src.slice(u, u + 6000);
+  const uBody = src.slice(u, src.indexOf('async function', u + 10)); // 整个函数体（旧 6000 窗装不下 #145 后的长度）
   const casAt = uBody.indexOf('const m = await mutateMeta(');
-  const progAt = uBody.indexOf('store.putText(KEY.progress(id)');
+  const progAt = uBody.indexOf('await putIf(store, KEY.progress(id), JSON.stringify(next), etag)');
   assert.ok(casAt > 0 && progAt > casAt, 'replace 进度迁移必须在 CAS 之后（409 时不得改写进度）');
+  assert.ok(!/store\.putText\(KEY\.progress\(id\)/.test(uBody),
+    '进度迁移不得用无条件 putText 的读—改—写（#145 P3-4：与并发的 apiProgressPut 撞上会整份覆盖掉那次阅读写入）');
+  assert.match(uBody, /const got = await getWithEtag\(store, KEY\.progress\(id\)\);/,
+    '迁移每轮必须重读现版本并用其 etag 条件写（updatedAt 每次重试现取，不许复用请求开始时的 now）');
   // P3-b：删章正文删除必须在 mutateMeta 之后
   const d = src.indexOf('async function apiDeleteChapter(');
   const dBody = src.slice(d, d + 2400);

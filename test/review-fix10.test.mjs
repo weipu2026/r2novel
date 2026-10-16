@@ -254,15 +254,18 @@ test('R3 批量改标签（非删除路径）：连续两次冲突同样不得�
 
   // 分片是**并行写**的：冲突中断时可能已有若干片落盘（不像删除路径那样 root 先写、一失败即中止），
   // 所以这里不能断言「整体未生效」。能保证的是「不丢更新 + 可收敛」——重发一轮（无注入）后，
-  // 本批覆盖到的书必须全部带上标签。另注：6 本里只有 5 本进得了预算（第 6 本被裁成 deferred）。
+  // 本批覆盖到的书必须全部带上标签。另注：#145 P3-2 起每本预扣 4，6 本各占一片时预算内
+  // 只进 4 本（第 4 本 est=43 ✓、第 5 本 est=53 ✗），余 2 本裁成 deferred。
   const r2 = await call(
     counted,
     req('/api/books/batch', { method: 'POST', cookie, body: { ids: books.map((b) => b.id), action: 'addTags', tags: ['x'] } })
   );
   assert.equal(r2.status, 200, JSON.stringify(r2.data));
+  assert.equal(r2.data.updated, 4, '重发一轮同样只进 4 本（预扣 4/本的数学）');
+  assert.equal(r2.data.deferred.length, 2, '余 2 本原样回传 deferred');
   const left = await readIdxBooks(counted);
   assert.ok(
-    left.filter((b) => (b.tags || []).includes('x')).length >= 5,
+    left.filter((b) => (b.tags || []).includes('x')).length >= 4,
     '重发一轮后必须收敛：本批覆盖到的书都要带上标签'
   );
 });

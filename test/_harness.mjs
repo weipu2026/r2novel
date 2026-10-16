@@ -89,9 +89,14 @@ export function memStore() {
   };
 }
 
-/** 构造请求：body 支持 string / Uint8Array / ReadableStream（chunked）/ 普通对象（自动 JSON） */
+/** 构造请求：body 支持 string / Uint8Array / ReadableStream（chunked）/ 普通对象（自动 JSON）
+ * ⚠️ 默认带 `sec-fetch-site: same-origin`：现代浏览器对同源 fetch/导航都发这个头，
+ * 而 #145 P3-11 起 sweep 类惰性清理（apiTrashList / apiBookMeta）只在同源请求里做
+ * （SameSite=Lax 下跨站顶层 GET 也带 Cookie，不能让外部页面白蹭删除副作用）。
+ * 用例要验「跨站不触发」时显式传 headers: { 'sec-fetch-site': 'cross-site' } 覆盖。 */
 export function req(path, { method = 'GET', body, headers = {}, cookie } = {}) {
   const h = new Headers(headers);
+  if (!h.has('sec-fetch-site')) h.set('sec-fetch-site', 'same-origin');
   if (cookie) h.set('Cookie', cookie);
   const opts = { method, headers: h };
   if (body !== undefined) {

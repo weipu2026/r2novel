@@ -258,34 +258,44 @@ test('批量预算：18 本散在多片时按预算裁剪，deferred 原样回�
     req('/api/books/batch', { method: 'POST', cookie, body: { ids, action: 'setFinished', finished: true } })
   );
   assert.equal(r.status, 200);
-  assert.equal(r.data.updated, 13, '预算内恰好处理 13 本（F3 预扣重放开销后比旧数学收紧 4 本）');
-  assert.deepEqual(r.data.deferred, ids.slice(13), '被裁掉的 id 必须**原样回传**：只回传数量而前端不消费＝静默丢书');
+  // #145 P3-2 起每本预扣 4（mutateMeta tries=2：读+写败+读+写）而非 2 → 预算内 8 本
+  // （est=1+3k+4(N+1)+(2+3k)：s0 取 5 本后 s1 第 3 本 est=47 ✓、第 4 本 est=51 ✗）
+  assert.equal(r.data.updated, 8, '预算内恰好处理 8 本（#145 P3-2 每本预扣 4 后比旧数学收紧 5 本）');
+  assert.deepEqual(r.data.deferred, ids.slice(8), '被裁掉的 id 必须**原样回传**：只回传数量而前端不消费＝静默丢书');
   assert.equal(r.data.skipped, 0, 'skipped 只算「在架却改不成」的，不含被裁的');
   // meta 只写已处理的书
-  assert.equal(JSON.parse(store._map.get(KEY.book(ids[12]))).finished, true);
-  assert.notEqual(JSON.parse(store._map.get(KEY.book(ids[13]))).finished, true, '被裁掉的书不应被写');
+  assert.equal(JSON.parse(store._map.get(KEY.book(ids[7]))).finished, true);
+  assert.notEqual(JSON.parse(store._map.get(KEY.book(ids[8]))).finished, true, '被裁掉的书不应被写');
   // 索引摘要同步
   const after = await readIdxBooks(store);
   assert.equal(after.find((b) => b.id === ids[0]).finished, true);
 
-  // 续调（客户端 batch-queue.js 的做法）：把 deferred 发回来 → 一本不落
+  // 续调（客户端 batch-queue.js 的做法）：把 deferred 发回来 → 一本不落。18 本裁成 8+6+4 三批：
+  // 第二批 = s1×1 + s2×4 + s3×1（s3 第 2 本 est=49 ✗）；第三批 = s3×3 + s4×1 收尾。
   const r2 = await call(
     store,
     req('/api/books/batch', { method: 'POST', cookie, body: { ids: r.data.deferred, action: 'setFinished', finished: true } })
   );
-  assert.equal(r2.data.updated, 5, '续调把被裁的 5 本（s3×4 + s4×1）一次做完');
-  assert.deepEqual(r2.data.deferred, []);
+  assert.equal(r2.data.updated, 6, '续调第二批 6 本（s1×1 + s2×4 + s3×1）');
+  assert.equal(r2.data.deferred.length, 4, '仍裁 4 本原样回传');
   assert.equal(r2.data.skipped, 0);
+  const r3 = await call(
+    store,
+    req('/api/books/batch', { method: 'POST', cookie, body: { ids: r2.data.deferred, action: 'setFinished', finished: true } })
+  );
+  assert.equal(r3.data.updated, 4, '续调第三批 4 本（s3×3 + s4×1）收尾');
+  assert.deepEqual(r3.data.deferred, []);
+  assert.equal(r3.data.skipped, 0);
   for (const id of ids) assert.equal(JSON.parse(store._map.get(KEY.book(id))).finished, true, `${id} 应已落库`);
 
   // 不在架的 id 进 skipped 而非 deferred（否则客户端会无限重试同一个死 id）
-  const r3 = await call(
+  const r4 = await call(
     store,
     req('/api/books/batch', { method: 'POST', cookie, body: { ids: ['b9999999'], action: 'setFinished', finished: true } })
   );
-  assert.equal(r3.data.updated, 0);
-  assert.equal(r3.data.skipped, 1);
-  assert.deepEqual(r3.data.deferred, []);
+  assert.equal(r4.data.updated, 0);
+  assert.equal(r4.data.skipped, 1);
+  assert.deepEqual(r4.data.deferred, []);
 });
 
 test('root bak：空布局（shards:0）不进 bak —— root 一坏不得回落到「合法空书架」', async () => {

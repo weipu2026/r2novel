@@ -126,19 +126,19 @@ test('P2-1 游标不得塞进 purge 数组当哨兵（会被当章 key 删掉且
     'done 判定必须同时看「本窗没删完」与「还有没列到的章节」');
 });
 
-test('P2-1/P3-1 恢复判据与 purge 的 done 判据同源（purge 非空或游标非空即不可恢复）', () => {
+test('P2-1/P3-1 恢复判据与 purge 的 done 判据同源（purging 占用标记 / purge 非空 / 游标非空即不可恢复）', () => {
   const src = routerSrc();
   const i = src.indexOf('async function apiRestore(');
   const body = src.slice(i, i + 1500);
-  assert.match(body, /Array\.isArray\(entry\.purge\) && entry\.purge\.length/,
-    'apiRestore 必须用「有剩余待清」而不是「purge 字段存在」（空数组为真会让一次中断的书永久不可恢复）');
-  assert.match(body, /entry\.purgeCursor/,
-    'apiRestore 也必须把「还有没列到的章节」算作不可恢复');
+  // #145 P1-1：判据从「purge 字段存在 → purge 非空」再进一步 —— 在飞占用改认独立字段
+  // purging（purge:[] 同时是「在飞稳定中间态」与「崩溃残留」，只认 .length 会被稳定穿透）。
+  assert.match(body, /entry\.purging \|\| \(Array\.isArray\(entry\.purge\) && entry\.purge\.length\) \|\| entry\.purgeCursor/,
+    'apiRestore 必须三判据齐全：purging 占用标记 / 有剩余待清（不是「字段存在」，空数组为真会让一次中断的书永久不可恢复）/ 还有没列到的章节');
   // apiTrashList 的 restorable 同步
   const j = src.indexOf('async function apiTrashList(');
   const list = src.slice(j, j + 1200);
-  assert.match(list, /restorable: !\(Array\.isArray\(b\.purge\) && b\.purge\.length\) && !b\.purgeCursor/,
-    'apiTrashList 的 restorable 必须与 apiRestore 同判据');
+  assert.match(list, /restorable: !b\.purging && !\(Array\.isArray\(b\.purge\) && b\.purge\.length\) && !b\.purgeCursor/,
+    'apiTrashList 的 restorable 必须与 apiRestore 同判据（含 #145 P1-1 的 purging）');
 });
 
 test('P3-2 purgeOnce 不得再保留已成死参数的 trash 形参', () => {

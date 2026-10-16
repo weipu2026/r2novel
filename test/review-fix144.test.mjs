@@ -25,7 +25,8 @@ test('P1-1 purgeOnce：keys 来自 purge 数组时必须继承续扫游标（否
 test('P1-2 apiRestore：CAS 重放必须检出 purge 占用标记并 409（只比 deletedAt 会穿透）', () => {
   const src = routerSrc();
   const i = src.indexOf('async function apiRestore(');
-  const body = src.slice(i, i + 4000);
+  // R3 后函数体变长（vanished/redo 分流）：固定 4000 窗口截不到 raced 消费块，取整段函数体
+  const body = src.slice(i, src.indexOf('\nasync function', i + 10));
   // #145 P1-1：判据加上 purging 独立字段 —— purgeOnce 保留 deletedAt 不变，在飞占用
   // （≤30 章的书 left 恒为空数组）只比 purge.length 会被每一次在飞 purge 稳定穿透。
   assert.match(

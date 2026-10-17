@@ -55,13 +55,19 @@ test('R8：_reading 在飞时 isBusy 为真、但「上传/导入在飞」判据
 test('R8：renderPreviewChapters 的锁判据是 isUploading()||isImporting()，且仍在该处最后一环', () => {
   const src = read('public/js/upload/preview.js');
   // 行首锚定：注释里出现同样的词不会喂假绿（注释行以 // 开头，匹配不到 ^\s*if）
-  const ok = /^\s*if \(upSession\.isUploading\(\) \|\| upSession\.isImporting\(\)\) lockPreviewRows\(ul\);$/m.exec(src);
-  assert.ok(ok, '锁判据必须是「上传/导入在飞」——isBusy() 含 _reading，会让首次预览永久锁死');
-  assert.doesNotMatch(
-    src,
-    /^\s*if \(upSession\.isBusy\(\)\) lockPreviewRows\(ul\);$/m,
-    '不得改回 isBusy()（编辑闸与入场闸必须分离）'
+  // #146 P2-6：判据搬进 syncPreviewLock()（锁/解锁双向同步），调用点仍行首锚定
+  const ok = /^\s*syncPreviewLock\(\);$/m.exec(src);
+  assert.ok(ok, '渲染完成后必须调用 syncPreviewLock()');
+  const fnAt = src.indexOf('export function syncPreviewLock()');
+  assert.ok(fnAt > 0, '缺少 syncPreviewLock');
+  const fnEnd = src.indexOf('\n}', fnAt);
+  const fnBody = src.slice(fnAt, fnEnd > 0 ? fnEnd + 2 : fnAt + 500);
+  assert.match(
+    fnBody,
+    /const locked = upSession\.isUploading\(\) \|\| upSession\.isImporting\(\);/,
+    '锁判据必须是「上传/导入在飞」——isBusy() 含 _reading，会让首次预览永久锁死'
   );
+  assert.doesNotMatch(fnBody, /isBusy\(\)/, '不得改回 isBusy()（编辑闸与入场闸必须分离）');
   // 锁必须发生在所有行渲染之后（addLi 追加之后），否则一行都锁不到
   const i = ok.index;
   const before = src.slice(0, i);

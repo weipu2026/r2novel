@@ -14,6 +14,7 @@ import { CHAPTER_MAX, BULK_CHAPTER_BATCH } from '../shared-const.js';
 import { toast } from '../ui.js';
 import { host } from './ctx.js';
 import { buildBookPayload } from './payload.js';
+import { syncPreviewLock } from './preview.js';
 import * as upSession from './session.js';
 
 function collectPayload(session) {
@@ -57,6 +58,9 @@ export async function onConfirm() {
   upSession.setCreatedId(null);
   upSession.setUploading(true);
   els.upConfirm.disabled = true;
+  // #146 P2-6：上传一开始就锁预览行。只禁用确认按钮不够 —— 下面的 await 窗口里用户还能改标题/删章，
+  // 而真正入库的是上面冻结的 frozenChapters 快照 → 改动被静默丢弃（用户以为改到了）。
+  syncPreviewLock();
   els.upProgWrap.classList.remove('hidden');
 
   try {
@@ -108,6 +112,8 @@ export async function onConfirm() {
     toast('上传失败：' + (e.message || e), 3200);
   } finally {
     upSession.setUploading(false); // 无论成败都解冻上传会话
+    // #146 P2-6：解冻后立刻放行预览行 —— 失败重试时用户必须还能继续改标题/删章/换文件
+    syncPreviewLock();
   }
 }
 
@@ -178,7 +184,7 @@ async function uploadToExisting(id, op, payload, keepRaw, session) {
   if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
   // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：发布成功后由 finalizeUpload 内的
   // onConfirm 分支刷新书架（publish 自 2026-09-17 起不再回传 books 快照，无快照时走 loadShelf 全量刷新）
-  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session);
+  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session, op);
   return finalizeUpload(id, rawRes);
 }
 
@@ -188,10 +194,14 @@ async function uploadToExisting(id, op, payload, keepRaw, session) {
  *  raw 是可选附件（不勾「保留原件」就没有，书照样合法）→ 失败不算上传失败：
  *  返回 { rawFailed:true }，由调用方决定提示文案；书照常发布，仅重洗不可用。
  *  （旧实现 raw 失败 throw → onConfirm 兜底 deleteBook，会因非必需附件失败删掉整本正文。） */
-async function uploadBulkAndRaw(id, keys, keepRaw, session) {
+async function uploadBulkAndRaw(id, keys, keepRaw, session, op) {
   // 一律用会话快照（session），不读 upSession.current() —— 上传期间当前会话可能已被换掉
   if (!session) throw new Error('上传会话已失效，请重新选择文件');
-  const rawP = keepRaw && session.bytes ? api.putRaw(id, session.bytes) : null;
+  // #146 P2-2：append **绝不**写原件。raw/<id>.txt 是「整本重新清洗」的唯一数据源，而追加时的
+  // session.bytes 只是这次新增的章节片段 → 覆盖后点「重新清洗」会用片段替换掉整本正文（老章节
+  // 全丢，且发布前没有任何提示）。保留旧原件：重洗仍是全量口径；本次新追加的章不在重洗结果里，
+  // 但那是可恢复的（再追加一次），比整本丢失好得多。
+  const rawP = keepRaw && op !== 'append' && session.bytes ? api.putRaw(id, session.bytes) : null;
   // raw 在后台并行传输：bulk 进度文字里捎带原件状态，慢链路下 20s 黑箱不再像卡死
   upSession.setRawReq(rawP);
   if (rawP) setProg(0, `上传章节 0/${keys.length}（原件传输中…）`);

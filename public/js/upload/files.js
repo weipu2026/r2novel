@@ -10,8 +10,8 @@ import { api } from '../store.js';
 import { busy, busyDone, toast } from '../ui.js';
 import { host } from './ctx.js';
 import { buildBookPayload } from './payload.js';
-import { hint, prepareFile } from './prepare.js';
-import { runPreview } from './preview.js';
+import { hint, isAutoTitle, prepareFile, resetAutoTitle, setAutoTitle } from './prepare.js';
+import { resetEncChoice, runPreview } from './preview.js';
 import { setProg, uploadChapters } from './upload.js';
 import * as upSession from './session.js';
 
@@ -26,6 +26,9 @@ export function openUpload(opts = {}) {
   host().showView('upload');
   host().refreshPresetTags(); // 每次进上传页后台刷新 top20（快照先显示，不阻塞；打了新标签立刻跟进）
   els.upForm.reset();
+  // #146 P2-3：标题框被 reset 清空，「自动填的书名」记忆也要一起清 —— 否则上一次的文件名还被
+  // 当成「我们填的」，下次换文件时会把用户新输的书名覆盖掉。
+  resetAutoTitle();
   els.upFile.value = '';
   els.upClean.checked = true;
   els.upCleanOpts.classList.remove('off');
@@ -111,6 +114,12 @@ export async function handleFiles(files) {
     const f = files[0];
     upSession.clear();
     els.upPrev.classList.add('hidden');
+    // #146 P2-1：编码选择是**跨文件**残留的模块状态，换内容必须复位到「自动检测」—— 上一本手选的
+    // gb18030 会原样套到这一本 UTF-8 文件上，整本乱码且检测行还写着「已按 gb18030 编码解析」。
+    resetEncChoice();
+    // #146 P2-1b：单文件分支原先漏了复位 input.value（批量在取消/结束时都有）→ 重选同一个文件
+    // 不触发 change 事件，表现为「点了没反应」。
+    els.upFile.value = '';
     await prepareFile(f);
   } finally {
     upSession.setReading(false);
@@ -153,6 +162,8 @@ async function importBatch(files, prevNoSplit = false) {
     for (let i = 0; i < n; i++) {
       const file = files[i];
       const title = file.name.replace(/\.(txt|text)$/i, '').trim() || ('未命名_' + (i + 1));
+      // #146 P2-1：逐本复位。批量没有下拉 UI，上一本切到手选编码会静默把整批都带歪。
+      resetEncChoice();
       setProg(i / n, `处理 ${i + 1}/${n}：《${title}》`);
       try {
         const buf = new Uint8Array(await file.arrayBuffer());
@@ -218,7 +229,12 @@ export function onPasteText(e) {
   const txt = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
   if (!txt || !txt.trim()) return;
   e.preventDefault();
-  if (!els.upTitle.value) els.upTitle.value = '粘贴文本_' + new Date().toISOString().slice(0, 10);
+  // #146 P2-3：粘贴也是「换了内容」—— 标题框里若是上一本书自动带出的文件名，必须换成粘贴标题，
+  // 否则又是「标题A/正文B」；用户手输的书名一律不动。
+  const autoTitle = '粘贴文本_' + new Date().toISOString().slice(0, 10);
+  if (!els.upTitle.value.trim() || isAutoTitle(els.upTitle.value.trim())) setAutoTitle(autoTitle);
+  // #146 P2-1：粘贴的文本按上一本手选的编码解会整篇乱码（粘贴内容本来就是 UTF-8 内存字节）
+  resetEncChoice();
   upSession.begin({
     title: els.upTitle.value.trim(),
     bytes: new TextEncoder().encode(txt),

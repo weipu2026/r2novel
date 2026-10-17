@@ -10,12 +10,23 @@ import * as cleaner from '../cleaner.js';
 import * as upSession from './session.js';
 
 /* 「我们自动写进下拉框的编码值」（见 runPreview 开头的 forceEncoding 判定）。
- * 模块级而非会话级：跨会话残留无害——新会话 files.js 会把下拉重置为 'auto'，首跑即覆盖。 */
+ * 模块级而非会话级：残留本身无害 —— 但**前提是每个入场口都把下拉复位到 'auto'**。
+ * #146 P2-1：旧实现只有 openUpload 复位，选文件/粘贴/批量都不复位 → 上一本手选的 gb18030 会跟着
+ * 下一本 UTF-8 文件走，整本乱码入库，而检测行还写着「已按 gb18030 编码解析」（用户以为看到了真结果）。
+ * 复位统一走下面的 resetEncChoice()，别在调用点手写。 */
 let lastAutoSet = null;
 
 /** 手动指定编码入口（openEncPick）调用：用户已表达「我要手选」，此后下拉值 ≠ 'auto' 一律算手动 */
 export function invalidateAutoEnc() {
   lastAutoSet = null;
+}
+
+/** 把「编码选择」复位回自动检测（#146 P2-1）：每个「换内容」的入口（选文件 / 粘贴 / 批量逐本）
+ *  都必须先调它。只把 value 改回 'auto' 不够 —— lastAutoSet 也要作废，否则 runPreview 会把
+ *  上次自动写入的值当成用户手选继续钉死。选项表由 runPreview 负责重建，这里不动 DOM 结构。 */
+export function resetEncChoice() {
+  invalidateAutoEnc();
+  els.upEncoding.value = 'auto';
 }
 
 function currentCleanOpts() {
@@ -202,9 +213,14 @@ function appendPreview() {
   }
 }
 
-/** 上传在飞时把预览行的可交互控件全部禁用（标题/正文/编辑/插入/删除/末尾追加） */
-function lockPreviewRows(ul) {
-  for (const el of ul.querySelectorAll('input, textarea, button')) el.disabled = true;
+/** 按当前忙态**双向**同步预览行的可交互控件（标题/正文/编辑/插入/删除/末尾追加）的 disabled。
+ *  #146 P2-6：从「渲染时一次性禁用」改成可复用的同步函数并对外导出 —— 上传一开始
+ *  （onConfirm 的同步段）就必须锁上：原先只在 renderPreviewChapters 里锁，而那一刻没有任何重绘，
+ *  于是整个 await 窗口里用户仍能改标题/删章，改完才发现入库的是确认时冻结的快照（frozenChapters），
+ *  改动被静默丢弃。上传结束/失败后再调一次即解锁（不重建 DOM，保留光标与展开态）。 */
+export function syncPreviewLock() {
+  const locked = upSession.isUploading() || upSession.isImporting();
+  for (const el of els.upList.querySelectorAll('input, textarea, button')) el.disabled = locked;
 }
 
 function renderPreviewChapters() {
@@ -231,7 +247,7 @@ function renderPreviewChapters() {
   //    永久只读（真机实测：立即 16/16 locked、稳态仍 16/16 locked，用户改不了标题也删不了章）。
   //    _reading 是**入场闸**（拦新的会话入口，见 handleFiles/openUpload），编辑闸必须与它分离。
   // ⚠️ 必须放在**所有行渲染完之后**（addLi 之后）：提前调用时一行都还没建，锁不到任何东西。
-  if (upSession.isUploading() || upSession.isImporting()) lockPreviewRows(ul);
+  syncPreviewLock();
   refreshPreviewStats();
   updateConfirmBtn();
 }

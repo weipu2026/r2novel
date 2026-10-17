@@ -50,9 +50,16 @@ export function setOnExpire(fn) {
   onExpire = fn;
 }
 
-/** 会话已死的统一处置：提示 + 收敛（不跳转的提示等于没修 —— 重试永远不会成功）。 */
+/** 会话已死的统一处置：提示 + 收敛（不跳转的提示等于没修 —— 重试永远不会成功）。
+ *  #145 R13：**幂等**。401 天然成串到达（并行请求、连点重试、翻章 + 进度对账同时失败），
+ *  收敛入口放开到 renderChapter 之后更明显（goto 那条 catch 还会再调一次）—— 重复走
+ *  finishLogout 本身无害但会重复 clearAll/建 IndexedDB 事务，且让「一次过期 = 一次收敛」
+ *  这个语义变得没法讲。openBook 里重新武装（进入阅读器＝新的会话尝试）。 */
+let expiredOnce = false;
 function sessionExpired() {
   showTip('会话过期，请重新登录', 2000);
+  if (expiredOnce) return;
+  expiredOnce = true;
   if (onExpire) onExpire();
 }
 
@@ -186,6 +193,7 @@ export function closeReader() {
 
 export async function openBook(id) {
   const seq = ++openSeq;
+  expiredOnce = false; // #145 R13：进入阅读器＝一次新的会话尝试 → 重新武装 401 收敛（见 sessionExpired）
   let meta;
   try {
     meta = await api.bookMeta(id);
@@ -267,7 +275,13 @@ async function renderChapter(idx, restoreRatio) {
     text = await loadChapter(idx);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) {
-      showTip('会话过期，请重新登录', 2000);
+      // #145 R13：401 在这里**自己**收敛，不再指望调用方。renderChapter 有三个调用方，只有
+      // goto（895）收敛；另外两个是「静默重绘」路径 —— 重试按钮（284）与跨设备对账（814）都以
+      // `.catch(() => {})` 收尾，抛出去的 401 被吃掉：正文区已在上面清空（401 分支又在重试提示
+      // 之前 throw），用户看到的是空白正文 + 一句提示，人还困在阅读器里，点多少次「重试」都不会
+      // 成功。收敛放这里 = 三个调用方一次全覆盖（重复触发由 sessionExpired 幂等去重）；throw 保留，
+      // 供 goto/日志继续拿得到 401 这个事实。
+      sessionExpired();
       throw e;
     }
     // 等待期间用户已翻到别的章 / 换了书：本次失败作废（否则重试提示会盖在新章正文上）

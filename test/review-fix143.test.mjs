@@ -115,8 +115,18 @@ test('P1-3 深拷贝语义实证：冻结后改标题/删章都不影响本次�
 test('P1-3 上传在飞时预览行控件必须被禁用', () => {
   const src = read('public/js/upload/preview.js');
   assert.match(src, /function lockPreviewRows\(ul\)/, '缺少 lockPreviewRows');
-  const i = src.indexOf('if (upSession.isBusy()) lockPreviewRows(ul);');
-  assert.ok(i > 0, 'renderPreviewChapters 未在渲染完成后调用 lockPreviewRows');
+  // #145 R8 修订：判据从 isBusy()（含 _reading）改为「上传/导入在飞」。_reading 是**入场闸**，
+  // 而首次预览（prepareFile → runPreview，全程同步）恰好落在 _reading 窗口内：旧判据在这种情况
+  // 下把预览区锁上，finally 置回 _reading 后没有任何重绘 → 预览区从第一次选文件起永久只读
+  //（真机实测 16/16 恒锁）。行首锚定断言，避免注释里的同名词喂假绿/假红。
+  const ok = /^\s*if \(upSession\.isUploading\(\) \|\| upSession\.isImporting\(\)\) lockPreviewRows\(ul\);$/m.exec(src);
+  assert.ok(ok, 'renderPreviewChapters 必须按「上传/导入在飞」在渲染完成后调用 lockPreviewRows');
+  assert.doesNotMatch(
+    src,
+    /^\s*if \(upSession\.isBusy\(\)\) lockPreviewRows\(ul\);$/m,
+    '编辑闸不得复用 isBusy()（含 _reading → 首次预览发布后就地永久锁死）'
+  );
+  const i = ok.index;
   // 锁必须发生在所有行渲染之后（addLi 追加之后），否则一行都锁不到
   const before = src.slice(0, i);
   assert.ok(before.lastIndexOf('ul.appendChild(addLi);') > before.lastIndexOf('chs.slice(0, MAX_PREVIEW).forEach'),

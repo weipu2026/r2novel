@@ -221,8 +221,20 @@ async function boot() {
       books = [];
     }
   }
+  // #145 R10：世代快照必须取在 await **之前**。下面 loadShelf(data) 的 seq = ++shelfSeq 分配在
+  // 「响应到达之后」→ 若这段往返窗口里发生了 finishLogout（shelfSeq++）或新会话登录（doLogin →
+  // loadShelf → ++），响应回来时 ++ 出来的 seq 恰好追平当前世代、校验必然通过：前任会话的完整
+  // 书架会被写回 local.setShelfCache（**紧接着 finishLogout 的 clearAll 之后**）并 renderShelf，
+  // 共享设备上「打开页面秒显前任书架」的隐私缺口被重新打开，而且 showView('shelf') 还会把登录页
+  // 顶掉、直接展示前任的书。catch 分支同理会把刚登录成功的新会话一脚踢回登录页。
+  // 取快照 = 让「窗口内推进过任何一代」都能被下面两处判据发现。注意必须声明在 try **之外**：
+  // const 在 try 块里的话 catch 看不到它。
+  const seq0 = shelfSeq;
   try {
     const data = await api.books(); // 一次拉取，鉴权预检 + 首屏数据共用
+    // #145 R10：往返窗口内世代已推进（登出清痕迹 / 另一路 loadShelf / 新会话登录）→ 手上这份数据
+    // 属于前任会话，一律丢弃：既不写快照也不抢视图（否则登录页会被书架顶掉）。
+    if (seq0 !== shelfSeq) return;
     // ⚠️ 视图守卫（2026-10-15 用户实测两 BUG 同根）：books() 在飞期间用户可能已点书卡
     // 进入阅读页（有本地快照时书架秒开，窗口很大）——此处无条件 showView('shelf') 会：
     // ① 把人从阅读页踢回书架（「有时自动跳回首页」）；
@@ -237,6 +249,10 @@ async function boot() {
     await loadShelf(data);
     refreshPresetTags(); // 已确认登录 → 云端标签覆盖本地快照（打新标签/治理后 chips 跟进）
   } catch (e) {
+    // #145 R10：窗口内世代已推进 → 本次失败不再收敛。推进来自「新会话刚登录成功」时，这里再走
+    // 一遍 finishLogout 会把人踢回登录页（doLogin 已 showView('shelf') 并正在 loadShelf）；来自
+    // finishLogout 时本来就已经登出并清了痕迹，重复一遍纯属多余。
+    if (seq0 !== shelfSeq) return;
     // 走 finishLogout（而非裸 showView）：上面已把 snap 写进 books 并 renderShelf()，
     // 裸切视图会把上个会话的完整书架 + localStorage 快照留在登录页之后，登录成功瞬间
     // 还会闪一下上次的书架（2026-10-06 审计 P3，与 L18「登出清痕迹」同一出口）。

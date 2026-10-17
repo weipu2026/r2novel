@@ -225,8 +225,13 @@ function renderPreviewChapters() {
   // 上传/导入在飞 → 预览区整体只读：这些控件都会**就地改写** session.preview.chapters，而本次上传的
   // 正文正是在 await 窗口之后才读它 → 标题与正文错配、删章导致正文整体错位一格。集中在此锁（而非
   // 逐个控件加守卫），新增控件自动纳入（2026-10-06 审计 P1-3）。
+  // ⚠️ 判据只认「上传/导入在飞」，**不得**改回 isBusy()：#145 P2-7 把 _reading 并进 isBusy() 之后，
+  //    首次预览（prepareFile → runPreview，全程同步）恰好落在 _reading===true 的窗口内 → 这里锁上；
+  //    而 handleFiles 的 finally 置回 _reading 后**没有任何重绘** → 预览区从「第一次选文件」起就
+  //    永久只读（真机实测：立即 16/16 locked、稳态仍 16/16 locked，用户改不了标题也删不了章）。
+  //    _reading 是**入场闸**（拦新的会话入口，见 handleFiles/openUpload），编辑闸必须与它分离。
   // ⚠️ 必须放在**所有行渲染完之后**（addLi 之后）：提前调用时一行都还没建，锁不到任何东西。
-  if (upSession.isBusy()) lockPreviewRows(ul);
+  if (upSession.isUploading() || upSession.isImporting()) lockPreviewRows(ul);
   refreshPreviewStats();
   updateConfirmBtn();
 }

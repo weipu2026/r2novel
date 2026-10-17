@@ -60,11 +60,16 @@ test('P1-5 全量打开时按「本批真正需要的片数」计费（大库不
   const src = routerSrc();
   const i = src.indexOf('async function apiBatchBooks(');
   assert.ok(i > 0);
-  const body = src.slice(i, i + 4200);
+  const body = src.slice(i, src.indexOf('async function ', i + 100)); // 整段函数体（别用固定字符窗口）
   assert.match(body, /needShards/,
     '预算计费必须按目标实际所在片数（needShards），不能直接用 shardCount');
-  assert.match(body, /const extra = healthy \? 1 \+ \(needShards\.size > 0 \? needShards\.size : 1\) : 1 \+ h\.shardCount \+ 4;/,
-    '只有 root 健康时才退差；自愈路径必须按 4 + shardCount 全额计费（否则实测 53 > 50 越顶）');
+  // 第四轮审计（P1-5 的二次修正）：退差只在「真的一本就够、不需要全量读」时成立。只要有目标 id
+  // 不在 root.map 里，openIndex 就已经**全量读了 K 片**（开销真实发生）→ 必须按 1 + shardCount
+  // 计费。否则剩余预算虚高，大库（K≥35）的写操作整批撞 50 子请求硬顶 → 整批 500。
+  assert.match(body, /const needAll = !looksRoot\(root\) \|\| !batch\.every\(\(id\) => Number\.isInteger\(root\.map\[id\]\)\);/,
+    'needAll 必须按「目标 id 是否全在 root.map」判定，且**先判 looksRoot**（root 深度坏时是 null，直接取 .map 会抛）');
+  assert.match(body, /healthy\s*\?\s*needAll\s*\?\s*1 \+ h\.shardCount\s*:\s*1 \+ \(needShards\.size > 0 \? needShards\.size : 1\)\s*:\s*1 \+ h\.shardCount \+ 4/,
+    '三档计费：健康+已全量读→按实际读过的片数；健康+只需部分→退差；自愈（root 深度坏）→ 4 + shardCount 全额（否则实测 53 > 50 越顶）');
 });
 
 test('P1-5 retry 只在真自愈时置位（离架 id 导致的正常全量打开不是自愈）', () => {

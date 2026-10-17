@@ -1043,9 +1043,22 @@ export async function openIndex(store, opts = {}) {
       rootSrc = bak.text;
     }
   }
-  if (!root) {
+  // 判据必须是 looksRoot 而不是真值判断：root.json 里是「合法 JSON 但不是 root 形状」
+  //（如 []、{"v":2} 缺 map、误放的 v1 快照）时，tryParseJson 返回真值、上面 1038 的
+  // bak 回落也救不了（rb 同样不 looksRoot）—— 直接用这个假 root 会在 root.map[...] 上
+  // 抛 TypeError，所有 /api 一律 500，且没有任何写盘动作能让自愈链触发。
+  if (!looksRoot(root)) {
     // root 缺失（新装 / v1）→ 迁移；root 与 bak 双坏 → 由分片重建
-    if (rootRaw == null) return migrateV1(store);
+    if (rootRaw == null) {
+      // ⚠️ 第四轮审计：「root 缺失」不等于「从未迁移」。migrateV1 会**无条件覆盖 s0..sK**，
+      // 数据源是迁移时冻结的 meta/index.json —— 若迁移早已完成、之后又新增过书，而 root.json
+      // 被外部误删，重放迁移会把整库索引回滚到那一刻（新增条目全丢，正文还在但索引不认）。
+      // 反方向（root 在、分片全丢）有 resumeMigration 的「盘上无任何分片才动」保护，这一侧也必须
+      // 有对称守卫：v1Bak 存在 ⇒ 迁移发生过 ⇒ 走「由分片重建」（幂等，以盘上分片为真相）。
+      const v1bak = await getWithEtag(store, KEY_IDX.v1Bak);
+      if (v1bak) return rebuildIdxRoot(store);
+      return migrateV1(store);
+    }
     return rebuildIdxRoot(store);
   }
 
@@ -1618,10 +1631,16 @@ async function apiUpdateChapters(req, env, store, id) {
   // 阶段 A（副作用，只做一次）：先清一批孤儿正文释放 key 空间。删除幂等；清不掉的会留在
   // sweptA.left 里，由下面的变换**避让它们的 key**——否则新章正文会被后续 sweep 当成孤儿删掉，
   // 而章表仍引用它们 → 阅读 404（#139 实测：60 章 replace 成 10 章后直接 append 50 章，丢 24 章）。
-  // replace 的候选 = 已登记的孤儿 ∪ 被新表挤掉的旧章（都排除新表仍在用的 key）。
+  // replace 的候选 = **仅**已登记的孤儿（被新表挤掉的旧章不在此清理，见下方 ⚠️）。
   const newKeySet = op === 'append' ? null : new Set(chapters.map((_, i) => String(i + 1)));
+  // ⚠️ 第四轮审计 P1：这里**绝不能**把「被新表挤掉的旧章」放进待删集合。删除是副作用，
+  // 而 CAS（mutateMeta，下方阶段 C）随时可能因并发冲突返回 409 —— 那时章表一个字都没改、
+  // 仍引用着这些 key，正文却已被物理删掉（R2 删除不可逆）→ 书显示 N 章、点开 404，
+  // 而用户只看到一句「并发冲突，请重试」。
+  // 正确做法：只清**已登记**的孤儿；被新表挤掉的旧章由阶段 C 的 cand 登记进 mm.orphans
+  // （CAS 成功后才落盘），再由 publish / apiBookMeta 的惰性清扫删除。与 #144 P3 在
+  // apiDeleteChapter 里「删正文挪到 CAS 之后」是同一条纪律。
   const preKeys = new Set(Array.isArray(meta.orphans) ? meta.orphans : []);
-  if (newKeySet) for (const c of oldCh) if (!newKeySet.has(c.key)) preKeys.add(c.key);
   // 活键 = 清完后**仍会被章表引用**的 key：append=现有章（一本都不删）；replace=新表 key。
   // 传给 sweepOrphansBatch 让「活键防御」在这条路径也生效（F2，见该函数注释）。
   const sweepLive = newKeySet ? Array.from(newKeySet) : oldCh.map((c) => c.key);
@@ -2545,7 +2564,18 @@ async function apiBatchBooks(req, store) {
       if (Number.isInteger(n)) needShards.add(n);
     }
     const healthy = looksRoot(root);
-    const extra = healthy ? 1 + (needShards.size > 0 ? needShards.size : 1) : 1 + h.shardCount + 4;
+    // ⚠️ 第四轮审计：健康 root 但**有目标 id 不在 map** 时，上面的 openIndex 走的是**全量**模式
+    // （1 + K 次读已经真实发生），而这里只按 needShards 计费 → 已花的 K 次读被当成没花，
+    // 剩余预算虚高 → 大库（K≥35）时整批写操作撞 50 子请求硬顶 → 整批 500。
+    // 「退差」只在**真的一本就够、不需要全量读**的场景才成立；既然已经全量读了，就必须按实际计费。
+    // ⚠️ root **深度坏**（raw 解析失败）时 root 为 null → 直接 `root.map[id]` 抛 TypeError，
+    // 整批 500。而这条路径正是「自愈轮」——最不能挂的地方。先判 looksRoot 再取 map。
+    const needAll = !looksRoot(root) || !batch.every((id) => Number.isInteger(root.map[id]));
+    const extra = healthy
+      ? needAll
+        ? 1 + h.shardCount
+        : 1 + (needShards.size > 0 ? needShards.size : 1)
+      : 1 + h.shardCount + 4;
     // rebuilt 只在「root 深度坏、被 rebuildIdxRoot 确定性重建」时为真。openIndex 对健康 root
     // 也可能因目标不在 map 而全量打开（extra>0 但没重建）——那不是自愈（2026-10-06 审计 P1-5）
     return { root: h.root, raw: null, rootEtag: null, extra, handle: h, rebuilt: !looksRoot(root) };
@@ -3068,6 +3098,8 @@ async function doDiagScan(store, textCursor = '') {
   const residue = [];
   const chapterOrphans = [];
   const orphanBooks = [];
+  // #146 P3-5：清单被截断时「无法判断归属」的对象进这里（只展示，前端不提供一键删除）
+  const unverified = [];
 
   // 分前缀并发 list：meta/raw/progress 是「书数级」对象（每本各 1 个，千本各 1 页）→
   // 给足预算保证无主书/已删残留永远完整；text/ 是「章数级」大头（每章 1 个，3 万章 = 30 页
@@ -3098,6 +3130,12 @@ async function doDiagScan(store, textCursor = '') {
   ]);
   budget.used += lMeta.pages + lRaw.pages + lProg.pages + lText.pages;
   if (lMeta.truncated || lRaw.truncated || lProg.truncated) budget.incomplete = true;
+  // #146 P3-5：meta/ 清单被截断 ⇒ orphanSet（无主书 id 集合）不完整 ⇒「不在索引里」不再等价于
+  // 「没有主」。典型误判：一本 creating 态的书（有 meta/raw/text 却还没进索引），若它的 meta 恰好
+  // 落在被截掉的那一页之后，它的原件与正文就会被当成「可直接删的残留」，被「删除全部」永久抹掉 ——
+  // 而无主书本该走「移入回收站」保全正文。这类只能进 unverified：展示出来，但不给批量删除入口。
+  const pushResidue = (o) =>
+    (lMeta.truncated ? unverified : residue).push({ key: o.key, size: o.size });
 
   // meta/{id}.json → 无主书（系统 meta 文件排除）。候选先收集、预算内批量并发回读：
   // 预算尽则剩余标 unknown（宁漏勿错），已允许的并发一次读完（RTT 从串行 N 次降到一次）。
@@ -3149,7 +3187,7 @@ async function doDiagScan(store, textCursor = '') {
           ob.textBytes = (ob.textBytes || 0) + items.reduce((s, x) => s + x.size, 0);
         }
       } else {
-        for (const it of items) residue.push({ key: it.key, size: it.size });
+        for (const it of items) pushResidue(it);
       }
       continue;
     }
@@ -3186,19 +3224,21 @@ async function doDiagScan(store, textCursor = '') {
   // raw/{id}.txt、progress/{id}.json → 无主残留（书数级前缀已完整列出，不存在截断漏检）
   for (const o of lRaw.objects) {
     const id = o.key.slice('raw/'.length).replace(/\.(txt|json)$/, '');
-    if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
+    if (!live.has(id) && !orphanSet.has(id)) pushResidue(o);
   }
   for (const o of lProg.objects) {
     const id = o.key.slice('progress/'.length).replace(/\.(txt|json)$/, '');
-    if (!live.has(id) && !orphanSet.has(id)) residue.push({ key: o.key, size: o.size });
+    if (!live.has(id) && !orphanSet.has(id)) pushResidue(o);
   }
 
-  const summary = { residue: residue.length, orphanBooks: orphanBooks.length, chapterOrphans: chapterOrphans.length };
+  const summary = { residue: residue.length, orphanBooks: orphanBooks.length, chapterOrphans: chapterOrphans.length, unverified: unverified.length };
   return json({
     scannedAt: Date.now(),
     liveBooks: live.size,
     summary,
     residue,
+    // 未能核验（清单截断）：只展示，不参与任何批量删除
+    unverified,
     orphanBooks,
     chapterOrphans,
     // text/ 下一窗的续扫游标：null = text/ 已扫完。前端循环带上它续调，直到 null，
@@ -3206,7 +3246,7 @@ async function doDiagScan(store, textCursor = '') {
     textCursor: lText.cursor || null,
     scannedPages: lText.pages,
     skippedBooks,
-    incomplete: budget.incomplete || skippedBooks > 0,
+    incomplete: budget.incomplete || skippedBooks > 0 || unverified.length > 0,
   });
 }
 
@@ -3626,6 +3666,12 @@ async function handleApi(req, env, store, url, p) {
   if (mCh && req.method === 'GET') return apiChapter(store, mCh[1], mCh[2]);
   if (mCh && req.method === 'PATCH') return apiPatchChapter(req, env, store, mCh[1], mCh[2]);
   if (mCh && req.method === 'DELETE') return apiDeleteChapter(store, mCh[1], mCh[2]);
+  if (mCh) {
+    // 第四轮审计：其余子路由（/chapters、/insert、/bulk、/raw、/publish、/trash/:id…）都有
+    // 405 兜底，只有这里漏了 → POST 会穿透到末尾的 404，客户端把「方法不对」读成「端点不存在」。
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
 
   const mBook = /^\/api\/books\/([^/]+)$/.exec(p);
   if (mBook && !isSafeId(mBook[1])) {

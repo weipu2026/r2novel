@@ -152,25 +152,79 @@ test('审计：append 传负数 wordCount —— 总字数夹到 ≥0，不写�
   assert.equal(meta2.wordCount, Math.max(0, meta.wordCount) + 10, '夹取后增量累加仍准确');
 });
 
-test('审计：replace 章节数变少 —— 孤儿正文先清一批、publish 清完、meta 不残留', async () => {
+test('审计：replace 章节数变少 —— 旧正文不在 CAS 前删，只登记孤儿、惰性清空', async () => {
   const store = memStore();
   const cookie = await login(store);
   const { id } = await makeBook(store, cookie, '缩水书', 45); // 原 45 章（key 1..45）
+  const r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'replace', chapters: ['新的一章'] } }));
+  assert.equal(r.status, 200);
+  // 第四轮审计 P1：被新表挤掉的旧章**绝不在 CAS 之前物理删除**。R2 删除不可逆，而 mutateMeta 随时
+  // 可能因并发冲突返回 409 —— 那时章表一个字都没改、仍引用这些 key，正文却已没了（书显示 45 章、
+  // 点开 404，用户只看到一句「并发冲突，请重试」）。改为 CAS 成功后登记孤儿、由惰性清扫兜底。
+  for (const k of [2, 25, 26, 45]) assert.ok(store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 不得在 CAS 前删除`);
+  const raw = JSON.parse(store._map.get(`meta/${id}.json`));
+  assert.equal(raw.orphans.length, 44, '2..45 共 44 章应全部登记为孤儿');
+  assert.ok(!raw.orphans.includes('1'), '仍被章表引用的 key 不得登记为孤儿');
+  // replace 把 status 打回 creating（publish 前不可读）→ 此刻目录 GET 是 409，惰性清扫根本跑不到。
+  // 正因为清不掉，才更不能在 CAS 前删：没发布的中间态可能一直挂着，甚至被 409 打断后永远不发布。
+  const g = await call(store, req(`/api/books/${id}`, { cookie }));
+  assert.equal(g.status, 409, 'replace 后到 publish 前不可读');
+  for (let k = 1; k <= 45; k++) assert.ok(store._map.has(`text/${id}/${k}.txt`), `章 ${k} 的正文一个都不该少`);
+});
+
+test('审计：replace 撞 CAS 冲突 409 → 45 章正文逐章仍可读（正文绝不能先于 CAS 落盘/删除）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeBook(store, cookie, '冲突书', 45);
+  const metaKey = `meta/${id}.json`;
+  const origIf = store.putTextIf.bind(store);
+  // 让 meta CAS 永远失败：并发方持续改无关字段推进版本号 → mutateMeta 重试耗尽 → 409
+  store.putTextIf = async (k, s, etag) => {
+    if (k === metaKey) {
+      const cur = JSON.parse(await store.getText(k));
+      cur.note = '并发方';
+      await origIf(k, JSON.stringify(cur), undefined);
+      return null;
+    }
+    return origIf(k, s, etag);
+  };
+  let status = 0;
+  try {
+    const r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'replace', chapters: ['新的一章'] } }));
+    status = r.status;
+  } finally {
+    store.putTextIf = origIf;
+  }
+  assert.equal(status, 409, 'CAS 重试耗尽应当 409（用户会原样重试）');
+  // 关键：409 之后盘面必须仍然自洽 —— 章表没变（45 章）、正文也一个都不能少
+  for (let k = 1; k <= 45; k++) assert.ok(store._map.has(`text/${id}/${k}.txt`), `章 ${k} 的正文不得因 409 丢失`);
+  const g = await call(store, req(`/api/books/${id}/chapters/2`, { cookie }));
+  assert.equal(g.status, 200, '409 之后老章仍必须可读（旧实现此刻 24 章已 404）');
+});
+
+test('审计：replace 成功路径的 publish 只清已登记孤儿，且不残留 orphans 字段', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeBook(store, cookie, '缩水发布书', 30);
   let r = await call(store, req(`/api/books/${id}/chapters`, { method: 'POST', cookie, body: { op: 'replace', chapters: ['新的一章'] } }));
   assert.equal(r.status, 200);
-  // updateChapters 当场清一批（24 个）：key 2..25 应被删，26..45 留待惰性
-  for (const k of [2, 25]) assert.ok(!store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应在首批被删`);
-  for (const k of [26, 45]) assert.ok(store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应留待下一批`);
   await call(store, req(`/api/books/${id}/chapters/1`, { method: 'PUT', cookie, body: '新正文' }));
   r = await call(store, req(`/api/books/${id}/publish`, { method: 'POST', cookie }));
   assert.equal(r.status, 200);
-  // publish 清剩余一批：42..45 全没了
-  for (const k of [42, 43, 44, 45]) assert.ok(!store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应在 publish 时清掉`);
   const meta = JSON.parse(store._map.get(`meta/${id}.json`));
-  assert.ok(!('orphans' in meta), 'meta 不应残留 orphans 字段');
-  r = await call(store, req(`/api/books/${id}`, { cookie }));
-  assert.equal(r.status, 200);
-  assert.ok(!('orphans' in r.data), 'bookMeta 响应不应暴露 orphans');
+  assert.equal(meta.status, 'ready');
+  assert.equal(meta.chapterCount, 1, '章表应是新的 1 章');
+  // publish 清一批（24 个）：2..25 没了；剩下的继续登记，靠目录 GET 续清
+  for (const k of [2, 25]) assert.ok(!store._map.has(`text/${id}/${k}.txt`), `孤儿章 ${k} 应在 publish 时清掉`);
+  assert.ok(store._map.has(`text/${id}/30.txt`), '孤儿章 30 应留待惰性清扫（不越预算）');
+  let rounds = 0;
+  for (; rounds < 8; rounds++) {
+    await call(store, req(`/api/books/${id}`, { cookie }));
+    if (!('orphans' in JSON.parse(store._map.get(`meta/${id}.json`)))) break;
+  }
+  const last = JSON.parse(store._map.get(`meta/${id}.json`));
+  assert.ok(!('orphans' in last), '清空后不应残留 orphans 字段');
+  assert.ok(store._map.has(`text/${id}/1.txt`), '在用的新章正文不能丢');
 });
 
 test('审计：进度镜像 —— 书不在架不写索引分片；位置无变化跳过分片重写', async () => {

@@ -357,13 +357,18 @@ test('B-R4 apiPublish：两处 409 前 putStatus ready + 终判 readIndex try/ca
   const body = src.slice(p, src.indexOf('\nasync function', p + 10));
   const syncs = body.match(/putStatus\(store, id, 'ready'\)\.catch\(\(\) => \{\}\)/g) || [];
   assert.ok(syncs.length >= 2, 'trash2 复检与 clash 两个 409 出口前都要同步副档');
-  // lastIndexOf 锁定**复检**那一处（入口快照检查的文案逐字相同但位于所有 putStatus 之前）
-  const trash409 = body.lastIndexOf('该书在回收站中，请先恢复再发布');
+  // ⚠️ #145 R9 后同一文案的 409 出口变成 3 处（入口快照 / trash2 复检 / 重放被回收站拒绝），
+  // 原来的「lastIndexOf = 复检那一处」启发式随之失准（会指到函数末尾的新出口）。
+  // 改为**结构锚点**定位：先找到 trash2 那次读，再核它那一小段里的 409 与副档同步写序。
+  const t2 = body.indexOf('const trash2 = await readTrash(store)');
+  assert.ok(t2 > 0, '找不到 trash2 复检');
+  const t2Blk = body.slice(t2, t2 + 700);
+  const t2msg = t2Blk.indexOf('该书在回收站中，请先恢复再发布');
+  assert.ok(t2msg > 0, 'trash2 复检命中时必须 409');
+  const t2sync = t2Blk.lastIndexOf("putStatus(store, id, 'ready')", t2msg);
+  assert.ok(t2sync > 0 && t2sync < t2msg, 'trash2 复检 409 之前要同步副档');
   const clash409 = body.indexOf('书架已有同名');
-  assert.ok(trash409 > 0 && clash409 > trash409, '写序：trash2 复检在 upsert/同名终判之前');
-  // lastIndexOf 限定在 409 返回语句之前：写序必须是「先同步副档 → 再 409」。
-  // 直白 indexOf 会被函数上方注释里的 putStatus 预算账文字喂错位置，故取「之前最近的一次调用」。
-  assert.ok(body.lastIndexOf("putStatus(store, id, 'ready')", trash409) > trash409 - 400, 'trash2 复检 409 之前要同步副档');
+  assert.ok(clash409 > t2, '写序：trash2 复检在 upsert/同名终判之前');
   assert.ok(body.lastIndexOf("putStatus(store, id, 'ready')", clash409) > clash409 - 400, 'clash 409 之前要同步副档');
   assert.match(body, /let full = null;\s*\n\s*try \{\s*\n\s*full = await readIndex\(store\);/, '全量读必须 try/catch（瞬时抖动 fail-open）');
   assert.match(body, /if \(full\) \{/, '读失败 → full 保持 null → 跳过终判');

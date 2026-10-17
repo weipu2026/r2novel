@@ -485,11 +485,38 @@ const readIndex = (store) => openIndex(store).then((h) => ({ books: h.books }));
 // 就已无预算干活（diag room=0、purge deleted=0、tags updated=0）。41 片 ≈2.05 万本：
 // 超限的端点先探 root（1 次读）再决定，报 409 + 可操作指引，而不是 502/500 或死循环续调。
 const IDX_SHARD_CAP = 40;
-/** 探测 root 分片数是否超熔断线。返回超限时的分片数（0 = 未超限 / root 缺失或损坏）。 */
-async function shardCapExceeded(store) {
-  const probe = await getWithEtag(store, KEY_IDX.root).catch(() => null);
-  const r = tryParseJson(probe && probe.text);
-  return looksRoot(r) && Number(r.shards) > IDX_SHARD_CAP ? Number(r.shards) : 0;
+/** 探测 root 声明的分片数（1 次读，**不读分片**）。给「熔断判据必须在全量读之前」的端点用。
+ * 返回 { shards, opts }：
+ *   · shards = 分片数；探不出（读失败 / 缺失 / 双坏）→ 0 = 「未知」→ 调用方按未超限继续，交给
+ *     openIndex 自己的自愈链（bak → 由分片重建）去处理；
+ *   · opts 可直接喂给 openIndex(store, opts) 复用这次读（省 1 子请求）。**读失败时是 undefined**：
+ *     那种情况下 rootRaw=null 只表示「没读到」，当成「root 不存在」喂进去会让 openIndex 误判成
+ *     新装库去 migrateV1（把 v2 分片库当 v1 重迁）—— 所以宁可不复用。
+ *   #145 R11：原实现（只认主 root、探不出即 fail-open 返回 0）在 root 损坏时会让熔断线彻底失效，
+ *   而 root 损坏恰恰是要走「由分片重建」→ 必然全量读分片的最坏场景。故这里补一次 bak 兜底，
+ *   只为拿分片数这个判据；内容仍由 openIndex 统一走它自己的 bak/重建语义，不在这里复述。 */
+async function probeIdxRoot(store) {
+  let probe;
+  try {
+    probe = await getWithEtag(store, KEY_IDX.root);
+  } catch {
+    return { shards: 0, opts: undefined }; // 读失败：不复用、不判超限（别把「没读到」当「不存在」）
+  }
+  const raw = probe ? probe.text : null;
+  const opts = { rootRaw: raw, rootEtag: probe ? probe.etag : null };
+  const root = raw != null ? tryParseJson(raw) : null;
+  if (looksRoot(root)) return { shards: Number(root.shards), opts };
+  const bak = await getWithEtag(store, KEY_IDX.rootBak).catch(() => null);
+  const rb = bak ? tryParseJson(bak.text) : null;
+  return { shards: looksRoot(rb) ? Number(rb.shards) : 0, opts };
+}
+
+/** 探测 root 分片数是否超熔断线。返回超限时的分片数（0 = 未超限 / 探不出）。
+ * cap 默认是全站熔断线；个别端点自己的预算判据更松/更紧时按自己那条传（见 apiTagsMerge /
+ * apiPurgeOrphans —— 探针只负责把**该端点的既有判据**前移，不改变判据本身）。 */
+async function shardCapExceeded(store, cap = IDX_SHARD_CAP) {
+  const p = await probeIdxRoot(store);
+  return p.shards > cap ? p.shards : 0;
 }
 
 const readTrash = (store) =>
@@ -736,8 +763,11 @@ function makeHandle(store, root, shards, opts = {}) {
      * replay:false → 撞 CAS 冲突不自己重放，直接抛给调用方（全量模式端点用，见 apiTagsMerge）。
      * replay: 数字 → 最多自己重放几次（预算敏感端点用，见 apiBatchBooks）。默认 2 次；重放次数
      *   直接决定子请求上界，所以预留了重放开销的调用方必须把它限死，预留才是精确值。
-     * 返回 { skipped:[id...] }：重放时被跳过（书已被并发删除）的 patch id，供调用方修正计数。 */
-    async save({ bak = true, replay = true, attempt = 0 } = {}) {
+     * allowUpsert: async (id)=>bool —— **只在重放路径**上问一次「这条 upsert 还该落盘吗」。重放跑在
+     *   CAS 冲突之后，比首次写又多出一整段 RTT 窗口，期间盘面可能已变到「不该再上架」（apiPublish 的
+     *   回收站复检过去正是被这段窗口绕过的）。返回 false → 该 id 计入 skipped，不写盘（#145 R9）。
+     * 返回 { skipped:[id...] }：重放时被跳过（书已被并发删除 / 被 allowUpsert 否决）的 patch|upsert id。 */
+    async save({ bak = true, replay = true, attempt = 0, allowUpsert = null } = {}) {
       try {
         await saveOnce(bak);
       } catch (e) {
@@ -748,8 +778,14 @@ function makeHandle(store, root, shards, opts = {}) {
         const again = await openIndex(store, reopenOpts());
         const skipped = [];
         for (const o of opLog) {
-          if (o.op === 'upsert') again.upsert(o.id, o.entry);
-          else if (o.op === 'patch') {
+          if (o.op === 'upsert') {
+            // #145 R9：重放的 upsert 是**无条件上架**（patch 有 again.get 守卫、remove 幂等，只有它会
+            // 把不在架的书加回去）。它跑在 CAS 冲突之后 —— publish 的两处回收站复检全在这之前，
+            // 拦不到这段窗口 → 并发软删的书会被「复活」成在架+回收站双态，随后 purgeOnce 删掉在架书。
+            // 由调用方带 allowUpsert 复检（publish 传回收站检查）；否决即计入 skipped。
+            if (allowUpsert && !(await allowUpsert(o.id))) skipped.push(o.id);
+            else again.upsert(o.id, o.entry);
+          } else if (o.op === 'patch') {
             // 重放时书可能已被并发软删（新盘面的 map 里没有它）——patch 对不在架的书会抛
             // 非冲突错误 → 500。软删语义已吸收这次改动，跳过即可（2026-09-17 复查 F2）。
             if (again.get(o.id)) again.patch(o.id, o.fn);
@@ -757,7 +793,7 @@ function makeHandle(store, root, shards, opts = {}) {
           } else again.remove(o.id);
         }
         // replay 必须带下去：否则嵌套那层用默认的 2 次重放，限次形同虚设（实测会多写一次 root）
-        const sub = await again.save({ bak, replay, attempt: attempt + 1 });
+        const sub = await again.save({ bak, replay, attempt: attempt + 1, allowUpsert });
         // 本 handle 的待落盘改动已由 again 那份落盘 → 清空，免得再次 save 拿旧内存态覆盖回去
         dirty.clear();
         rootDirty = false;
@@ -1844,7 +1880,23 @@ async function apiPublish(req, env, store, id) {
   idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog }));
   // 两个互不依赖的写并行：状态副档 ∥ 索引（脏分片 + bak + root 如有成员变化）。
   // 任一写失败的后果与原「副档先行」分析同类：可读/409 短暂不一致，重试发布即愈合
-  await Promise.all([putStatus(store, id, 'ready'), idx.save({ bak: true })]);
+  // #145 R9：save 撞 CAS 冲突会自己重放（默认最多 2 次），而重放的 upsert 是无条件上架 ——
+  // 上面两处 trash 复检**都在这段窗口之前**。allowUpsert 让重放前再复检一次回收站：命中就不写盘，
+  // 书留在回收站（不会双态）。成本只在「撞冲突」这条并发彩票路径上多 1 读 + 1 读 trash，
+  // 下面 49 的账面（不含重放开销，见上）不受影响。
+  const [, saved] = await Promise.all([
+    putStatus(store, id, 'ready'),
+    idx.save({
+      bak: true,
+      allowUpsert: async () => !(await readTrash(store).catch(() => ({ books: [] }))).books.some((b) => b.id === id),
+    }),
+  ]);
+  if (saved && Array.isArray(saved.skipped) && saved.skipped.includes(id)) {
+    // 重放期间书进了回收站：索引里没有它（无副本可对齐），meta.status 却已在 CAS 里写成 ready。
+    // 与上面两处 409 同一处理：先把副档对齐 meta（否则「目录能开、每章 409」），再按在回收站拒绝。
+    await putStatus(store, id, 'ready').catch(() => {});
+    return json({ error: '该书在回收站中，请先恢复再发布' }, 409);
+  }
   const tWrite = Date.now() - T2;
   // 不再回传 books 快照（见上：为它做全量读会在 2 万本量级撞 50 子请求硬顶）。前端 upload.js /
   // upload/files.js 两处都有 `if (pub.books) … else loadShelf()` 兜底，新旧前后端任意组合都安全。
@@ -2667,10 +2719,19 @@ async function apiTagsMerge(req, store) {
   if (!from) return json({ error: '请指定要处理的标签' }, 400);
   if (to && to === from) return json({ error: '源标签与目标相同' }, 400);
 
-  const idx = await openIndex(store);
+  // #145 R11：熔断判据必须在**全量读之前**。原实现先 openIndex（1+K 读）再判 1+K+4>48 —— 判超限时
+  // 已经把 1+K 个子请求烧在「马上要拒绝」的那次读上（K=44 时 45 读，白烧）。先探 root（1 读）拿同一个
+  // 判据：超限立刻 409；未超限把这次读的 rootRaw/rootEtag 喂回 openIndex，净开销与原来一致。
+  const probe = await probeIdxRoot(store);
+  if (1 + probe.shards + 4 > 48) {
+    return json({ error: `书库分片过多（${probe.shards} 片），标签合并超出单请求预算，请稍后重试` }, 409);
+  }
+  const idx = await openIndex(store, probe.opts);
   // #145 P3-1：1+K+4 > 48 时连一本都装不下（每本 2 + 每脏片 2 的最低开销）→ updated 恒 0。
   // 原实现返回 ok+updated:0+remaining:N，前端零进展守卫每轮仍要白跑一次全库扫描。
   // 超限明确报错，让前端立刻停。
+  // ⚠️ 这条**留着**（不是死代码）：探针复用失败时（root 读失败 → shards 未知 → 按未超限放行）
+  // 只有这里能拿到权威的 idx.shardCount 兜底。
   if (1 + idx.shardCount + 4 > 48) {
     return json({ error: `书库分片过多（${idx.shardCount} 片），标签合并超出单请求预算，请稍后重试` }, 409);
   }
@@ -3161,13 +3222,21 @@ async function apiPurgeOrphans(req, store) {
   const ok = keys.filter((k) => /^(?:text|raw|progress)\/[^/]/.test(k) && !/\.\./.test(k));
   if (!ok.length) return json({ error: '没有可删除的合法对象' }, 400);
 
-  const idx = await openIndex(store); // 全量：root + K 分片
+  // #145 R11：与 apiTagsMerge 同一处问题 —— 熔断判据（2+K ≥ 45）也必须在全量读之前。先探 root
+  // （1 读）：超限立刻 409，不再白烧 1+K；未超限把这次读喂回 openIndex，净开销与原来一致。
+  // cap 用 DIAG_SUB_BUDGET - 3：本端点判据是「2 + K ≥ B」⇔「K > B-3」，与下面那条逐一对应。
+  const probe = await probeIdxRoot(store);
+  if (probe.shards > DIAG_SUB_BUDGET - 3) {
+    return json({ error: `书库分片过多（${probe.shards} 片），本次无法在请求预算内完成清理，请稍后重试` }, 409);
+  }
+  const idx = await openIndex(store, probe.opts); // 全量：root + K 分片（root 那次读复用上面的探针）
   const index = { books: idx.books };
   const trash = await readTrash(store);
   const live = new Set([...(index.books || []), ...(trash.books || [])].map((b) => b.id));
   let used = 2 + idx.shardCount; // 已读 root+分片 + trash
   // #145 P3-1：2+K ≥ 删除预算（45）时本端点不可能有进展 —— 原实现会把全部对象原样回传
   // deferred，前端续调循环每轮一次全库扫描却 deleted=0（K≥43 起白烧 60 轮）。明确报错。
+  // ⚠️ 同样留着做权威兜底（探针读失败 → shards 未知 → 上面放行，这里才拿得到真值）。
   if (used >= DIAG_SUB_BUDGET) {
     return json({ error: `书库分片过多（${idx.shardCount} 片），本次无法在请求预算内完成清理，请稍后重试` }, 409);
   }
@@ -3431,7 +3500,14 @@ async function handleApi(req, env, store, url, p) {
     return json({ error: 'unauthorized' }, 401);
   }
 
-  if (p === '/api/logout' && req.method === 'POST') return apiLogout(req);
+  // #145 R12：POST 之外的 method 必须显式 405。原写法把条件写成「p === … && method === 'POST'」，
+  // 其他 method 不匹配就**穿过整条路由链**落到末尾的 404（客户端拿到的是「没有这个端点」，
+  // 而不是「方法不对」）。与 P3-9 的口径对齐：子路由 method 不匹配一律 405。
+  if (p === '/api/logout') {
+    if (req.method === 'POST') return apiLogout(req);
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
 
   if (p === '/api/books') {
     if (req.method === 'GET') return apiBooks(store, env);
@@ -3477,6 +3553,12 @@ async function handleApi(req, env, store, url, p) {
   }
   if (mRaw && req.method === 'PUT') return apiPutRaw(req, env, store, mRaw[1]);
   if (mRaw && req.method === 'GET') return apiRawGet(store, mRaw[1]);
+  // #145 R12：同上 —— PUT/GET 之外（POST / DELETE / PATCH…）原来会穿到末尾的 404；补上本子路由
+  // 的 405 出口（/publish、/restore、/chapters 等分支都有，这两个漏了）。
+  if (mRaw) {
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
 
   const mPublish = /^\/api\/books\/([^/]+)\/publish$/.exec(p);
   if (mPublish && !isSafeId(mPublish[1])) {

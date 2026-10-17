@@ -132,7 +132,9 @@ test('P3 后端：进度迁移在 CAS 后 / 删章正文在 CAS 后 / tagsMerge 
 test('P3 前端：finishLogout 收敛阅读器 / exitBatchMode 不闪现 / placeSheet 防脱锚', () => {
   const app = read('public/js/app.js');
   const f = app.indexOf('async function finishLogout()');
-  const fBody = app.slice(f, f + 1600);
+  const fEnd = app.indexOf('function expireSession()', f); // 整段函数体（固定字符窗口会被新增注释击穿）
+  assert.ok(f > 0 && fEnd > f, '找不到 finishLogout 的边界锚点（expireSession）');
+  const fBody = app.slice(f, fEnd);
   assert.match(fBody, /reader\.closeReader\(\);\s*\n\s*closeModal\(\);/, 'finishLogout 必须先收敛阅读器');
   const e = app.indexOf('function exitBatchMode(');
   const eBody = app.slice(e, e + 400);
@@ -157,8 +159,10 @@ test('P3 reader：closeReader 清正文区；inflight 收尾只删仍属于自�
 test('P3 cleaner：joinSoft 英文补空格；utf-16 候选 replaced 整篇口径', () => {
   const src = read('public/js/cleaner.js');
   assert.match(src, /buf \+ ' ' \+ line : buf \+ line;/, '英文词间断行必须补空格');
-  const i = src.indexOf("for (const lab of ['utf-16le', 'utf-16be'])");
-  const body = src.slice(i, i + 700);
+  // 锚点跟着实现走：改为候选数组声明处（#146 P1-2 给候选加了字节闸门，for 头已不再是字面量数组）
+  const i = src.indexOf('const utf16Cands =');
+  assert.ok(i > 0, '找不到 utf-16 候选数组声明');
+  const body = src.slice(i, i + 1200);
   assert.match(body, /countReplaced\(decodeText\(bin, lab\)\)/, 'utf-16 候选门槛必须用整篇 replaced');
 });
 

@@ -205,6 +205,41 @@ test('编码：无 BOM 的 UTF-16LE 可被启发式识别', () => {
   assert.ok(r.text.includes('第一章'));
 });
 
+test('编码：无 BOM 的 UTF-16BE 同样可识别（闸门的正向对照：别把真 UTF-16 一起挡掉）', () => {
+  const le = Buffer.from('第一章 相遇\n他醒了。\n第二章 离别\n她走了。', 'utf16le');
+  const be = Buffer.alloc(le.length);
+  for (let i = 0; i < le.length; i += 2) {
+    be[i] = le[i + 1];
+    be[i + 1] = le[i];
+  }
+  const r = detectEncoding(new Uint8Array(be));
+  assert.equal(r.encoding, 'utf-16be');
+  assert.ok(r.text.includes('第一章'));
+});
+
+test('编码：纯 ASCII 不得被 UTF-16 兜底抢走（#146 P1-2 字节闸门）', () => {
+  // 实测旧实现：纯 ASCII 按 UTF-16 配对解码会把两两 ASCII 拼成 CJK 假汉字（'a','b' → U+6261），
+  // cjk 占比≈100 → 得分 91~100 且零替换符 → 旧门槛 score≥60 全数穿透 → 整本乱码入库。
+  const cases = [
+    'hello world, this is plain ascii text with punctuation.',
+    'abcdefghijklmnopqrstuvwxyz0123456789 '.repeat(2000), // 约 76KB，贴近 96KB 样本口径
+    'a'.repeat(100000), // 超样本长度：断言只在样本上判闸门也不会漏
+  ];
+  for (const text of cases) {
+    const r = detectEncoding(new Uint8Array(Buffer.from(text, 'ascii')));
+    assert.equal(r.encoding, 'utf-8', `纯 ASCII 必须判 utf-8（长度 ${text.length}）`);
+    assert.equal(r.text, text, '正文必须原样，不能是假汉字');
+    assert.equal(r.replaced, 0);
+  }
+});
+
+test('编码：ASCII 里掺少量 UTF-8 中文，仍判 utf-8（闸门不误伤混合文本）', () => {
+  const text = ('plain english line.\n'.repeat(200)) + '第一章 相遇\n他醒了。\n';
+  const r = detectEncoding(new Uint8Array(Buffer.from(text, 'utf8')));
+  assert.equal(r.encoding, 'utf-8');
+  assert.ok(r.text.includes('第一章'));
+});
+
 /* 2 章 GBK 样本（码位手工核验）：'第一章 中文\n这是测试。\n第二章 小字\n这是测试。'
  *   第B5DA 一D2BB 章D5C2 空格20 中D6D0 文CEC4 \n0A
  *   这D5E2 是CAC7 测B2E2 试CAD4 。A1A3 \n0A

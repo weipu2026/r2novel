@@ -19,7 +19,10 @@ import { MAX_CHAPTER_BYTES, MAX_UPLOAD_BYTES } from '../public/js/shared-const.j
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC = path.join(ROOT, 'public');
-const DATA = process.env.R2NOVEL_DATA || path.join(ROOT, 'data-dev');
+// ⚠️ 必须 resolve 成绝对路径：调用方传 `R2NOVEL_DATA=./x`（带 ./ 前缀）时，path.join 会把
+// 前缀规整掉，而下面 keyPath 的越界判据用的是**未规整**的 `DATA + path.sep` → 永不命中 →
+// 每个 key 都抛「key 越界」，建书/传章/索引迁移全 500（冒烟 12 项全红，且报错完全指错方向）。
+const DATA = path.resolve(process.env.R2NOVEL_DATA || path.join(ROOT, 'data-dev'));
 const PORT = Number(process.env.PORT) || 8088; // 复查 P2-4：与门禁 ENV PARSE 判据一致（非数字串回落默认）
 
 /* ---- 读取 .dev.vars（如有），用真实 ADMIN_PASSWORD/SESSION_SECRET 模拟线上 ---- */

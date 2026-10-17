@@ -38,6 +38,11 @@ loadDevVars();
 const BASE = process.env.SMOKE_BASE || 'http://127.0.0.1:8088'; // dev-server 只绑回环，直接用 IP 免去 localhost 双栈解析歧义
 const PASS = process.env.SMOKE_PASSWORD || process.env.ADMIN_PASSWORD || '';
 const CLEANUP = process.env.SMOKE_CLEANUP === '1';
+/* 冒烟测试书的书名判据（#146 P2-8）：收尾清理与「清理后残留核对」必须用**同一个**正则。
+ * 原先清理按 ^(M2 测试书|冒烟测试书)、核对却按 /测试书/（子串）—— 用户真实书名里只要含
+ * 「测试书」三个字（如《我的测试书记录》），核对就永远认为有残留 → CI 永久红，提示还是
+ * 「清理后书架仍有测试书」，把人误导到清理逻辑上去查。 */
+const SMOKE_TITLE_RE = /^(M2 测试书|冒烟测试书)/;
 
 let cookie = '';
 const failures = [];
@@ -111,6 +116,16 @@ async function runAll() {
   const sc = r.headers.get('set-cookie') || '';
   const m = /rn_session=([^;]+)/.exec(sc);
   check('下发会话 cookie', !!m);
+  // #146 P2-7：没有 cookie 就继续跑的话，后面几十条会全部 401 —— 真正的原因（会话没下发）被淹在
+  // 「M2 链路失败 N 项」里，而且旧写法在这里直接 `m[1]` 会抛 TypeError（报成「冒烟异常：Cannot read
+  // properties of null」）。直接收敛成一条带 smoke 标记的错误，main 的 finally 照常清理。
+  if (!m) {
+    const e = new Error(
+      '登录返回 200 但没有下发会话 cookie（Set-Cookie: ' + (sc || '（空）') + '）——检查 SESSION_SECRET / ADMIN_PASSWORD 是否与部署一致'
+    );
+    e.smoke = true;
+    throw e;
+  }
   cookie = 'rn_session=' + m[1];
 
   const mkSmoke = () =>
@@ -367,12 +382,12 @@ async function main() {
         }
         // 兜底：历次冒烟遗留（含被改过名的）测试书一并清走
         const lr = await api('/api/books');
-        for (const b of (lr.data.books || []).filter((x) => /^(M2 测试书|冒烟测试书)/.test(x.title || ''))) {
+        for (const b of (lr.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''))) {
           await purgeBook(b.id);
           console.log('  · 已清理遗留测试书 ' + b.id + '《' + b.title + '》');
         }
         const lr2 = await api('/api/books');
-        const remain = (lr2.data.books || []).filter((x) => /测试书/.test(x.title || ''));
+        const remain = (lr2.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''));
         if (remain.length) {
           console.error('  ✗ 清理后书架仍有测试书：' + remain.map((x) => x.id + '《' + x.title + '》').join('、'));
           process.exitCode = 1;

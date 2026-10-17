@@ -365,6 +365,17 @@ async function finishLogout() {
   if (els.sortSel) els.sortSel.value = 'recent';
   presetTags = []; presetTagsAt = 0; presetTagsInflight = null;
   els.grid.innerHTML = '';
+  // #146 P2-5：书架里**不随 grid 重建**的动态容器也要清 —— 继续阅读卡（含书名与进度）、
+  // 它的显隐、书库规模（「共 N 本 · X 万字」）、筛选结果条数、回收站列表（书名 + 时间）。
+  // doLogin 是「先 showView('shelf') 再 await loadShelf」：不清就会在登录后的整个往返窗口里把
+  // 前任的继续阅读书卡与书库规模摆给新登录者看（共享设备上的隐私残留），加载失败时更是长期停留
+  //（这正是 L18「登出清痕迹」的缺口，offline.js 把同类残留直接定为隐私问题）。
+  els.continueCard.innerHTML = '';
+  els.continueWrap.classList.add('hidden');
+  els.shelfCount.textContent = '';
+  els.filterNote.textContent = '';
+  els.trashList.innerHTML = '';
+  els.trashCount.textContent = '';
   // ⚠️ 必须关弹层再切视图（2026-10-06 审计 P1-6）：showView 只切 5 个视图容器，**不碰
   // modalMask / busyMask**。会话过期走 handleAuth → finishLogout 时，若当时正开着弹层
   // （如诊断面板点「重新扫描」→ 401），遮罩（position:fixed; inset:0; z-index:70）会留在
@@ -1453,6 +1464,8 @@ async function diagScanAll(onPage) {
       merged = d;
     } else {
       merged.residue = (merged.residue || []).concat(d.residue || []);
+      // #146 P3-5：未核验桶也必须跨窗合并，否则首页之外的未核验对象会凭空消失
+      merged.unverified = (merged.unverified || []).concat(d.unverified || []);
       merged.chapterOrphans = (merged.chapterOrphans || []).concat(d.chapterOrphans || []);
       merged.scannedAt = d.scannedAt;
       merged.scannedPages = (merged.scannedPages || 0) + (d.scannedPages || 0);
@@ -1498,7 +1511,12 @@ async function openDiag() {
 async function diagRefresh() {
   const seq = modalSeq; // 同 openDiag：诊断面板内的操作等待期间用户可能换了弹层
   try {
-    diagData = await diagScanAll(null);
+    // #146 P3-6：与 openDiag 用同一道中止回调 —— 扫描途中用户关掉弹层/换了弹层就停止后续请求，
+    // 不再白烧每窗 12 页的服务端子请求配额（旧实现传 null，一路扫到底，结果还被 seq 判据丢掉）。
+    diagData = await diagScanAll(() => {
+      if (seq !== modalSeq || els.modalMask.classList.contains('hidden')) return false;
+      return true;
+    });
   } catch (e) {
     if (handleAuth(e)) return;
     toast('扫描失败：' + (e.message || e), 2200);
@@ -1514,7 +1532,13 @@ function renderDiag() {
   const obs = d.orphanBooks || [];
   const cos = d.chapterOrphans || [];
   const unregCos = cos.filter((o) => !o.known); // 未登记的孤儿才一键清；已登记的交给惰性清理
-  const total = rs.length + obs.length + cos.length;
+  const unv = d.unverified || []; // #146 P3-5：清单被截断时无法判断归属的对象（只展示，不给一键删）
+  const total = rs.length + obs.length + cos.length + unv.length;
+  // #146 P3-5：本次扫描不完整（预算不足 / 用户中止 / 清单截断）时禁用「删除全部」——
+  // 没核验完就批量删，等于拿「没看见」当「没有引用」，删掉的是无主书的正文或原件，且不可恢复。
+  const delAllOff = d.incomplete
+    ? ' disabled title="本次扫描不完整：还有对象未核验，禁用一键删除（可先重新扫描）"'
+    : '';
   const badge = total ? `<span class="diag-badge diag-badge-warn">发现 ${total} 项残留</span>` : `<span class="diag-badge diag-badge-ok">一切干净</span>`;
 
   const sec = (dotCls, title, n, bodyHtml) => `<div class="diag-sec">
@@ -1538,6 +1562,10 @@ function renderDiag() {
   </div>`;
 
   const chTag = (o) => (o.known ? ' · <span class="diag-tag">已在惰性清理名单</span>' : ' · <span class="diag-tag diag-tag-orphan">未登记</span>');
+  // 未能核验的行：**故意不渲染任何删除按钮**（单删也不行 —— 归属没确认就删，同样可能删掉无主书正文）
+  const unvRow = (o) => '<div class="diag-row"><div class="diag-row-main"><code class="diag-key" title="' +
+    esc(o.key) + '">' + esc(diagShort(o.key)) + '</code><div class="diag-row-sub">' +
+    fmtBytes(o.size) + '</div></div></div>';
 
   let body;
   if (!total) {
@@ -1545,15 +1573,18 @@ function renderDiag() {
   } else {
     body = sec('diag-dot-red', '已删书的残留对象', rs.length,
       rs.length ? `<div class="diag-rows">${rs.map((o) => objRow(o, '')).join('')}</div>
-        <p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="residue">删除全部 ${rs.length} 项</button></p>`
+        <p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="residue"${delAllOff}>删除全部 ${rs.length} 项</button></p>`
         : '<p class="diag-none">无</p>')
       + sec('diag-dot-amber', '未入架的无主书', obs.length,
         obs.length ? `<div class="diag-rows">${obs.map((b) => bookRow(b)).join('')}</div>`
           : '<p class="diag-none">无</p>')
       + sec('diag-dot-gray', '章节孤儿', cos.length,
         cos.length ? `<div class="diag-rows">${cos.map((o) => objRow(o, ` · ${esc(o.bookTitle || o.bookId)}${chTag(o)}`)).join('')}</div>
-          ${unregCos.length ? `<p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="chapters">删除未登记孤儿 ${unregCos.length} 项</button></p>` : '<p class="diag-group-acts muted">已登记孤儿由惰性清理自动删除</p>'}`
-          : '<p class="diag-none">无（自动惰性清理工作正常）</p>');
+          ${unregCos.length ? `<p class="diag-group-acts"><button class="ghost slim" type="button" data-diag="del-all" data-what="chapters"${delAllOff}>删除未登记孤儿 ${unregCos.length} 项</button></p>` : '<p class="diag-group-acts muted">已登记孤儿由惰性清理自动删除</p>'}`
+          : '<p class="diag-none">无（自动惰性清理工作正常）</p>')
+      + (unv.length ? sec('diag-dot-gray', '未能核验的对象', unv.length,
+        '<div class="diag-rows">' + unv.map(unvRow).join('') + '</div>' +
+        '<p class="diag-group-acts muted">清单被截断时无法判断归属：可能是未入架书的正文或原件，先用「移入回收站」保全，这里不提供删除</p>') : '');
   }
 
   openModal(`<h3>残留检查</h3>
@@ -1585,6 +1616,12 @@ async function onDiagBoxClick(e) {
       toast('删除失败：' + (err.message || err), 2400);
     }
   } else if (act === 'del-all') {
+    // #146 P3-5：按钮已 disabled（浏览器不会派发 click），这里再拦一道 —— disabled 只是 UI 约定，
+    // 键盘/脚本触发或将来别的入口复用时，必须由业务判据兜住。
+    if (diagData.incomplete) {
+      toast('本次扫描不完整，还有对象未核验：请先重新扫描，再决定是否批量删除', 2800);
+      return;
+    }
     const src = btn.dataset.what === 'residue' ? diagData.residue : (diagData.chapterOrphans || []).filter((o) => !o.known);
     const keys = src.map((o) => o.key);
     if (!keys.length) return;

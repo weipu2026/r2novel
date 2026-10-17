@@ -114,18 +114,24 @@ test('P1-3 深拷贝语义实证：冻结后改标题/删章都不影响本次�
 
 test('P1-3 上传在飞时预览行控件必须被禁用', () => {
   const src = read('public/js/upload/preview.js');
-  assert.match(src, /function lockPreviewRows\(ul\)/, '缺少 lockPreviewRows');
+  assert.match(src, /export function syncPreviewLock\(\)/, '缺少 syncPreviewLock');
   // #145 R8 修订：判据从 isBusy()（含 _reading）改为「上传/导入在飞」。_reading 是**入场闸**，
   // 而首次预览（prepareFile → runPreview，全程同步）恰好落在 _reading 窗口内：旧判据在这种情况
   // 下把预览区锁上，finally 置回 _reading 后没有任何重绘 → 预览区从第一次选文件起永久只读
   //（真机实测 16/16 恒锁）。行首锚定断言，避免注释里的同名词喂假绿/假红。
-  const ok = /^\s*if \(upSession\.isUploading\(\) \|\| upSession\.isImporting\(\)\) lockPreviewRows\(ul\);$/m.exec(src);
-  assert.ok(ok, 'renderPreviewChapters 必须按「上传/导入在飞」在渲染完成后调用 lockPreviewRows');
-  assert.doesNotMatch(
-    src,
-    /^\s*if \(upSession\.isBusy\(\)\) lockPreviewRows\(ul\);$/m,
-    '编辑闸不得复用 isBusy()（含 _reading → 首次预览发布后就地永久锁死）'
+  // #146 P2-6：锁改成 syncPreviewLock() 双向同步，判据本体搬进函数体 → 断言 = 调用点行首锚定
+  //（注释里的同名词匹配不到 ^\s*）+ 函数体内判据（切到函数体再匹配，不吃后面别的函数的注释）。
+  const ok = /^\s*syncPreviewLock\(\);$/m.exec(src);
+  assert.ok(ok, 'renderPreviewChapters 必须在渲染完成后调用 syncPreviewLock()');
+  const fnAt = src.indexOf('export function syncPreviewLock()');
+  const fnEnd = src.indexOf('\n}', fnAt);
+  const fnBody = src.slice(fnAt, fnEnd > 0 ? fnEnd + 2 : fnAt + 500);
+  assert.match(
+    fnBody,
+    /const locked = upSession\.isUploading\(\) \|\| upSession\.isImporting\(\);/,
+    '锁判据必须是「上传/导入在飞」'
   );
+  assert.doesNotMatch(fnBody, /isBusy\(\)/, '编辑闸不得复用 isBusy()（含 _reading → 首次预览发布后就地永久锁死）');
   const i = ok.index;
   // 锁必须发生在所有行渲染之后（addLi 追加之后），否则一行都锁不到
   const before = src.slice(0, i);
@@ -140,8 +146,11 @@ test('P1-6 finishLogout 必须先关弹层再切视图（遮罩否则盖住登�
   const src = read('public/js/app.js');
   const i = src.indexOf('async function finishLogout()');
   assert.ok(i > 0, '找不到 finishLogout');
-  const j = src.indexOf('async function expireSession()', i);
-  const body = src.slice(i, j > 0 ? j : i + 2000);
+  // ⚠️ expireSession **不是** async（写成 'async function expireSession()' 会 indexOf 到 -1，
+  // 于是静默回落到固定字符窗口 —— finishLogout 一变长就切片不足，closeModal 掉出窗口 → 假红）。
+  const j = src.indexOf('function expireSession()', i);
+  assert.ok(j > i, '找不到 finishLogout 的结束锚点（expireSession）');
+  const body = src.slice(i, j);
   const closeAt = body.indexOf('closeModal();');
   const viewAt = body.indexOf("showView('login');");
   assert.ok(closeAt > 0, 'finishLogout 未调用 closeModal()');

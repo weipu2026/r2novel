@@ -226,7 +226,8 @@ export async function openBook(id) {
   let sp = await api.getProgressStrict(id).catch(() => null);
   if (!sp) sp = await api.getProgressStrict(id).catch(() => null);
   if (seq !== openSeq) return; // 进度请求等待期间已切书/已关闭：整次打开作废（state 尚未落，无需清理）
-  progBase = { id, at: sp ? Number(sp.updatedAt) || 0 : 0, known: !!sp, failed: !sp };
+  // 语义单点：读失败 → failed 基线（known:false）；读到（哪怕只是 EMPTY_PROG）→ known 基线
+  progBase = sp ? progBaseline(id, sp) : { id, at: 0, known: false, failed: true };
   if (sp && sp.updatedAt && Number.isFinite(sp.ch) && (!lp || sp.updatedAt > (lp.updatedAt || 0))) {
     ch = clampCh((sp.ch || 1) - 1);
     ratio = sp.ratio || 0;
@@ -791,6 +792,17 @@ function onVis() {
 let progBase = { id: null, at: 0, known: false };
 let lastSyncAt = 0;
 
+/** 由「一次进度读的结果」推出 OCC 基线（#146 P2-4）。三态语义，混掉任何两态都会静默丢进度：
+ *  · sp 为空（null/undefined）⇒ **读失败**：返回 null = 「别动现有基线」。此时若原基线是 failed，
+ *    必须继续 failed —— 把读失败当成「服务端没有进度」正是 #138 修的跨设备覆盖，不能从侧面绕回来。
+ *  · sp 存在但 updatedAt 为 0 ⇒ 服务端**确认这本书还没有进度**（router 的 EMPTY_PROG）：
+ *    { at:0, known:true, failed:false } —— 关键是 known:true，它负责把 failed 洗掉。
+ *  · sp 带 updatedAt ⇒ 真值，基线推进到它。 */
+export function progBaseline(id, sp) {
+  if (!sp) return null;
+  return { id, at: Number(sp.updatedAt) || 0, known: true, failed: false };
+}
+
 const clampChapter = (x) => Math.max(0, Math.min(state.chapters.length - 1, Math.floor(x) || 0));
 
 /** 与服务端进度对账（转回前台 / 写入被拒时调用）。
@@ -813,10 +825,18 @@ async function syncFromServer(serverProg, forBookId) {
     lastSyncAt = now;
   }
   const sp = serverProg || (await api.getProgressStrict(book.id).catch(() => null));
-  if (!sp || !sp.updatedAt) return;
   if (state.book !== book) return; // await 期间已切书/已关闭
-  if (progBase.id === book.id && Number(sp.updatedAt) <= progBase.at) return; // 服务端没有更新
-  progBase = { id: book.id, at: Number(sp.updatedAt), known: true };
+  const nb = progBaseline(book.id, sp);
+  // 读失败 → 原样保留基线。⚠️ 不得在这里 return 掉「updatedAt === 0」那种**成功**读：
+  // 服务端对无进度的书回 EMPTY_PROG（updatedAt:0，不是 null），旧写法的 `!sp.updatedAt` 把
+  // 「确认没有进度」和「读失败」混成一类 → progBase.failed 永远洗不掉 → drainProgress 的
+  // `if (progBase.failed) return` 会把本设备对**整本**的进度写全部丢弃（读完都不落盘，且无提示）。
+  if (!nb) return;
+  // 已知基线且服务端没有更新 → 什么都不做（基线只推进不回灌）
+  if (progBase.id === book.id && progBase.known && nb.at <= progBase.at) return;
+  progBase = nb;
+  // 服务端确实没有进度（EMPTY_PROG）：基线归零 + 解除 failed 就够了，没有位置可同步
+  if (!nb.at) return;
   // 本地镜像写**服务端时间**：openBook 里「本地 vs 云端谁新」的比较才落在同一条时间轴上
   local.setProg(book.id, { ch: sp.ch || 1, ratio: sp.ratio || 0, updatedAt: Number(sp.updatedAt) });
   const idx = clampChapter((sp.ch || 1) - 1);

@@ -6,6 +6,7 @@
 import { els } from '../dom.js';
 import * as upSession from './session.js';
 import { runPreview, invalidateAutoEnc } from './preview.js';
+import { toast } from '../ui.js';
 
 /* #146 P2-3：「上一次由文件名自动填进标题框的值」。用来区分「用户手输的书名」与「上一本书自动
  * 带出的文件名」—— 旧实现只看标题框是否为空，换第二本书时标题仍是第一本的文件名 → 「标题A/正文B」。
@@ -32,6 +33,17 @@ export function hint(text) {
 
 export async function prepareFile(file) {
   const buf = new Uint8Array(await file.arrayBuffer());
+  // #147 C：0 字节文件以前照常建会话 → 直接进预览态显示「0 章 · 0 字」+ 灰掉的「确认入库」，
+  // 而按钮为什么是灰的没有任何说明（无 title / 无 aria / 无 toast），检测行还自相矛盾地写着
+  // 「分章规则：未识别（整本一章）」—— 用户看到的是「这个网页坏了」，不是「这个文件有问题」。
+  // 手机上导出空 txt 很常见，选错文件是高频操作，所以前置拒绝：不建会话、不进预览、标题框保持
+  // 原样（用户可能正想改），并明确告知是文件本身的问题。
+  if (!buf.length) {
+    els.upConfirm.disabled = true;
+    els.upConfirm.setAttribute('title', '文件是空的（0 字节），没有内容可入库');
+    toast('《' + file.name + '》是空文件（0 字节），换一个文件再试', 3000);
+    return;
+  }
   const auto = file.name.replace(/\.(txt|text)$/i, '').trim();
   // #146 P2-3：标题框空**或仍是上一本自动带出的文件名**时才回填；用户手输的书名一律不动
   if (!els.upTitle.value.trim() || isAutoTitle(els.upTitle.value.trim())) setAutoTitle(auto);

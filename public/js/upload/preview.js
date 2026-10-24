@@ -124,6 +124,10 @@ function updateConfirmBtn() {
   const cur = upSession.current();
   const chs = cur && cur.preview ? cur.preview.chapters : [];
   els.upConfirm.disabled = !chs.length;
+  // #147 C：禁用态必须说明「为什么不能用」。除了 0 字节文件（prepareFile 已拦），还有一类是
+  // 「有字节但清洗后 0 章」（纯空白 / 全是分隔符）—— 那种也会走到这里，同样需要原因。
+  if (!chs.length) els.upConfirm.setAttribute('title', '没有可入库的章节（正文为空或全是空白）');
+  else els.upConfirm.removeAttribute('title');
   const isUpd = !!(cur && cur.updating && cur.updating.id);
   els.upConfirm.textContent = isUpd
     ? (cur.updating.op === 'append' ? `追加到《${cur.updating.book.title}》` : `整本替换《${cur.updating.book.title}》`)

@@ -374,6 +374,12 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 .read-top button:first-child, .read-bar button:first-child,
 .read-bar button:last-child { min-width: 40px; min-height: 40px; display: grid; place-items: center; padding: 0; }
+/* #147 B：翻到首/末章时按钮降透明度（aria-disabled 由 syncStepBtns 维护）。
+   不能用 pointer-events:none —— 那会让点击穿透到 #readScroll（阅读器空白处点击是翻页），
+   反而在「已经是最后一章」时把用户又往前送了一屏。 */
+.read-top button[aria-disabled="true"], .read-bar button[aria-disabled="true"] {
+  opacity: .34; cursor: default;
+}
 .read-bar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
   /* 同理：46px 是内容高度，安全区另加。否则底栏实际只占 46px，而 #readScroll 的

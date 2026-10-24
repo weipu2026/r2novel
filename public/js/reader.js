@@ -82,6 +82,8 @@ export function bindReader(root, navCb) {
     tip: root.querySelector('#readTip'),
     prog: root.querySelector('#readProg'),
     progFill: root.querySelector('#readProgFill'),
+    btnPrev: root.querySelector('[data-act="prev"]'),
+    btnNext: root.querySelector('[data-act="next"]'),
     prefPanel: root.querySelector('#prefPanel'),
     ppFs: root.querySelector('#ppFs'),
     ppLh: root.querySelector('#ppLh'),
@@ -385,6 +387,19 @@ function updateProgressLine() {
     els.prog.setAttribute('aria-valuemax', String(n));
     els.prog.setAttribute('aria-valuenow', String(i + 1));
   }
+  syncStepBtns(i, state.chapters.length); // #147 B：翻页按钮的「到头」状态跟章号一起更新
+}
+
+/* #147 B：首/末章的翻页按钮必须看得出「到头了」。
+ * 旧实现只在 goto() 里 `if (idx < 0 || idx >= len) return;` —— 按钮看着完全可用、点下去毫无反应，
+ * 用户分不清「已经是最后一章」和「界面卡死了」；单章书（实测《荒》）两个箭头全是死键且无任何解释。
+ * 用 aria-disabled 而不是原生 disabled：原生 disabled 不派发 click，点下去连提示都没有；
+ * aria-disabled 保留可聚焦可点击，由 goto() 的越界分支给出「已经是第一章/最后一章」。 */
+function syncStepBtns(i, len) {
+  const atFirst = len <= 0 || i <= 0;
+  const atLast = len <= 0 || i >= len - 1;
+  if (els.btnPrev) els.btnPrev.setAttribute('aria-disabled', atFirst ? 'true' : 'false');
+  if (els.btnNext) els.btnNext.setAttribute('aria-disabled', atLast ? 'true' : 'false');
 }
 
 /* 进度线轻点确认态（模块级：goto()/closeReader() 要能复位，见各自注释） */
@@ -923,7 +938,13 @@ function drainProgress() {
 }
 
 function goto(idx) {
-  if (idx < 0 || idx >= state.chapters.length) return;
+  if (idx < 0 || idx >= state.chapters.length) {
+    // #147 B：到头必须有声音。按钮已被 aria-disabled 标灰但仍可点（原生 disabled 收不到 click，
+    // 点了连提示都没有），键盘 ←/→ 走的也是这条路 —— 提示统一在这里给，一处覆盖三条入口。
+    // chapters 为空（尚未加载完）不算「到头」，不提示。
+    if (state.chapters.length) showTip(idx < 0 ? '已经是第一章' : '已经是最后一章', 1400);
+    return;
+  }
   progConfirmIdx = -1; // 换章后挂起的「再点跳转」目标已失去上下文：不清的话下一次轻点会被当成第二击直接跳章
   saveProgress();
   renderChapter(idx, 0).catch((e) => {

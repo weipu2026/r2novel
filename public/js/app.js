@@ -446,11 +446,22 @@ async function loadShelf(data) {
   renderShelf();
 }
 
+/** 搜索命中的字段集（#147 A）：书名 / 作者 / 备注 / 标签。
+ *  用 \u0001 拼接而不是空格：空格拼接会让「名 作者」这类查询跨字段命中（书名尾部 + 作者头部）。 */
+function matchTerms(b, terms) {
+  const hay = [b.title || '', b.author || '', b.note || '', ...(b.tags || [])].join('\u0001').toLowerCase();
+  return terms.every((t) => hay.includes(t));
+}
+
 function filteredBooks() {
   let list = books;
   if (ui.q) {
-    const q = ui.q.toLowerCase();
-    list = list.filter((b) => b.title.toLowerCase().includes(q) || (b.tags || []).some((t) => t.toLowerCase().includes(q)));
+    // #147 A：① 作者与备注本来就存在服务端（「编辑信息」弹窗能改），旧实现只匹配书名/标签 ——
+    // 数据存着却搜不到，卡片上也根本不显示作者，等于作者字段只写不读。
+    // ② 多词必须**分词后 AND**：旧实现把整个输入当一串 includes，「诡秘 之主」永远 0 本，
+    // 而用户的输入习惯恰恰是带空格的关键词。
+    const terms = ui.q.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length) list = list.filter((b) => matchTerms(b, terms));
   }
   if (ui.tag) list = list.filter((b) => (b.tags || []).includes(ui.tag));
   if (ui.finished === 'done') list = list.filter((b) => b.finished);
@@ -501,7 +512,10 @@ function renderShelf() {
 
   // 继续阅读：有进度且**还没读完**的书，按云端最后阅读时间倒序取前 3（prog 镜像，电脑/手机一致）。
   // 读完的书不再占「继续阅读」位——读完了就该从待读队列退出去（手动标记读完后同样退出）。
-  const reading = books
+  // #147 D：必须走 filteredBooks() 而不是全量 books —— 旧实现在搜索/标签/状态筛选生效时，
+  // 网格只剩 1 本，上面仍稳稳挂着 3 本与条件无关的书（筛「已读完」时挂着 3 本在读的），
+  // 两块内容互相矛盾。无条件筛选时 filteredBooks() 原样返回 books，行为与之前完全一致。
+  const reading = filteredBooks()
     .filter((b) => b.prog && b.prog.updatedAt > 0 && readState(b) !== 'done')
     .sort((a, b) => (b.prog.updatedAt || 0) - (a.prog.updatedAt || 0))
     .slice(0, 3);

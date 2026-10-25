@@ -45,15 +45,22 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     // 逐资源容错缓存：addAll 是"一损俱损"——慢网络/代理下单个资源失败会毁掉整个缓存，
     // 之后每个静态资源都回落网络 → 打开明显变慢。改为单个 add，失败只影响该资源。
-    // 分类处理：js/css/HTML/manifest 部署后必须拿到最新 → cache:'reload' 绕过浏览器 HTTP 缓存；
+    // 分类处理：js/css/HTML/manifest 部署后必须拿到最新 → cache:'no-cache' 强制回源校验 ETag；
     // icons 几乎不变且 HTTP 层有 7 天缓存 → 走默认缓存（命中即用，不重复下载），
-    // 部署后 install 的重下量从 14 降到 11，首开负担更小
+    // 部署后 install 的重下量从 14 降到 11，首开负担更小。
+    //
+    // ⚠️ 这里原先是 'reload'（语义是"跳过一切缓存、强制完整重下"）。代价很实在：首访时页面
+    // 刚通过 modulepreload 与 import 图把 20 多个模块下过一遍，install 又把同一批 body 完整
+    // 重下一遍 —— 实测 25 个重复请求、约 135 KB br 的纯浪费（见 .ui-tests/measure-firstload.mjs）。
+    // 'no-cache' 只要求"必须回源校验"：内容没变时服务端回 304（线上 /js/app.js 带
+    // If-None-Match 实测 304、传输 0 字节），部署后"拿最新"的保证一点没丢 —— ETag 变了自然
+    // 拿到 200 与新 body。两者唯一的差别只是不再重复搬运未变的 body。
     caches
       .open(CACHE)
       .then((c) =>
         Promise.allSettled(
           SHELL.map((u) =>
-            c.add(new Request(u, u.endsWith('.png') ? undefined : { cache: 'reload' }))
+            c.add(new Request(u, u.endsWith('.png') ? undefined : { cache: 'no-cache' }))
           )
         )
       )

@@ -210,9 +210,20 @@ function serveStatic(req, url) {
     const st = fs.statSync(file);
     if (!st.isFile()) return null;
     const ext = path.extname(file).toLowerCase();
-    return new Response(fs.createReadStream(file), {
+    const body = fs.readFileSync(file);
+    // ETag = 内容 sha1（与线上 Cloudflare 静态资源同语义：内容变则 etag 变）。
+    // 为什么必须有：线上 CF 的静态资源带 ETag、支持 If-None-Match→304，而本地原先
+    // 无条件 200 全量 —— 于是「SW install 的 cache 选项到底省了多少字节」这类结论
+    // 在本地永远测不出来（请求数一样，只是每个都完整重下）。补上后本地与线上同判据。
+    const etag = '"' + createHash('sha1').update(body).digest('hex') + '"';
+    const base = { etag, 'cache-control': 'no-cache' };
+    const inm = req.headers.get('if-none-match');
+    if (inm && inm.split(',').some((s) => s.trim() === etag)) {
+      return new Response(null, { status: 304, headers: base });
+    }
+    return new Response(body, {
       status: 200,
-      headers: { 'content-type': MIME[ext] || 'application/octet-stream', 'cache-control': 'no-cache' },
+      headers: { ...base, 'content-type': MIME[ext] || 'application/octet-stream' },
     });
   } catch {
     return null;

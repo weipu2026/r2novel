@@ -81,8 +81,14 @@ test('门禁 d)：SHELL 期望集必须用排除法（新资源类型不得静�
   assert.ok(!/js\|css\|webmanifest\|png\|svg\|woff2/.test(body),
     '仍在用扩展名白名单：新增 .webp/.ico/.json 之类资源不会被报 SW MISSING（静默漏绿），'
     + '写进 SHELL 反而报 SW UNKNOWN 假阳性');
-  assert.match(body, /rel === '\/_headers' \|\| rel === '\/sw\.js'\) continue;/,
-    '只应排除 CF 配置与 SW 自身');
+  // 排除项必须逐条显式列举（不能是扩展名通配），且集合恰好是这三个「非页面运行时资源」：
+  // _headers（平台配置）、sw.js（不预缓存自身）、robots.txt（只给爬虫看）。
+  // 断言用深比较而不是"包含某两串"：多排除一个路径就意味着某类页面资源不再被要求预缓存
+  // （SW MISSING 静默漏绿），少一个则 SHELL 会混入非页面项。
+  const ex = /if \((rel === '[^']+' \|\| )+rel === '[^']+'\) continue;/.exec(body);
+  assert.ok(ex, '排除项必须是一串显式路径比较（不能用扩展名通配）');
+  const excluded = [...ex[0].matchAll(/'(\/[^']+)'/g)].map((x) => x[1]);
+  assert.deepEqual(excluded, ['/_headers', '/sw.js', '/robots.txt'], '排除集合只允许这三个');
   assert.match(body, /assets\.push\(rel\);/, '其余全部收入期望集');
 });
 

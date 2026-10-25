@@ -411,6 +411,8 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
  *   期望集合 = public/ 下全部可预缓存静态资源（js / css / manifest / icons / index.html；
  *             排除 _headers —— CF 配置文件非页面资源；排除 sw.js —— SW 不预缓存自身）。
  *   SW_MISSING：期望集合里有、SHELL 没有 → 离线壳缺文件（新模块上线离线不可用）
+ *   排除项（不属于"页面运行时资源"，不进期望集合）：_headers（平台配置）、
+ *   sw.js（不预缓存自身）、robots.txt（只给爬虫看）
  *   SW_UNKNOWN：SHELL 里有、public/ 没有 → 清单指向已删除/改名文件（404 白缓存）
  * index.html 特例：'/' 与 '/index.html' 都算覆盖（现清单两者并存，不必二选一）。
  */
@@ -436,8 +438,9 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
           // js/css/webmanifest/png/svg/woff2? + index.html，于是新增 public/img/x.webp
           // 之类资源时 ① 不会被报 SW MISSING（离线壳缺文件，静默漏绿），
           // ② 写进 SHELL 反而报 SW UNKNOWN 假阳性（作者会误删正确的清单条目）。
-          // 非页面资源只有两个，且都是配置/自身，都需要排除。
-          if (rel === '/_headers' || rel === '/sw.js') continue;
+          // 非页面资源都排除：_headers 是平台配置、sw.js 不预缓存自身、
+          // robots.txt 只给爬虫看（页面运行时不需要它，缓存它反而让 SW 清单混入非页面项）。
+          if (rel === '/_headers' || rel === '/sw.js' || rel === '/robots.txt') continue;
           assets.push(rel);
         }
       }

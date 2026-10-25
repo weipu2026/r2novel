@@ -1,0 +1,14 @@
+# 私人书库：整站不对外索引。
+# 具名 UA 单独列一遍 —— 部分爬虫只读自己的段、忽略 User-agent: *。
+
+User-agent: *
+Disallow: /
+
+User-agent: Googlebot
+Disallow: /
+
+User-agent: Baiduspider
+Disallow: /
+
+User-agent: Bingbot
+Disallow: /

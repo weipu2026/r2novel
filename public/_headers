@@ -1,11 +1,16 @@
 # 安全响应头（Cloudflare Workers 静态资产原生支持 _headers，部署即生效；本地 dev-server 不需要）
+# 私人书库：不允许任何搜索引擎收录。robots.txt 是第一道，X-Robots-Tag 是第二道——
+# robots.txt 只约束"守规矩的爬虫"，X-Robots-Tag 连被抓到之后的索引也一并否掉。
+# HSTS：浏览器拿到过该头后一年内只走 https（不写 preload / includeSubDomains：本站无子域）。
 /*
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
+  X-Robots-Tag: noindex, nofollow, noarchive
+  Strict-Transport-Security: max-age=31536000
   Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
 
-# 浏览器缓存：js/css 短缓存（前端改动靠 sw.js 版本 bump 强制刷新，SW install 用 cache:reload 拿最新）；
+# 浏览器缓存：js/css 短缓存（前端改动靠 sw.js 版本 bump 强制刷新，SW install 用 cache:no-cache 校验 ETag）；
 # 图标不变更长缓存；HTML/SW/manifest 永远协商（保证入口与 SW 即时更新）
 /js/*
   Cache-Control: public, max-age=300

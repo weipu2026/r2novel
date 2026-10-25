@@ -796,7 +796,10 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 @media (min-width: 900px) {
   /* 顶栏更舒展（安全区 inset 不能在断点里丢：iPad PWA 等带 inset 的桌面端同样要加回去） */
   .top {
-    padding: calc(16px + env(safe-area-inset-top)) 32px 14px;
+    /* 内容与 .shelf-body 的 1180 版心同一公式对齐（LOGO 左缘 = 卡片左缘，
+       「上传/⋯」右缘 = 卡片右缘），底边框线仍全宽；100% 基准同为 .view 宽，
+       移动端断点不受影响 */
+    padding: calc(16px + env(safe-area-inset-top)) max(32px, calc((100% - 1180px) / 2)) 14px;
   }
   .brand-name { font-size: var(--fz-3xl); }
   .brand-logo { width: 38px; height: 38px; border-radius: var(--r-sm); font-size: var(--fz-2xl); }

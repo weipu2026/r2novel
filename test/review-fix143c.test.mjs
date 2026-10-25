@@ -94,7 +94,7 @@ test('门禁 d)：SHELL 期望集必须用排除法（新资源类型不得静�
 
 test('门禁 d)：HOST_CAPS 锚点缺失必须报错而不是静默返回空数组', () => {
   const c = read('scripts/check.mjs');
-  const i = c.indexOf("code.indexOf('initUpload(')");
+  const i = c.indexOf("code.indexOf('function uploadCaps()')");
   assert.ok(i > 0, '找不到 HOST_CAPS 锚点');
   const body = codeOnly(c.slice(i - 200, i + 700)); // 同上：注释里引用了旧写法
   assert.ok(!/if \(i < 0\) return \[\];/.test(body),

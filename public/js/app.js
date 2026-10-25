@@ -2,12 +2,113 @@
 import { api, local, fmtWords, ApiError } from './store.js';
 import { BATCH_BOOKS_MAX, TRASH_DAYS, READ_DONE_RATIO, TAG_MAX } from './shared-const.js';
 import { offline } from './offline.js';
-import * as reader from './reader.js';
 import { bindBusy, bindToast, busy, busyDone, toast } from './ui.js';
 import { exportBookTxt } from './exporter.js';
 import { els, $, $$, esc, IC } from './dom.js';
 import { runBatched } from './batch-queue.js';
-import { init as initUpload, openUpload, rewashConfirm, openChapterEditor } from './upload/index.js';
+
+/* ---------------- 按需加载（首屏省 ≈165 KB） ----------------
+ * reader.js(52.6 KB)、cleaner.js(36.6 KB)、upload/ 全套(≈76 KB) 原先被静态 import，
+ * 于是首屏要下 22 个 JS —— 而其中 12 个只有「点开书」「点上传」时才用得到。
+ * 现在改成动态 import：首屏 10 个模块，点开的瞬间再拉。
+ *
+ * 离线不受影响：sw.js 的 fetch handler 对任意同源静态 GET 都做 stale-while-revalidate，
+ * 未命中时会 cache.put —— 这些模块第一次联网用过就进 SW 缓存，之后断网照常可用。
+ * 唯一的代价是「装完 PWA 从没打开过任何书就断网」时打不开书 —— 而那种状态下本来
+ * 也没有已下载的离线书可读（离线整本的下载入口都在阅读器内部，必然先加载过 reader）。
+ *
+ * ⚠️ 两条纪律：
+ *   ① 所有调用点必须 await / 再 .then：漏一处就是 undefined is not a function，
+ *      而且只在「第一次点」时炸（模块加载完之后就再也复现不出来）；
+ *   ② 进上传页的唯一入口是 openUpload()（upload/files.js 里的 showView('upload')），
+ *      所以 upload/ 的 document paste 与拖拽监听跟着模块一起延迟是安全的
+ *      —— 它们都自带「上传页不可见就 return」的守卫。 */
+let readerMod = null; // 已加载的模块（closeReader 要同步调用，不能等 Promise）
+let readerP = null; // 在途/已完成的加载 Promise（并发去重）
+let upMod = null;
+let upP = null;
+
+function ensureReader() {
+  if (!readerP) {
+    readerP = import('./reader.js')
+      .then((m) => {
+        readerMod = m;
+        m.bindReader(els.readRoot, onNavBack);
+        // #145 P2-3：reader 内 401 的统一收敛出口（下载/导出/翻章）—— 与 handleAuth 同一终点
+        m.setOnExpire(() => expireSession());
+        return m;
+      })
+      .catch((e) => {
+        readerP = null; // 失败允许重试（弱网下第一次点开书失败，再点一次不该永久锁死）
+        throw e;
+      });
+  }
+  return readerP;
+}
+
+/** 同步关阅读器：模块没加载过就说明从没打开过书，没有状态要清 */
+function closeReaderIfLoaded() {
+  if (readerMod) readerMod.closeReader();
+}
+
+/** 上传域的宿主能力表。写成函数而不是常量：避免这些名字里若有 const 箭头函数，
+ *  在模块顶层求值时踩 TDZ（调用时才求值最稳）。 */
+function uploadCaps() {
+  return {
+    showView,
+    loadShelf,
+    getBooks: () => books,
+    openModal,
+    closeModal,
+    confirmModal,
+    modalGen,
+    modalTake,
+    syncPresetChips,
+    refreshPresetTags,
+    parseTagInput,
+  };
+}
+
+function ensureUpload() {
+  if (!upP) {
+    upP = import('./upload/index.js')
+      .then((m) => {
+        upMod = m;
+        m.init(uploadCaps()); // init 幂等（模块内 _bound 守卫），重复调用只刷新宿主能力
+        return m;
+      })
+      .catch((e) => {
+        upP = null;
+        throw e;
+      });
+  }
+  return upP;
+}
+
+function openUploadLazy() {
+  ensureUpload()
+    .then((m) => m.openUpload())
+    .catch((e) => {
+      console.error('[upload] 模块加载失败', e);
+      toast('上传模块加载失败，请检查网络后重试', 3000);
+    });
+}
+function openChapterEditorLazy(b) {
+  ensureUpload()
+    .then((m) => m.openChapterEditor(b))
+    .catch((e) => {
+      console.error('[upload] 模块加载失败', e);
+      toast('编辑模块加载失败，请检查网络后重试', 3000);
+    });
+}
+function rewashConfirmLazy(b) {
+  ensureUpload()
+    .then((m) => m.rewashConfirm(b))
+    .catch((e) => {
+      console.error('[upload] 模块加载失败', e);
+      toast('清洗模块加载失败，请检查网络后重试', 3000);
+    });
+}
 
 const PAGE = 60; // 书库分页
 
@@ -118,7 +219,7 @@ export function init() {
 
   // 书架事件
   els.login.addEventListener('submit', doLogin);
-  els.uploadBtn.addEventListener('click', () => openUpload());
+  els.uploadBtn.addEventListener('click', () => openUploadLazy());
   els.moreBtn.addEventListener('click', openMoreSheet);
   // 视口变化时操作单还开着 → 重新贴回触发按钮（否则它会停在旧坐标上）
   window.addEventListener('resize', () => {
@@ -173,24 +274,9 @@ export function init() {
   els.sortSel.addEventListener('change', () => { ui.sort = els.sortSel.value; ui.page = 1; renderShelf(); });
   els.loadMoreBtn.addEventListener('click', () => { ui.page++; renderShelf(); });
 
-  // 上传域（upload/）：注入宿主能力 + 绑定上传页自己的事件（切视图 / 刷书架 / 弹层 / 标签 chips）
-  initUpload({
-    showView,
-    loadShelf,
-    getBooks: () => books,
-    openModal,
-    closeModal,
-    confirmModal,
-    modalGen,
-    modalTake,
-    syncPresetChips,
-    refreshPresetTags,
-    parseTagInput,
-  });
-
-  reader.bindReader(els.readRoot, onNavBack);
-  // #145 P2-3：reader 内 401 的统一收敛出口（下载/导出/翻章）—— 与 handleAuth 同一终点
-  reader.setOnExpire(() => expireSession());
+  // 上传域与阅读器改为按需加载：宿主能力注入（uploadCaps）与 bindReader/onExpire 都挪到
+  // 首次 openUpload() / openBook() 时执行 —— 见文件顶部 ensureUpload/ensureReader。
+  // init 里只做「不加载模块也能完成」的初始化。
   bindBusy({ bar: els.busyBar, text: els.busyText, mask: els.busyMask });
   presetTags = local.getPresetTags();
   renderPresetChips();
@@ -202,7 +288,7 @@ function onNavBack() {
   // visibilitychange 与 pagehide 监听彻底停写。漏掉这一步 → 返回书架后切后台仍会写进度，
   // 且比例读的是已 display:none 的正文区（scrollHeight 与 clientHeight 同为 0），
   // 把云端「末章 + 读完比例」覆盖成「末章 0%」。
-  reader.closeReader();
+  closeReaderIfLoaded();
   showView('shelf');
   loadShelf().catch(() => {});
 }
@@ -385,7 +471,7 @@ async function finishLogout() {
   // #144 P3：阅读器也要一并收敛 —— closeReader 清 state.book、停 visibilitychange 写进度、
   // 收起抽屉/面板/书名。会话过期时若正在阅读页，漏掉这步会让阅读器状态跨会话残留
   //（重登后抽屉/悬浮层里还是上一会话的书与章节）。
-  reader.closeReader();
+  closeReaderIfLoaded();
   closeModal();
   busyDone();
   showView('login');
@@ -559,7 +645,7 @@ function renderGrid(list) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = '＋ 上传第一本书';
-      btn.addEventListener('click', () => openUpload());
+      btn.addEventListener('click', () => openUploadLazy());
       box.append(logo, strong, p, btn);
       grid.appendChild(box);
     } else {
@@ -949,7 +1035,7 @@ function makeCard(b) {
 async function openRead(id) {
   try {
     showView('read');
-    await reader.openBook(id);
+    await (await ensureReader()).openBook(id);
   } catch (e) {
     if (handleAuth(e)) return; // expireSession → finishLogout 已完成视图切换（含回登录页）
     showView('shelf');
@@ -1001,9 +1087,9 @@ function openSheet(b, anchor) {
     { text: isPin ? '取消置顶' : '置顶到书架顶部', act: async () => { await safePatch(b.id, { pinned: !isPin }); } },
     { text: b.star ? '取消星标' : '标为星标', act: async () => { await safePatch(b.id, { star: !b.star }); } },
     { text: '编辑信息（书名/作者/标签/备注）', act: () => openEditModal(b) },
-    { text: '编辑章节（标题/正文/增删章）', act: () => openChapterEditor(b) },
+    { text: '编辑章节（标题/正文/增删章）', act: () => openChapterEditorLazy(b) },
     { text: '导出清洗后的 txt', act: () => exportBook(b) },
-    { text: '重新清洗（用原件重排）', act: () => rewashConfirm(b) },
+    { text: '重新清洗（用原件重排）', act: () => rewashConfirmLazy(b) },
     {
       text: '移入回收站',
       danger: true,

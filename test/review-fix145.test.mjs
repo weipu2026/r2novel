@@ -659,7 +659,15 @@ test('P2-4/P2-5 删书 catch 补 handleAuth；finishLogout 推进 shelfSeq；bin
   const f = app.indexOf('async function finishLogout(');
   const fBody = app.slice(f, f + 1600);
   assert.match(fBody, /shelfSeq\+\+;/, '登出必须推进世代（否则在途 loadShelf 的 200 把前任书架写回 localStorage）');
-  assert.match(app, /reader\.setOnExpire\(/, 'bindReader 后必须注入会话过期收敛回调');
+  // #149：bindReader / setOnExpire 一起搬进 ensureReader 的 then 里。
+  // 顺序仍要守 —— onExpire 必须在 bindReader 之后注入（reader 内部用同一个 state 存回调）。
+  const erStart = app.indexOf('function ensureReader()');
+  const erEnd = app.indexOf('function closeReaderIfLoaded()', erStart);
+  assert.ok(erStart > 0 && erEnd > erStart, '找不到 ensureReader 的边界锚点（closeReaderIfLoaded）');
+  const erBody = app.slice(erStart, erEnd);
+  assert.match(erBody, /m\.bindReader\(/, 'ensureReader 必须绑定阅读器根节点');
+  assert.match(erBody, /m\.setOnExpire\(\(\) => expireSession\(\)\)/, 'bindReader 后必须注入会话过期收敛回调');
+  assert.ok(erBody.indexOf('m.bindReader(') < erBody.indexOf('m.setOnExpire('), 'onExpire 必须在 bindReader 之后注入');
 });
 
 test('P2-6 sw 白名单放行 /opds 与 /opds/ 两种形态', () => {

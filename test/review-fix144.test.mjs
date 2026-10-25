@@ -135,7 +135,11 @@ test('P3 前端：finishLogout 收敛阅读器 / exitBatchMode 不闪现 / place
   const fEnd = app.indexOf('function expireSession()', f); // 整段函数体（固定字符窗口会被新增注释击穿）
   assert.ok(f > 0 && fEnd > f, '找不到 finishLogout 的边界锚点（expireSession）');
   const fBody = app.slice(f, fEnd);
-  assert.match(fBody, /reader\.closeReader\(\);\s*\n\s*closeModal\(\);/, 'finishLogout 必须先收敛阅读器');
+  assert.match(fBody, /closeReaderIfLoaded\(\);\s*\n\s*closeModal\(\);/, 'finishLogout 必须先收敛阅读器');
+  // #149 之后 closeReader 变成"模块加载过才关"（懒加载），所以哨兵要分两层：
+  // 既要求 finishLogout 调它，也要求它真的会调到 reader.closeReader —— 否则空函数也能骗过上一行。
+  assert.match(app, /function closeReaderIfLoaded\(\) \{\s*\n\s*if \(readerMod\) readerMod\.closeReader\(\);/,
+    'closeReaderIfLoaded 必须真的调 reader.closeReader');
   const e = app.indexOf('function exitBatchMode(');
   const eBody = app.slice(e, e + 400);
   assert.match(eBody, /if \(rerender\) renderShelf\(\);/, 'exitBatchMode 必须可跳过重渲染');

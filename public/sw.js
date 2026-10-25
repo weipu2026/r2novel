@@ -1,14 +1,18 @@
 /* sw.js — r2novel Service Worker（PWA 离线支持）
  *
  * 策略：
- *   - 静态壳（/、CSS/JS/manifest/icons）：stale-while-revalidate（先返回缓存，后台刷新）
+ *   - 静态壳（/、CSS/JS/manifest/icons，含 SHELL 与 LAZY 两部分）：stale-while-revalidate
+ *     —— LAZY 里的模块第一次被 fetch 时同样走这条链路，所以"用过一次就能离线"
  *   - /api/*、/opds、/export/* 一律网络直走，不缓存（鉴权 + 强动态，响应均 no-store）
  *   - 跨域请求直接 pass-through
  *   - 章节正文 / 整本书目不在 SW 缓存，由前端 IndexedDB（offline.js）按需存
  *
  * 离线能用的真正保障来自离线整本下载（IndexedDB），SW 只是「静态壳可缓存」。
  */
-const CACHE = 'r2novel-shell-v14';
+const CACHE = 'r2novel-shell-v15';
+/* 离线壳 = 首屏真正会用到的那批（#149 代码分割后从 29 项收缩到 17 项）。
+ * 判据不是"文件存在就预缓存"，而是"打开首页会不会用到"—— 预缓存用不到的模块，
+ * 等于让首访为"也许永远不会点"的功能付流量。 */
 const SHELL = [
   '/',
   '/index.html',
@@ -17,28 +21,39 @@ const SHELL = [
   '/js/main.js',
   '/js/app.js',
   '/js/dom.js',
-  '/js/upload/session.js',
-  '/js/upload/ctx.js',
-  '/js/upload/prepare.js',
-  '/js/upload/preview.js',
-  '/js/upload/upload.js',
-  '/js/upload/editor.js',
-  '/js/upload/files.js',
-  '/js/upload/rewash.js',
-  '/js/upload/index.js',
-  '/js/upload/payload.js',
   '/js/store.js',
-  '/js/reader.js',
-  '/js/cleaner.js',
   '/js/offline.js',
   '/js/ui.js',
   '/js/exporter.js',
   '/js/shared-const.js',
-  '/js/shared-text.js',
+  '/js/shared-text.js', // dom.js 静态 re-export normTitle → 首屏依赖
   '/js/batch-queue.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/maskable-512.png',
+];
+
+/* 按需加载的模块（#149 代码分割）：首屏不下载，第一次用到时由下面的 fetch handler
+ * 走 stale-while-revalidate 自动入缓存 —— 之后断网照常可用，离线能力不受影响。
+ * 唯一的前置条件是"装完从没打开过任何书就断网"，而那种状态下本来也没有离线书可读
+ * （下载整本的入口都在阅读器内部，必然先加载过 reader.js）。
+ *
+ * check.mjs ⑤ 对这份清单是硬约束：
+ *   SHELL ∪ LAZY 必须覆盖 public/ 全部静态资源 · SHELL ∩ LAZY = ∅ ·
+ *   LAZY 里的模块不得出现在静态 import 图里（否则它其实是首屏依赖，标成懒加载只是骗门禁）。 */
+const LAZY = [
+  '/js/reader.js',
+  '/js/cleaner.js',
+  '/js/upload/index.js',
+  '/js/upload/files.js',
+  '/js/upload/preview.js',
+  '/js/upload/prepare.js',
+  '/js/upload/upload.js',
+  '/js/upload/editor.js',
+  '/js/upload/session.js',
+  '/js/upload/rewash.js',
+  '/js/upload/payload.js',
+  '/js/upload/ctx.js',
 ];
 
 self.addEventListener('install', (event) => {

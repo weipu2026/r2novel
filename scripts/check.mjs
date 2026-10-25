@@ -56,23 +56,25 @@ const HOST_CAPS = (() => {
     process.exit(1);
   }
   const code = stripCode(fs.readFileSync(p, 'utf8')); // 函数声明会提升，可先用后定义
-  const i = code.indexOf('initUpload(');
+  // #149 代码分割：上传域改成按需加载后，宿主能力表从 `initUpload({...})` 的实参搬到
+  // `uploadCaps()` 的返回值（延迟到首次 openUpload 才注入）。锚点跟着搬，
+  // 但 fail-loud 的纪律一点不变 —— 锚点找不到仍是硬失败，不静默空转。
+  const i = code.indexOf('function uploadCaps()');
   if (i < 0) {
     // ⚠️ 锚点找不到**必须报错**（2026-10-06 审计 P2）：静默 return [] 会让规则 c（upload 域
-    // 必须走 host()）整段空转、零告警 —— app.js 的 import 一旦改名（`init as initUpload`
-    // 变 `init as initUploadUp`），这道门禁就永久失效而 CI 全绿。
-    console.error('HOST CAPS 门禁失效：public/js/app.js 里找不到 initUpload( 实参，规则 c 已整体空转。'
-      + '若 app.js 改了注入入口名，请同步更新本锚点。');
+    // 必须走 host()）整段空转、零告警 —— app.js 重构一次，这道门禁就永久失效而 CI 全绿。
+    console.error('HOST CAPS 门禁失效：public/js/app.js 里找不到 uploadCaps() 定义，规则 c 已整体空转。'
+      + '若 app.js 改了宿主能力表的承载方式，请同步更新本锚点。');
     process.exit(1);
   }
-  const open = code.indexOf('(', i);
+  const open = code.indexOf('{', i);
   let depth = 0, close = -1;
   for (let k = open; k < code.length; k++) {
-    if (code[k] === '(') depth++;
-    else if (code[k] === ')') { depth--; if (!depth) { close = k; break; } }
+    if (code[k] === '{') depth++;
+    else if (code[k] === '}') { depth--; if (!depth) { close = k; break; } }
   }
   if (close < 0) {
-    console.error('HOST CAPS 门禁失效：initUpload( 实参括号配对失败（app.js 可能被截断或语法损坏）。');
+    console.error('HOST CAPS 门禁失效：uploadCaps() 函数体花括号配对失败（app.js 可能被截断或语法损坏）。');
     process.exit(1);
   }
   const out = new Set();
@@ -409,16 +411,52 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
  * 「漏搬常量」同族（手写镜像必漂移），且离线用户只会表现为断网后打不开，平时毫无症状。
  * 这里不做手写镜像，而是**双向比对**：
  *   期望集合 = public/ 下全部可预缓存静态资源（js / css / manifest / icons / index.html；
- *             排除 _headers —— CF 配置文件非页面资源；排除 sw.js —— SW 不预缓存自身）。
- *   SW_MISSING：期望集合里有、SHELL 没有 → 离线壳缺文件（新模块上线离线不可用）
- *   排除项（不属于"页面运行时资源"，不进期望集合）：_headers（平台配置）、
- *   sw.js（不预缓存自身）、robots.txt（只给爬虫看）
- *   SW_UNKNOWN：SHELL 里有、public/ 没有 → 清单指向已删除/改名文件（404 白缓存）
+ *             排除 _headers —— CF 配置文件非页面资源；排除 sw.js —— SW 不预缓存自身；
+ *             排除 robots.txt —— 只给爬虫看，页面运行时用不到）。
+ *   SW_MISSING：期望集合里有、SHELL 与 LAZY 都没有 → 离线壳缺文件（新模块上线离线不可用）
+ *   SW_UNKNOWN：SHELL/LAZY 里有、public/ 没有 → 清单指向已删除/改名文件（404 白缓存）
  * index.html 特例：'/' 与 '/index.html' 都算覆盖（现清单两者并存，不必二选一）。
+ *
+ * #149 代码分割后新增两条判据（防止"懒加载清单"被滥用）：
+ *   SW OVERLAP：同一文件既在 SHELL 又 在 LAZY（装两份、白占空间，还掩盖真实首屏依赖）
+ *   SW LAZY   ：LAZY 里的模块出现在**静态** import 图里 —— 它其实是首屏依赖，
+ *               标成懒加载只是把门禁骗过去，实际首屏照样下载（等于优化没做还背锅）
  */
+
+/** 只删注释、保留字符串字面量（stripCode 会把字符串一起删，import 路径就没了） */
+function stripCommentsOnly(src) {
+  let s = src.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  s = s.replace(/(^|[^:\\])\/\/[^\n]*/gm, '$1 ');
+  return s;
+}
+
+/** 从 public/js/main.js 出发的**静态** import 图，返回 '/js/x.js' 形式的集合。
+ *  判据的由来：代码分割对不对没法靠"文件里有没有 import( 字样"判断，唯一可靠的问法是
+ *  "这个模块能不能被首屏静态拉到"。动态 import() 不进这张图，静态 import / re-export 才进。 */
+function staticReach() {
+  const seen = new Set();
+  const stack = ['/js/main.js'];
+  while (stack.length) {
+    const url = stack.pop();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const abs = path.join(PUBLIC, url.slice(1));
+    if (!fs.existsSync(abs)) continue;
+    const code = stripCommentsOnly(fs.readFileSync(abs, 'utf8'));
+    const re = /(?:^|\n)[ \t]*(?:import\s*(?:[^;\n]*?\sfrom\s*)?|export\s*\*\s*from\s*)['"]([^'"]+)['"]/g;
+    for (const m of code.matchAll(re)) {
+      const spec = m[1];
+      if (!spec.startsWith('.')) continue; // 本项目没有裸包名依赖
+      stack.push(path.posix.normalize(path.posix.join(path.posix.dirname(url), spec)));
+    }
+  }
+  return seen;
+}
+
 {
   const swPath = path.join(PUBLIC, 'sw.js');
-  const m = fs.readFileSync(swPath, 'utf8').match(/const\s+SHELL\s*=\s*\[([\s\S]*?)\]/);
+  const swSrc = fs.readFileSync(swPath, 'utf8');
+  const m = swSrc.match(/const\s+SHELL\s*=\s*\[([\s\S]*?)\]/);
   if (!m) {
     say('SW SHELL', 'sw.js 里找不到 SHELL 数组定义');
   } else {
@@ -426,7 +464,15 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
     const shellSet = new Set(shell);
     if (shellSet.size !== shell.length) say('SW SHELL', `SHELL 存在重复条目：${shell.filter((v, i) => shell.indexOf(v) !== i).join(' ')}`);
 
-    // 期望集合：public/ 下静态资源（排除 _headers / sw.js）
+    // 按需加载清单（#149）：首屏不下载，第一次用到时由 fetch handler 的 SWR 自动入缓存
+    const mLazy = swSrc.match(/const\s+LAZY\s*=\s*\[([\s\S]*?)\]/);
+    if (!mLazy) say('SW LAZY', 'sw.js 里找不到 LAZY 数组定义（代码分割后必须显式声明懒加载清单）');
+    const lazy = mLazy ? [...mLazy[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]) : [];
+    const lazySet = new Set(lazy);
+    if (lazySet.size !== lazy.length) say('SW LAZY', `LAZY 存在重复条目：${lazy.filter((v, i) => lazy.indexOf(v) !== i).join(' ')}`);
+    for (const s of shellSet) if (lazySet.has(s)) say('SW OVERLAP', `${s} 同时在 SHELL 与 LAZY 里（只能二选一）`);
+
+    // 期望集合：public/ 下静态资源（排除 _headers / sw.js / robots.txt）
     const assets = [];
     (function walkAssets(d) {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -448,12 +494,22 @@ console.log(`MODULE_OK · ${publicFiles.length} files`);
 
     const covered = (asset) =>
       asset === '/index.html' ? shellSet.has('/') || shellSet.has('/index.html') : shellSet.has(asset);
-    for (const a of assets) if (!covered(a)) say('SW MISSING', `静态资源 ${a} 不在 SHELL 预缓存清单（离线壳缺文件）`);
+    for (const a of assets) {
+      if (!covered(a) && !lazySet.has(a)) say('SW MISSING', `静态资源 ${a} 既不在 SHELL 也不在 LAZY（首屏漏文件 / 离线不可用）`);
+    }
 
     const expected = new Set(assets);
     for (const s of shellSet) {
       if (s === '/' || s === '/index.html') continue; // index.html 的两种写法都合法
       if (!expected.has(s)) say('SW UNKNOWN', `SHELL 条目 ${s} 在 public/ 下不存在（404 白缓存，多为改名/删除后忘清）`);
+    }
+    for (const s of lazySet) {
+      if (!expected.has(s)) say('SW UNKNOWN', `LAZY 条目 ${s} 在 public/ 下不存在（404 白缓存）`);
+    }
+
+    const reach = staticReach();
+    for (const s of lazySet) {
+      if (reach.has(s)) say('SW LAZY', `${s} 出现在静态 import 图里（它其实是首屏依赖，不该标成懒加载）`);
     }
   }
 }

@@ -142,11 +142,15 @@ test('桩自检：HTML 解析必须产出真实元素树（含 hN 这类「字�
 
 test('契约哨兵：app.js 必须把弹层世代令牌注入 upload 域（modalGen/modalTake）', () => {
   const src = fs.readFileSync(new URL('../public/js/app.js', import.meta.url), 'utf8');
-  const at = src.indexOf('initUpload({');
-  assert.ok(at > 0, '找不到 initUpload 调用点');
-  const caps = src.slice(at, at + 800);
-  assert.match(caps, /modalGen/, 'initUpload 实参缺 modalGen —— editor.js 的世代校验拿不到号');
-  assert.match(caps, /modalTake/, 'initUpload 实参缺 modalTake');
+  // #149 代码分割后：宿主能力表从 initUpload({...}) 实参搬到 uploadCaps() 的返回值，
+  // 由 ensureUpload 在首次 openUpload 时注入。锚点跟着搬，但"必须真的注入"要另加一条断言 ——
+  // 否则 uploadCaps 可能只是写在文件里没人调用，哨兵就变成空转。
+  const at = src.indexOf('function uploadCaps()');
+  assert.ok(at > 0, '找不到 uploadCaps()（宿主能力表）');
+  const caps = src.slice(at, at + 600);
+  assert.match(caps, /modalGen/, 'uploadCaps 缺 modalGen —— editor.js 的世代校验拿不到号');
+  assert.match(caps, /modalTake/, 'uploadCaps 缺 modalTake');
+  assert.match(src, /m\.init\(uploadCaps\(\)\)/, 'ensureUpload 必须把宿主能力表真的注入 upload 域');
   assert.match(src, /function openModal\(html\) \{\s*modalSeq\+\+/, 'openModal 必须推进世代号');
   assert.match(src, /function closeModal\(\) \{\s*modalSeq\+\+/, 'closeModal 必须推进世代号（关闭也要作废在途写）');
 });

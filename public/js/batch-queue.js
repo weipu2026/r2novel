@@ -15,7 +15,8 @@
  * @param {number} pageSize 单批上限（= BATCH_BOOKS_MAX，后端也只认这么多）
  * @param {(batch: string[]) => Promise<{updated?: number, deferred?: string[], retry?: boolean}>} send 单批请求
  * @param {(done: number, total: number) => void} [onProgress] 进度回调（done=已出队数量）
- * @param {(e: unknown) => void} [onError] 单批失败时的原始错误（失败仍计入 fail，重试语义不变）。
+ * @param {(e: unknown) => boolean} [onError] 单批失败时的原始错误（失败仍计入 fail，重试语义不变）。
+ *        返回 **true** 表示立刻收手（队列停止，返回 { aborted: true }）；其余返回值一律忽略。
  *        存在的理由：调用方需要区分「书的问题」与「会话过期（401）」——后者重试一万次也不会成功，
  *        必须收敛到登录页，而不是报成「N 本失败（可能是半成品书）」。
  * @returns {Promise<{ok: number, fail: number}>} ok=后端 updated 之和（真正落库的本数），
@@ -38,7 +39,12 @@ export async function runBatched(ids, pageSize, send, onProgress, onError) {
     try {
       resp = await send(batch);
     } catch (e) {
-      if (onError) onError(e); // 把错误交出去分类，但失败语义不变（整批计入 fail、不原地重试）
+      // 把错误交出去分类，失败语义不变（整批计入 fail、不原地重试）。
+      // 返回**真值** = 调用方要求立刻收手（典型：401 会话已死，后面每一批都注定失败）：
+      // 旧实现只让调用方置一个标记，队列照样跑到底 —— 1500 本 = 84 个必 401 的请求。
+      // 判据是 === true，不是真值：回调里常见的 `onError: (e) => seen.push(e)` 返回的是数组长度（数字）
+      // —— 真值判断会把「只是记录一下」误当成「快收手」。（收手是破坏性动作，宁可少触发。）
+      if (onError && onError(e) === true) return { ok, fail: Math.max(0, total - ok), aborted: true };
       resp = null; // 单批失败：整批计入失败、不原地重试（沿用旧行为，避免网络抖动时死磕）
     }
     // 只认「本轮真的发出去的 id」里回传的 deferred：后端回传别的东西也不会污染队列

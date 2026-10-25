@@ -670,6 +670,9 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 
 /* ============ M2：卡片角标 / 置顶 / 菜单 ============ */
 .card { position: relative; }
+/* 打开一本书的忙态（P1-4）：reader/upload 模块按需下载，弱网下 1–3 秒没有任何反馈。
+   只降透明度、不拦截点击 —— 用户想改点别的书时不该被卡住（点另一本会推进意图令牌）。 */
+.card.opening { opacity: .6; }
 /* 元信息行：桌面端不放角标（角标 absolute 落在卡右上，不参与这里），
    手机端是「书名 / 元信息+进度」两行布局的第二行。 */
 .card-meta-row { display: flex; align-items: center; gap: 6px; min-width: 0; }

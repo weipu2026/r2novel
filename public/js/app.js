@@ -27,6 +27,11 @@ let readerMod = null; // 已加载的模块（closeReader 要同步调用，不�
 let readerP = null; // 在途/已完成的加载 Promise（并发去重）
 let upMod = null;
 let upP = null;
+/** 视图意图令牌（R150 P1-4）：每次 showView、每个异步打开入口都推进它。
+ *  懒加载入口在 await 之后必须比对取号 —— 模块下载期间用户完全可能点回书架/改点另一本书，
+ *  无条件切视图的后果是「上传页凭空出现」或「两个 .view 纵向同屏」（openBook 尾部裸揭阅读页）。
+ *  语义：**最后一次用户意图胜出**，晚到的旧意图一律作废。 */
+let viewSeq = 0;
 
 function ensureReader() {
   if (!readerP) {
@@ -36,6 +41,8 @@ function ensureReader() {
         m.bindReader(els.readRoot, onNavBack);
         // #145 P2-3：reader 内 401 的统一收敛出口（下载/导出/翻章）—— 与 handleAuth 同一终点
         m.setOnExpire(() => expireSession());
+        // P1-4：阅读器不再自己裸揭阅读页，视图切换统一由宿主收口（见 reader.js setShowView）
+        m.setShowView(showView);
         return m;
       })
       .catch((e) => {
@@ -85,29 +92,39 @@ function ensureUpload() {
   return upP;
 }
 
-function openUploadLazy() {
+/** 懒加载入口的统一形状：取号 → await 模块 → 比对令牌 → 执行。
+ *  btn 给了顺手做忙态：模块 ≈110 KB，弱网下 1–3 秒毫无反馈 ＝ 用户以为没点上，于是再点一次。 */
+function lazyOpen(btn, errMsg, run) {
+  const t = viewSeq;
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+  }
+  const done = () => {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+  };
   ensureUpload()
-    .then((m) => m.openUpload())
+    .then((m) => {
+      done();
+      if (t !== viewSeq) return; // await 期间已切视图 → 这次意图作废（P1-4）
+      run(m);
+    })
     .catch((e) => {
+      done();
       console.error('[upload] 模块加载失败', e);
-      toast('上传模块加载失败，请检查网络后重试', 3000);
+      toast(errMsg, 3000);
     });
+}
+function openUploadLazy(btn) {
+  lazyOpen(btn || els.uploadBtn, '上传模块加载失败，请检查网络后重试', (m) => m.openUpload());
 }
 function openChapterEditorLazy(b) {
-  ensureUpload()
-    .then((m) => m.openChapterEditor(b))
-    .catch((e) => {
-      console.error('[upload] 模块加载失败', e);
-      toast('编辑模块加载失败，请检查网络后重试', 3000);
-    });
+  lazyOpen(null, '编辑模块加载失败，请检查网络后重试', (m) => m.openChapterEditor(b));
 }
 function rewashConfirmLazy(b) {
-  ensureUpload()
-    .then((m) => m.rewashConfirm(b))
-    .catch((e) => {
-      console.error('[upload] 模块加载失败', e);
-      toast('清洗模块加载失败，请检查网络后重试', 3000);
-    });
+  lazyOpen(null, '清洗模块加载失败，请检查网络后重试', (m) => m.rewashConfirm(b));
 }
 
 const PAGE = 60; // 书库分页
@@ -119,6 +136,10 @@ const PRESET_SRC = 20;
 let presetTags = [];
 let presetTagsAt = 0; // 上次云端刷新时间（导航切换时去重，避免同一波操作连发多次 GET /api/tags）
 let presetTagsInflight = null;
+/** P2-10：标签刷新的世代计数 —— 全站唯一没有世代守卫的写入口。登出瞬间在途的
+ *  GET /api/tags 迟到回来会把上一会话的标签写回 localStorage 并画进（已隐藏的）上传页，
+ *  下一个登录者能看到前任的标签。finishLogout 推进它即可作废在途响应。 */
+let presetSeq = 0;
 
 let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
 // #144 P2-7：回收站保留期以服务端生效值为准（apiBooks/apiTrashList 随响应带 trashDays，
@@ -244,21 +265,9 @@ export function init() {
   }
   els.modalBox.addEventListener('click', onDiagBoxClick); // 残留诊断面板动作委托（常驻单例，只绑一次）
   els.bbExit.addEventListener('click', exitBatchMode);
-  els.bbAll.addEventListener('click', () => {
-    const list = sortedBooks(filteredBooks()); // 过滤+排序只算一次（百本量级下重复算一遍纯浪费）
-    for (const b of list) selected.add(b.id);
-    syncBatchBar();
-    renderGrid(list);
-  });
-  els.bbInvert.addEventListener('click', () => {
-    const list = sortedBooks(filteredBooks());
-    for (const b of list) {
-      if (selected.has(b.id)) selected.delete(b.id);
-      else selected.add(b.id);
-    }
-    syncBatchBar();
-    renderGrid(list);
-  });
+  // 过滤+排序只算一次（百本量级下重复算一遍纯浪费）；全选/反选走同一个出口
+  els.bbAll.addEventListener('click', () => pickBatch(sortedBooks(filteredBooks()), false));
+  els.bbInvert.addEventListener('click', () => pickBatch(sortedBooks(filteredBooks()), true));
   els.bbTags.addEventListener('click', batchEditTags);
   els.bbDone.addEventListener('click', () => batchRun('setFinished', { finished: true }, `把 ${selected.size} 本书标记为「已完结」？`));
   els.bbOngoing.addEventListener('click', () => batchRun('setFinished', { finished: false }, `把 ${selected.size} 本书标记为「连载中」？`));
@@ -354,6 +363,7 @@ async function boot() {
 }
 
 function showView(name) {
+  viewSeq++; // 任何一次视图切换都推进令牌（含 openBook 内部那次）
   ['login', 'shelf', 'upload', 'trash'].forEach((v) => els[v].classList.add('hidden'));
   els.readRoot.classList.add('hidden');
   els.sheet.classList.add('hidden');
@@ -449,6 +459,7 @@ async function finishLogout() {
   // 'recent' 而下拉框仍显示「字数」，此后任何筛选操作都按 recent 排、与显示永久矛盾
   // 且用户无从察觉（2026-10-06 审计 P2）。
   if (els.sortSel) els.sortSel.value = 'recent';
+  presetSeq++; // P2-10：作废在途的 GET /api/tags（否则前任的标签会写回快照并画进上传页）
   presetTags = []; presetTagsAt = 0; presetTagsInflight = null;
   els.grid.innerHTML = '';
   // #146 P2-5：书架里**不随 grid 重建**的动态容器也要清 —— 继续阅读卡（含书名与进度）、
@@ -580,6 +591,7 @@ function sortedBooks(list) {
 /** 批量选择集对账（L4）：筛选条件变化后，已不在当前范围内的书必须从选择集移除。
  *  否则用户换了关键词/标签再点「删除」，会连带删掉那些已经看不见的书——看不见却删得掉，
  *  是批量治理里最危险的一类误操作。翻页不算筛选（同页内的书仍在 filteredBooks() 里，保持选中）。 */
+let pruneToastAt = 0; // P3-17：剪选提示的节流时间戳
 function pruneSelected() {
   if (!batchMode || !selected.size) return;
   const live = new Set(filteredBooks().map((b) => b.id));
@@ -592,6 +604,11 @@ function pruneSelected() {
   }
   if (!n) return;
   syncBatchBar();
+  // 节流（P3-17）：搜索框 150ms 防抖就 prune 一次，逐次弹 2.2s toast 会让 #toast（role="status"）
+  // 连续播报同一句话，读屏用户听不清、视觉上提示条也一直亮着。3 秒内只提示一次。
+  const now = Date.now();
+  if (now - pruneToastAt < 3000) return;
+  pruneToastAt = now;
   toast(`筛选变化：已取消 ${n} 本不在当前范围内的选择`, 2200);
 }
 
@@ -626,6 +643,9 @@ function renderGrid(list) {
   // L5：页码越界收敛——筛选/删除让总页数变少时回退到最后有效页，而不是被无条件重置到第 1 页
   if (ui.page > Math.max(1, Math.ceil(list.length / PAGE))) ui.page = Math.max(1, Math.ceil(list.length / PAGE));
   grid.innerHTML = '';
+  // P3-16：网格一重建，操作单的锚点（卡片里的 ⋯ 或整张卡）就被摘掉了 —— 操作单会停在旧坐标上
+  // 继续挂着，看上去像「点开了一个不属于任何书的菜单」。锚点失联就顺手关掉，不让它悬空。
+  if (sheetAnchor && !sheetAnchor.isConnected) closeSheet();
   const shown = list.slice(0, ui.page * PAGE);
   for (const b of shown) grid.appendChild(makeCard(b));
   const hasMore = shown.length < list.length;
@@ -645,7 +665,7 @@ function renderGrid(list) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = '＋ 上传第一本书';
-      btn.addEventListener('click', () => openUploadLazy());
+      btn.addEventListener('click', () => openUploadLazy(btn));
       box.append(logo, strong, p, btn);
       grid.appendChild(box);
     } else {
@@ -856,9 +876,11 @@ async function refreshPresetTags(force = false) {
   if (!force && presetTagsInflight) return presetTagsInflight;
   if (!force && Date.now() - presetTagsAt < 3000) return;
   presetTagsAt = Date.now();
+  const gen = presetSeq;
   const task = (async () => {
     try {
       const data = await api.tags();
+      if (gen !== presetSeq) return; // 期间登出/换代 → 这份数据属前任会话，丢弃（P2-10）
       presetTags = (data.tags || []).slice(0, PRESET_SRC).map((t) => t.tag);
       local.setPresetTags(presetTags);
       renderPresetChips();
@@ -954,13 +976,7 @@ function makeCard(b) {
     tick.textContent = selected.has(b.id) ? '✓' : '';
     c.appendChild(tick);
     // 批量模式下点卡片 = 勾选/取消（不进阅读）
-    c.addEventListener('click', () => {
-      if (selected.has(b.id)) selected.delete(b.id);
-      else selected.add(b.id);
-      c.classList.toggle('picked', selected.has(b.id));
-      tick.textContent = selected.has(b.id) ? '✓' : '';
-      syncBatchBar();
-    });
+    c.addEventListener('click', () => togglePick(b.id, c));
   } else {
     const badge = progBadgeText(b);
     if (badge) {
@@ -1009,7 +1025,7 @@ function makeCard(b) {
       openSheet(b, e.currentTarget);
     });
     c.appendChild(more);
-    c.addEventListener('click', () => openRead(b.id));
+    c.addEventListener('click', () => openRead(b.id, c));
   }
   // div 卡片的键盘可达性（原 <button> 自带，改 div 后补上）：Enter/Space 触发与点击一致。
   // 只在本体聚焦时响应（e.target !== c 的按键属于卡内 ⋯ 按钮，由它自己处理）。
@@ -1018,28 +1034,36 @@ function makeCard(b) {
   c.addEventListener('keydown', (e) => {
     if (e.target !== c || (e.key !== 'Enter' && e.key !== ' ')) return;
     e.preventDefault();
-    if (batchMode) {
-      if (selected.has(b.id)) selected.delete(b.id);
-      else selected.add(b.id);
-      c.classList.toggle('picked', selected.has(b.id));
-      const tick = c.querySelector('.pick-tick');
-      if (tick) tick.textContent = selected.has(b.id) ? '✓' : '';
-      syncBatchBar();
-    } else {
-      openRead(b.id);
-    }
+    if (batchMode) togglePick(b.id, c);
+    else openRead(b.id, c);
   });
   return c;
 }
 
-async function openRead(id) {
+/** 打开一本书。卡面忙态 + 意图令牌：ensureReader 首次要下 ≈53 KB（弱网 1–3 秒），
+ *  这段时间绝不能先把阅读页揭出来 —— bindReader 还没跑，顶栏「返回/目录/Aa」全都点不动，
+ *  用户看到的是白屏。现在由 openBook 在书目到达后自己调 showView('read')（setShowView 注入）。 */
+async function openRead(id, card) {
+  const t = ++viewSeq;
+  if (card) {
+    card.classList.add('opening');
+    card.setAttribute('aria-busy', 'true');
+  }
   try {
-    showView('read');
-    await (await ensureReader()).openBook(id);
+    const m = await ensureReader();
+    if (t !== viewSeq) return; // 期间已切视图 / 已改点另一本书（P1-4）
+    await m.openBook(id);
   } catch (e) {
     if (handleAuth(e)) return; // expireSession → finishLogout 已完成视图切换（含回登录页）
-    showView('shelf');
+    // 判据用「此刻是否还在阅读页」而不是令牌：openBook 内部那次 showView 自己也会推进令牌，
+    // 拿 t !== viewSeq 判断会漏掉「已进阅读页但渲染失败」这一路，把用户留在白屏上。
+    if (!els.readRoot.classList.contains('hidden')) showView('shelf');
     toast('打开失败：' + (e.message || e), 2500);
+  } finally {
+    if (card) {
+      card.classList.remove('opening');
+      card.removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -1361,6 +1385,34 @@ function openMoreSheet(ev) {
   ], ev && ev.currentTarget); // 桌面上贴住右上角那个 ⋯
 }
 
+/** 勾选状态变更的**唯一**出口（R150 P3-13）。
+ *  以前「卡片点击」「卡片 Enter/Space」「全选/反选」是三份手写实现：改一处必忘另两处，
+ *  而漏掉的后果是「点了没反应」「计数变了但卡片没变勾」这类只有单路径才复现的错。
+ *  只管单个切换；整批（全选/反选）走 pickBatch，避免 N 次 syncBatchBar。 */
+function togglePick(id, card) {
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  const on = selected.has(id);
+  if (card) {
+    card.classList.toggle('picked', on);
+    const tick = card.querySelector('.pick-tick');
+    if (tick) tick.textContent = on ? '✓' : '';
+  }
+  syncBatchBar();
+}
+
+/** 全选（invert=false）/ 反选（invert=true）：整批改选择集后重渲一次。
+ *  逐卡 togglePick 会让 syncBatchBar 跑 N 次（千本 = 千次 DOM 写）。 */
+function pickBatch(list, invert) {
+  for (const b of list) {
+    if (!invert) selected.add(b.id);
+    else if (selected.has(b.id)) selected.delete(b.id);
+    else selected.add(b.id);
+  }
+  syncBatchBar();
+  renderGrid(list);
+}
+
 function syncBatchBar() {
   els.bbCount.textContent = String(selected.size);
   // 未选书时禁用全部动作按钮（视觉+语义同步）
@@ -1386,7 +1438,11 @@ async function batchRun(action, payload, confirmText) {
       (batch) => api.batchBooks(batch, action, payload),
       (done, total) => busy(done / total, `批量操作中… ${done}/${total}`),
       (e) => {
-        if (e instanceof ApiError && e.status === 401) expired = true;
+        if (!(e instanceof ApiError && e.status === 401)) return false;
+        expired = true;
+        // P2-11：会话已死，后面每一批都注定 401 —— 立刻收手。旧实现只置标记、队列照跑到尾，
+        // 1500 本选中 = 84 个必失败请求，遮罩从 0% 一路跑到 100% 才跳登录页。
+        return true;
       }
     );
     ok = r.ok;
@@ -1909,10 +1965,15 @@ async function purgeOne(b) {
   busy(0.1, '正在彻底删除…');
   try {
     let remaining = 1;
+    let total = 0; // 首次响应的 remaining 已是「删完这一轮后」的剩余量 → 总数要 +1（同 clearTrashFlow）
     let guard = 0;
     while (remaining > 0 && guard++ < 1000) {
       const r = await api.purgeTrash(b.id);
       remaining = r.remaining || 0;
+      // P3-18：千章回收站要跑上千轮，旧实现全程只 busy(0.1) 一次 —— 进度条一动不动，
+      // 用户以为卡死。这里按剩余量推进（到 99% 封顶，只有真删完才显示完成）。
+      if (!total) total = Math.max(remaining + 1, 1);
+      busy(Math.min(0.99, Math.max(0.05, 1 - remaining / total)), remaining ? `正在彻底删除…剩余 ${remaining} 项` : '完成');
     }
     toast(remaining ? '删除未完成，请重试' : '已彻底删除', 1400);
     await loadTrash();

@@ -29,7 +29,8 @@ const state = {
   pref: { ...defaultPref(), ...local.getPref() },
 };
 
-const CACHE_MAX = 40; // 内存章缓存上限（LRU，防千章书无限膨胀）
+const CACHE_MAX = 40; // 内存章缓存条数上限（LRU，防千章书无限膨胀）
+const CACHE_MAX_CHARS = 4 * 1024 * 1024; // 总字符上限（P3-15）：40 章 × 单章 2 MB 的条数上限 = 80 MB 常驻
 
 function defaultPref() {
   return { fs: 18, lh: 1.95, theme: 'paper' };
@@ -39,6 +40,7 @@ function defaultPref() {
 let els = {};
 let onNav = null;
 let onExpire = null; // 会话过期收敛回调（app.js 注入）—— reader 不 import app.js（避免环依赖）
+let onShowView = null; // 视图切换出口（app.js 注入，P1-4）—— 同上，避免环依赖
 const mqDesktop = () => matchMedia('(min-width: 900px)').matches;
 
 let flushBound = false;
@@ -48,6 +50,13 @@ let flushBound = false;
  *  会话已死重试永远失败、用户被困阅读器。现在统一「中文提示 + 收敛到登录页」。 */
 export function setOnExpire(fn) {
   onExpire = fn;
+}
+
+/** app.js 注入：视图切换的唯一出口（R150 P1-4）。
+ *  openBook 尾部原本自己 `els.root.classList.remove('hidden')` —— 绕过 showView 就意味着
+ *  其它视图的 hidden 不会被补回去，阅读页与书架/上传页纵向同屏（.view 是 height:100% 流式布局）。 */
+export function setShowView(fn) {
+  onShowView = fn;
 }
 
 /** 会话已死的统一处置：提示 + 收敛（不跳转的提示等于没修 —— 重试永远不会成功）。
@@ -191,6 +200,19 @@ export function closeReader() {
   // 新书渲染完成前用户会先看到上一本书的正文闪现。openBook 渲染前会重填，无需保留。
   els.art.innerHTML = '';
   progConfirmIdx = -1; // 确认态跨书残留的话，新书里第一次轻点进度线就会直接跳章（违反「轻点只预览」契约）
+  // P2-9：设置面板与目录抽屉必须跟着关。旧实现只清 state 与正文：阅读中调完字号直接点返回，
+  // 面板的「已展开」状态留在 DOM 上 → 开下一本书时它自己弹出来；抽屉里还挂着上一本书的
+  // 目录（共享设备上的隐私残留，与 #144 P3 同一类问题）。
+  closePref();
+  closeToc();
+  if (els.drawerList) els.drawerList.innerHTML = '';
+  if (els.sideList) els.sideList.innerHTML = '';
+  if (els.topTitle) els.topTitle.textContent = '';
+  if (els.sideTitle) els.sideTitle.textContent = '';
+  if (els.tocTitle) els.tocTitle.textContent = '';
+  if (els.sideOpenTitle) els.sideOpenTitle.textContent = '目';
+  els.root.dataset.book = '';
+  state.toc = { draw: TOC_PAGE, side: TOC_PAGE };
 }
 
 export async function openBook(id) {
@@ -212,7 +234,9 @@ export async function openBook(id) {
   // 恢复进度（本地 / 云端均为 1-based 章节号，取较新；0/-1 视为未读首章）。
   // ⚠️ 顺序要紧：进度取回之后再落 state —— 若先落 state 再 await，期间用户点返回
   // （closeReader 已把 state.book 置 null）会被这次 await 回来重新填上，白修一场。
-  const clampCh = (x) => Math.max(0, Math.min(meta.chapters.length - 1, x));
+  // 统一走模块级 clampChapter（P3-14）：旧实现在这里少一个 Math.floor —— 本地镜像若出现
+  // ch: 2.5（老版本脏数据 / 半同步），chapters[2.5] 是 undefined，打开书直接失败。
+  const clampCh = (x) => clampChapter(x, meta.chapters.length);
   let ch = 0;
   let ratio = 0;
   const lp = local.getProg(id);
@@ -251,7 +275,9 @@ export async function openBook(id) {
   els.side.classList.toggle('hidden', !desktop);
   els.root.classList.toggle('side-collapsed', !desktop);
   els.root.dataset.book = id;
-  els.root.classList.remove('hidden');
+  // 视图只由宿主一处控制（P1-4）：裸 remove('hidden') 不会给别的视图补 hidden
+  if (onShowView) onShowView('read');
+  else els.root.classList.remove('hidden');
   renderDrawerToc();
   if (desktop) {
     renderSideToc();
@@ -483,13 +509,19 @@ function bindProgLine() {
   });
 }
 
-/** 写入章缓存（LRU：命中提升为最新，超上限淘汰最久未读的章） */
+/** 写入章缓存（LRU：命中提升为最新，超上限淘汰最久未读的章）。
+ *  P3-15：淘汰判据是「条数 + 总字符」双阈值 —— 只按条数封顶时，40 章 × 单章 2 MB = 80 MB 常驻
+ *  （移动端 OOM 诱因），而 3000 字的短章 40 章才 0.1 MB（条数封顶反而过于保守）。
+ *  永远保留最新那一章：否则刚读的章会立刻被自己淘汰，翻回上一章又要重下。 */
 function cachePut(key, text) {
   state.cache.delete(key);
   state.cache.set(key, text);
-  while (state.cache.size > CACHE_MAX) {
+  let chars = 0;
+  for (const t of state.cache.values()) chars += t.length;
+  while (state.cache.size > 1 && (state.cache.size > CACHE_MAX || chars > CACHE_MAX_CHARS)) {
     const oldest = state.cache.keys().next().value;
     if (oldest === undefined) break;
+    chars -= (state.cache.get(oldest) || '').length;
     state.cache.delete(oldest);
   }
 }
@@ -818,7 +850,11 @@ export function progBaseline(id, sp) {
   return { id, at: Number(sp.updatedAt) || 0, known: true, failed: false };
 }
 
-const clampChapter = (x) => Math.max(0, Math.min(state.chapters.length - 1, Math.floor(x) || 0));
+/** 章节下标钳制：**唯一**实现（P3-14）。原先是两份：openBook 里的 clampCh 不 floor、
+ *  这里的 clampChapter 会 floor —— 同一份脏数据在两处得到不同结果，而 2.5 这种值在下标
+ *  访问上就是 undefined（打开书直接失败）。len 可显式传入：openBook 在 state 落地前就要钳制。 */
+const clampChapter = (x, len = state.chapters.length) =>
+  Math.max(0, Math.min(Math.max(0, len - 1), Math.floor(x) || 0));
 
 /** 与服务端进度对账（转回前台 / 写入被拒时调用）。
  *  serverProg 可由调用方直接传入（拒写响应里已带回真值，省一次读）。

@@ -169,7 +169,9 @@ async function importBatch(files, prevNoSplit = false) {
         const buf = new Uint8Array(await file.arrayBuffer());
         const sess = { title, bytes: buf, updating: null, keepRaw };
         upSession.begin(sess);
-        runPreview();
+        // #149 P1-B：runPreview 对大文件是异步的（走 Worker），而下面几行**马上**要读
+        // sess.preview.chapters 冻结快照 —— 不 await 会读到 undefined 直接抛。
+        await runPreview();
         els.upConfirm.disabled = true; // runPreview→updateConfirmBtn 会重启用按钮，这里再压住
         // 冻结章节数组（与单文件 onConfirm 同一判据）：uploadMany 在 createBook 的 await
         // 窗口后才读正文，期间控件切换会就地替换 preview 造成标题/正文错位

@@ -5,8 +5,10 @@
  * pvIconBtn / pvIconBtnSvg 被「编辑章节」复用（同款细线图标按钮语言）。
  */
 import { els, $$, IC } from '../dom.js';
+import { busy, busyDone } from '../ui.js';
 import { fmtWords } from '../store.js';
 import * as cleaner from '../cleaner.js';
+import { needsWorker, processBookOff } from '../cleaner-client.js';
 import * as upSession from './session.js';
 
 /* 「我们自动写进下拉框的编码值」（见 runPreview 开头的 forceEncoding 判定）。
@@ -43,9 +45,15 @@ function currentCleanOpts() {
   return o;
 }
 
-export function runPreview() {
+/* 预览世代：runPreview 对大文件变成 async（走 Worker），连点两次可能并发 ——
+ * 先发起的那轮在 await 之后必须作废，否则会用旧字节的结果覆盖新会话的预览
+ *（症状：换了文件，预览里还是上一本的内容）。 */
+let previewGen = 0;
+
+export async function runPreview() {
   const sess = upSession.current(); // 本函数作用域内下方已有 const cur（当前编码），故这里用 sess
   if (!sess || !sess.bytes) return;
+  const gen = ++previewGen;
   // 总开关「自动清洗排版」：关闭则整链不套清理（只按编码解码 + 分章）
   const useClean = els.upClean.checked;
   const cleanOpts = useClean ? currentCleanOpts() : { clean: false };
@@ -56,13 +64,30 @@ export function runPreview() {
   let forceEncoding = els.upEncoding.value;
   if (forceEncoding === 'auto' || forceEncoding === lastAutoSet) forceEncoding = null;
   const t0 = Date.now();
-  const r = cleaner.processBook(sess.bytes, {
+  const task = {
     fallbackTitle: sess.title,
     cleanOpts,
     forceEncoding,
     // 「不分章」：分章规则切错时的逃生门 —— 整本一章，取消勾选即恢复自动分章
     pattern: els.upNoSplit && els.upNoSplit.checked ? 'none' : 'auto',
-  });
+  };
+  // #149 P1-B：≥1.5 MB 丢给 Worker 解析。同步跑 10 MB 要占主线程 1 s（50 MB 上限约 5 s），
+  // 期间页面完全无响应 —— 用户以为崩了。小文件仍走同步（<100 ms，比 Worker 往返更快）。
+  // 批量导入期间**不抢遮罩**：那条链路有自己的进度条（setProg），here 的 busyDone 会把它的遮罩一起收掉。
+  let r;
+  if (needsWorker(sess.bytes)) {
+    const showMask = !upSession.isImporting();
+    if (showMask) busy(null, `正在解析 ${(sess.bytes.length / 1048576).toFixed(1)} MB…`);
+    try {
+      r = await processBookOff(sess.bytes, task);
+    } finally {
+      if (showMask) busyDone();
+    }
+    // await 期间用户换了文件 / 又发起了一轮 → 这轮结果作废
+    if (gen !== previewGen || upSession.current() !== sess) return;
+  } else {
+    r = cleaner.processBook(sess.bytes, task);
+  }
   // 服务端单章上限 2MB：超大章（整本一章兜底等）先按 UTF-8 字节边界自动分段，避免 413 中断留下半成品书
   const fit = cleaner.fitChapters(r.chapters);
   if (fit.extra > 0) r.fitNote = `含 ${fit.extra} 个超大单章，已自动分段`;

@@ -44,6 +44,8 @@ const SHELL = [
 const LAZY = [
   '/js/reader.js',
   '/js/cleaner.js',
+  '/js/cleaner-client.js',
+  '/js/cleaner-worker.js',
   '/js/upload/index.js',
   '/js/upload/files.js',
   '/js/upload/preview.js',

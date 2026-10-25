@@ -610,6 +610,13 @@ export function splitChapters(text, opts = {}) {
 // 约 200ms）纯属重复。按 (bytes 引用, forceEncoding) 缓存上一次结果：同一会话内复用；
 // 新会话是新 Uint8Array 对象，引用不等天然失配重算。
 let detMemo = null;
+/** 释放编码检测缓存（R150 P2-8）：detMemo 持有上一本书的 bytes 与**解码全文**，
+ *  50 MB 原件 ≈ 50 MB 字节 + 100 MB 级字符串，一直常驻到下一次解析 ——
+ *  移动端是 OOM 诱因，共享设备上则是登出后仍留着一整本书正文的隐私残留。
+ *  由 cleaner-client 的 disposeCleaner（登出 / 换会话）调用。 */
+export function clearDetMemo() {
+  detMemo = null;
+}
 function detectCached(bytes, forceEncoding) {
   if (detMemo && detMemo.bytes === bytes && detMemo.forceEncoding === forceEncoding) return detMemo.det;
   const det = forceEncoding ? { encoding: forceEncoding, text: decodeWith(bytes, forceEncoding) } : detectEncoding(bytes);

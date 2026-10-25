@@ -530,6 +530,60 @@ async function apiPublish(req, env, store, id) {
   });
 }
 
+/** 上传中断后「恢复到可读态」（R150 P1-3）。
+ *
+ * 背景：apiUpdateChapters 先把 meta.status 与状态副档**一起**写成 creating（publish 前不可读），
+ * 之后客户端才 bulk 传正文、最后 publish。弱网在 bulk 阶段中断（移动网络最常见的失败点）时，
+ * 书就永久停在 creating：读章 409「书正在更新中」、章节编辑器 409、回收站恢复 409 ——
+ * 用户看到的是「书还在、点开提示更新中」，除了整本重传没有任何自救路径。
+ *
+ * 这里只恢复**可读性**，不假装回滚了正文：replace 阶段同名 key 的正文可能已被新内容覆盖，
+ * 那部分不可逆（客户端会提示「缺失的章节请重新上传或重新清洗」）。append 是真正可回的：
+ * 追加的章是队尾新增 key、旧章一字未动 → 按客户端给的本批次章数截断回去。
+ *
+ * 幂等：不是 creating 一律 noop（发布已成功 / 已被上一次回滚修好 / 并发回滚）。
+ * 不乱改章表：只有 append + 令牌对得上 + 章数在范围内时才截断。 */
+async function apiRollback(req, env, store, id) {
+  const bj = await readJsonBody(req, 64 * 1024);
+  if (bj.err) return json({ error: bj.err }, bj.status);
+  const body = bj.body || {};
+  const meta0 = await readBook(store, id);
+  if (!meta0) return json({ error: '书不存在' }, 404);
+  if (meta0.status !== 'creating') return json({ ok: true, noop: true, status: meta0.status });
+  const idx = await openIndex(store, { single: id });
+  const op = body.op === 'append' ? 'append' : 'replace';
+  const count = Math.floor(Number(body.count) || 0);
+  const words = Math.max(0, Math.floor(Number(body.wordCount) || 0));
+  const batch = typeof body.batch === 'string' ? body.batch : '';
+  const m = await mutateMeta(
+    store,
+    id,
+    (meta) => {
+      if (meta.status !== 'creating') return { abort: json({ ok: true, noop: true, status: meta.status }) };
+      const cur = Array.isArray(meta.chapters) ? meta.chapters : [];
+      // 令牌对得上才敢截断：pending 是**本批次**登记（同令牌重试会回放同一批 keys），
+      // 跨批次误删会把别人刚追加的章删掉。
+      if (op === 'append' && count > 0 && count <= cur.length && meta.pending && (!batch || meta.pending.batch === batch)) {
+        meta.chapters = cur.slice(0, cur.length - count);
+        meta.wordCount = Math.max(0, (Number(meta.wordCount) || 0) - words);
+      }
+      meta.chapterCount = (Array.isArray(meta.chapters) ? meta.chapters : []).length;
+      meta.wordCount = Math.max(0, Number(meta.wordCount) || 0);
+      meta.status = 'ready';
+      delete meta.pending;
+      meta.updatedAt = Date.now();
+    },
+    null
+  );
+  if (!m.ok) return metaFail(m);
+  const meta = m.meta;
+  const old = idx.get(id);
+  idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog: old && old.prog }));
+  // 副档与索引同一步对齐：只写 meta 不写副档会留下「目录能开、每章 409」的错位。
+  await Promise.all([putStatus(store, id, 'ready'), idx.save({ bak: true })]);
+  return json({ ok: true, rolledBack: true, chapterCount: meta.chapterCount, wordCount: meta.wordCount });
+}
+
 /** 单书目录（章节表）——只读已发布书；顺带惰性清理 replace 遗留的孤儿章节 */
 async function apiBookMeta(store, id, req) {
   const got = await getWithEtag(store, KEY.book(id));
@@ -963,4 +1017,4 @@ async function apiDeleteChapter(store, id, key) {
 
 
 /* 供其他模块 / router.js 使用（集中导出，避免改动声明行） */
-export { apiPutChapter, apiPutChapters, apiPutRaw, apiRawGet, apiUpdateChapters, apiPublish, apiBookMeta, apiPatchBook, apiChapter, apiPatchChapter, apiInsertChapter, apiDeleteChapter };
+export { apiPutChapter, apiPutChapters, apiPutRaw, apiRawGet, apiUpdateChapters, apiPublish, apiRollback, apiBookMeta, apiPatchBook, apiChapter, apiPatchChapter, apiInsertChapter, apiDeleteChapter };

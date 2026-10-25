@@ -483,6 +483,10 @@ async function finishLogout() {
   // 收起抽屉/面板/书名。会话过期时若正在阅读页，漏掉这步会让阅读器状态跨会话残留
   //（重登后抽屉/悬浮层里还是上一会话的书与章节）。
   closeReaderIfLoaded();
+  // P2-8：清洗 Worker 与 cleaner 的检测缓存长期持有上一本书的 bytes 与解码全文
+  // （50 MB 原件 ≈ 50 MB + 100 MB 级字符串）。只在「上传域确实加载过」时才去清 ——
+  // 没加载过就没有实例，也免得为了一次登出白拉 36 KB 的 cleaner.js。
+  if (upMod) import('./cleaner-client.js').then((m) => m.disposeCleaner()).catch(() => {});
   closeModal();
   busyDone();
   showView('login');

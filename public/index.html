@@ -163,10 +163,13 @@
           <label class="switch" title="保留上传的原始 txt，以后可一键重新清洗"><input type="checkbox" id="upKeepRaw" checked><span>原件留档</span></label>
           <button id="upConfirm" class="primary" type="button">确认入库</button>
         </div>
-        <div id="upProgWrap" class="prog hidden">
-          <div class="prog-bar"><div id="upProgBar" class="prog-fill"></div></div>
-          <span id="upProgText" class="muted">上传中…</span>
-        </div>
+      </div>
+      <!-- R150 P2-6：进度条必须挂在 #upPrev **外面** —— 批量导入时预览整段是 display:none
+           （runPreview 会主动 hide），挂在里面时 setProg 全写进不可见节点：分钟级任务里
+           唯一的界面变化是按钮变灰，用户以为卡死 → 刷新 → 批次中断。 -->
+      <div id="upProgWrap" class="prog hidden">
+        <div class="prog-bar"><div id="upProgBar" class="prog-fill"></div></div>
+        <span id="upProgText" class="muted">上传中…</span>
       </div>
     </form>
   </main>

@@ -40,6 +40,7 @@ import {
   apiPutRaw,
   apiRawGet,
   apiPublish,
+  apiRollback,
   apiUpdateChapters,
   apiInsertChapter,
   apiPutChapters,
@@ -145,6 +146,18 @@ async function handleApi(req, env, store, url, p) {
   }
   if (mPublish && req.method === 'POST') return apiPublish(req, env, store, mPublish[1]);
   if (mPublish) {
+    await dropBody(req);
+    return json({ error: 'method' }, 405);
+  }
+
+  // R150 P1-3：更新中断后把书从 creating 恢复到可读态（幂等）
+  const mRollback = /^\/api\/books\/([^/]+)\/rollback$/.exec(p);
+  if (mRollback && !isSafeId(mRollback[1])) {
+    await dropBody(req);
+    return notFound();
+  }
+  if (mRollback && req.method === 'POST') return apiRollback(req, env, store, mRollback[1]);
+  if (mRollback) {
     await dropBody(req);
     return json({ error: 'method' }, 405);
   }

@@ -109,7 +109,8 @@ export async function onConfirm() {
     els.upConfirm.disabled = false;
     // 用户在同名弹窗里点「取消」是主动放弃，不是失败：静默复位即可，别打红色失败文案误导
     if (e && e.message === '已取消') return;
-    toast('上传失败：' + (e.message || e), 3200);
+    // 已回滚到可读态时要说清「书还在、能打开」，否则用户会以为整本没了
+    toast(e && e.rolledBack ? '更新中断，书已恢复可读（缺失章节请重新上传或「重新清洗」）：' + (e.message || e) : '上传失败：' + (e.message || e), 3600);
   } finally {
     upSession.setUploading(false); // 无论成败都解冻上传会话
     // #146 P2-6：解冻后立刻放行预览行 —— 失败重试时用户必须还能继续改标题/删章/换文件
@@ -178,14 +179,25 @@ async function uploadToExisting(id, op, payload, keepRaw, session) {
     ? { op, chapters: payload.chapters, wordCount: payload.wordCount, ...(batch ? { batch } : {}) }
     : { op, ...payload };
   const updated = await api.updateChapters(id, body);
+  // 从这一行起，书在服务端已经是 creating（读章/章节编辑/回收站恢复三条路径全 409）。
+  // 下面任何一步失败都必须把状态掰回来 —— 否则书永久卡在「更新中」，用户除了整本重传无路可走
+  // （R150 P1-3：移动网络在 bulk 阶段中断是最常见的失败点）。
   const keys = updated.chapterKeys || [];
   const n = payload.chapters.length; // 本次实际要传的正文数
-  const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
-  if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
-  // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：发布成功后由 finalizeUpload 内的
-  // onConfirm 分支刷新书架（publish 自 2026-09-17 起不再回传 books 快照，无快照时走 loadShelf 全量刷新）
-  const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session, op);
-  return finalizeUpload(id, rawRes);
+  try {
+    const startKeyIdx = keys.length - n; // replace→0（全部重传）；append→旧章数（只传新章）
+    if (startKeyIdx < 0) throw new Error('章节表与正文不匹配，已中止');
+    // 必须走 finalizeUpload 合并（而非只回传 rawFailed）：发布成功后由 finalizeUpload 内的
+    // onConfirm 分支刷新书架（publish 自 2026-09-17 起不再回传 books 快照，无快照时走 loadShelf 全量刷新）
+    const rawRes = await uploadBulkAndRaw(id, keys.slice(startKeyIdx), keepRaw, session, op);
+    return await finalizeUpload(id, rawRes);
+  } catch (e) {
+    // 尽力回滚（失败也不影响原始错误的抛出：rollback 本身 5xx 时用户仍看到真正的原因）。
+    // append 服务端会按 count 截断回旧章表；replace 只能恢复可读性（同名 key 的正文已覆盖）。
+    await api.rollbackBook(id, { op, count: n, wordCount: payload.wordCount, batch }).catch(() => {});
+    if (e && typeof e === 'object') e.rolledBack = true;
+    throw e;
+  }
 }
 
 /** 章节正文与原件留档互不依赖 → 并行上传（原件藏在正文传输窗口里，不再独占一程 RTT，

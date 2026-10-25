@@ -85,6 +85,10 @@ export const api = {
   updateChapters(id, payload) {
     return request(`/api/books/${encodeURIComponent(id)}/chapters`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
   },
+  /** R150 P1-3：更新中断后把书从 creating 恢复到可读态（服务端对非 creating 幂等 noop） */
+  rollbackBook(id, payload) {
+    return request(`/api/books/${encodeURIComponent(id)}/rollback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+  },
   // v1.1：已发布书章节就地编辑
   patchChapter(id, key, patch) {
     return request(`/api/books/${encodeURIComponent(id)}/chapters/${encodeURIComponent(key)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) });

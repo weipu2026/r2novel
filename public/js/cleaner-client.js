@@ -20,6 +20,26 @@ let worker = null;
 let seq = 0;
 const pending = new Map(); // id → { resolve, reject }
 
+/** 单次清洗的看门狗上限：50 MB 原件在 Worker 里实测 ≈5 s，留足慢设备余量 */
+const TIMEOUT_MS = 30000;
+
+/** 让 Worker 彻底失效：在途请求全部拒绝 + 实例销毁（下次调用重建）。
+ *  每一次拒绝都会让对应调用的 catch 走到「回退主线程同步清洗」—— 宁可卡几秒出结果，
+ *  也不能把用户钉在一张永不撤除的遮罩上（preview 的遮罩是 position:fixed; inset:0）。 */
+function killWorker(err) {
+  const e = err instanceof Error ? err : new Error('Worker 已失效');
+  for (const [, p] of pending) p.reject(e);
+  pending.clear();
+  if (worker) {
+    try {
+      worker.terminate();
+    } catch {
+      /* already dead */
+    }
+    worker = null;
+  }
+}
+
 export function needsWorker(bytes) {
   return !!(bytes && bytes.length >= OFFLOAD_BYTES);
 }
@@ -35,18 +55,12 @@ function getWorker() {
     if (ok) p.resolve(result);
     else p.reject(new Error(error || '清洗失败'));
   };
-  worker.onerror = (e) => {
-    // Worker 整体挂了（脚本 404 / 语法错 / 被 CSP 拦）：在途请求全拒，下次调用重建
-    const err = new Error((e && e.message) || 'Worker 加载失败');
-    for (const [, p] of pending) p.reject(err);
-    pending.clear();
-    try {
-      worker.terminate();
-    } catch {
-      /* already dead */
-    }
-    worker = null;
-  };
+  // 「消息永远回不来」有三种死法，每一种都必须把在途 Promise 结算掉（R150 P2-7）：
+  //   ① 脚本 404 / 语法错 / 被 CSP 拦 → onerror；
+  //   ② 回来的消息无法反序列化 → onmessageerror（这时 onmessage 根本不会触发）；
+  //   ③ Worker 活着但卡死（OOM / 死循环）→ 没有任何回调，只能靠看门狗定时器。
+  worker.onerror = (e) => killWorker(new Error((e && e.message) || 'Worker 加载失败'));
+  worker.onmessageerror = () => killWorker(new Error('Worker 消息解析失败'));
   return worker;
 }
 
@@ -65,28 +79,32 @@ export async function processBookOff(bytes, opts) {
     return cleaner.processBook(bytes, opts); // 构造 Worker 就失败（老浏览器/被拦）
   }
   const id = ++seq;
+  let timer = null;
   try {
     return await new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
-      w.postMessage({ id, bytes, opts });
+      timer = setTimeout(() => killWorker(new Error('清洗超时（>' + TIMEOUT_MS / 1000 + 's）')), TIMEOUT_MS);
+      try {
+        w.postMessage({ id, bytes, opts });
+      } catch (e) {
+        // 拿到的是已 terminate 的实例（onerror 之后 getWorker 会重建，但在途这次还握着旧引用）
+        killWorker(e instanceof Error ? e : new Error('Worker 不可用'));
+      }
     });
   } catch (e) {
     console.warn('[cleaner] Worker 路径失败，回退主线程', e);
     pending.delete(id);
     return cleaner.processBook(bytes, opts);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
 /** 退出登录 / 换会话时调用：终止 Worker，释放它那份 cleaner.js 实例 */
 export function disposeCleaner() {
-  for (const [, p] of pending) p.reject(new Error('已取消'));
-  pending.clear();
-  if (worker) {
-    try {
-      worker.terminate();
-    } catch {
-      /* ignore */
-    }
-    worker = null;
-  }
+  killWorker(new Error('已取消'));
+  // 顺带释放 cleaner 的编码检测缓存（R150 P2-8）：它持有上一本书的 bytes 与解码全文，
+  // 50 MB 原件 ≈ 50 MB 字节 + 100 MB 级字符串，常驻到下一次解析 —— 移动端 OOM 诱因，
+  // 共享设备上也是「登出后仍能拿到一整本书正文」的隐私残留。
+  cleaner.clearDetMemo();
 }

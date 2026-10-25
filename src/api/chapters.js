@@ -542,6 +542,10 @@ async function apiPublish(req, env, store, id) {
  * 追加的章是队尾新增 key、旧章一字未动 → 按客户端给的本批次章数截断回去。
  *
  * 幂等：不是 creating 一律 noop（发布已成功 / 已被上一次回滚修好 / 并发回滚）。
+ * 只服务「更新中断」路径 → 书必须在架（apiUpdateChapters 同款 indexHas 守卫）：
+ * 回收站里的 creating 书 / 首传半成品一律 404 —— 否则下面的 idx.upsert 会把书「复活」
+ * 成在架+回收站双态，随后回收站过期清理会删掉一本在架书的正文与 meta（书架留幽灵，
+ * 与 apiPublish #145 P1-2 同一条禁忌）。
  * 不乱改章表：只有 append + 令牌对得上 + 章数在范围内时才截断。 */
 async function apiRollback(req, env, store, id) {
   const bj = await readJsonBody(req, 64 * 1024);
@@ -550,6 +554,11 @@ async function apiRollback(req, env, store, id) {
   const meta0 = await readBook(store, id);
   if (!meta0) return json({ error: '书不存在' }, 404);
   if (meta0.status !== 'creating') return json({ ok: true, noop: true, status: meta0.status });
+  // 入口守卫（R150 复审补丁，apiUpdateChapters 同款同文案）：rollback 只服务「在架书更新中断」
+  // 这一条路径。回收站里的 creating 书 / 首传半成品（建书只写 meta，发布才进索引）不在架，
+  // 404 拒绝 —— meta 一个字不动：半成品留在原状可整本重传；回收站的 creating 书维持
+  // 「尚未发布、不可恢复」的原判（apiRestore 只放行 ready），不会被这里偷偷掰成 ready。
+  if (!(await indexHas(store, id))) return json({ error: '书不在书架（可能已删除或未发布）' }, 404);
   const idx = await openIndex(store, { single: id });
   const op = body.op === 'append' ? 'append' : 'replace';
   const count = Math.floor(Number(body.count) || 0);
@@ -577,10 +586,28 @@ async function apiRollback(req, env, store, id) {
   );
   if (!m.ok) return metaFail(m);
   const meta = m.meta;
+  // TOCTOU 复检（apiPublish #145 P1-2 同款）：mutateMeta 的 RTT 窗口里书可能被并发软删
+  // （软删只写 trash + 摘索引、不碰 meta，这边 CAS 照常成功）→ 此时若直接 upsert，书被
+  // 「复活」成在架+回收站双态，随后回收站过期清理会删掉一本在架书的正文与 meta。
+  // 失败落点：meta 已 ready（恢复判据放行 ready），书留回收站可恢复 —— 安全侧。
+  // putStatus 对齐副档：ready 已 CAS 落盘，副档滞后会留「可恢复、恢复回来每章 409」的错位。
+  const trash2 = await readTrash(store).catch(() => ({ books: [] }));
+  if (trash2.books.some((b) => b.id === id)) {
+    await putStatus(store, id, 'ready').catch(() => {});
+    return json({ error: '该书已在回收站中，如需找回请先恢复' }, 409);
+  }
   const old = idx.get(id);
   idx.upsert(id, indexEntryFromMeta(meta, { pinned: !!(old && old.pinned) || !!meta.pinned, prog: old && old.prog }));
   // 副档与索引同一步对齐：只写 meta 不写副档会留下「目录能开、每章 409」的错位。
-  await Promise.all([putStatus(store, id, 'ready'), idx.save({ bak: true })]);
+  // #145 R9 同款：save 撞 CAS 冲突会自重放，而重放的 upsert 是无条件上架 → allowUpsert
+  // 让重放前再复检一次回收站，命中就不写盘（书留回收站，不会双态）。
+  await Promise.all([
+    putStatus(store, id, 'ready'),
+    idx.save({
+      bak: true,
+      allowUpsert: async () => !(await readTrash(store).catch(() => ({ books: [] }))).books.some((b) => b.id === id),
+    }),
+  ]);
   return json({ ok: true, rolledBack: true, chapterCount: meta.chapterCount, wordCount: meta.wordCount });
 }
 

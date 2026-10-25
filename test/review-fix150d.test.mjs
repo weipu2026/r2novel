@@ -13,6 +13,83 @@ import { memStore, req, call, login, makeReadyBook } from './_harness.mjs';
 const read = (p) => readFileSync(p, 'utf8');
 const mj = async (store, id) => JSON.parse(await store.getText(KEY.book(id)));
 
+test('R150 复审补丁：rollback 不复活「不在架」的书（首传半成品 / 回收站 creating 书）', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  // ① 首传半成品：建书（creating、发布前不进索引）→ rollback 必须 404 且不把它接上架
+  const cr = await call(store, req('/api/books', {
+    method: 'POST', cookie,
+    body: { title: '半成品书', author: 't', chapters: ['第一章'], wordCount: 1, cleanVer: 1 },
+  }));
+  assert.equal(cr.status, 200, JSON.stringify(cr.data));
+  const halfId = cr.data.id;
+  const r1 = await call(store, req(`/api/books/${halfId}/rollback`, {
+    method: 'POST', cookie, body: { op: 'append', count: 1, wordCount: 1, batch: 'aabbccdd11223344' },
+  }));
+  assert.equal(r1.status, 404, '半成品书不在架，必须 404：' + JSON.stringify(r1.data));
+  assert.equal((await mj(store, halfId)).status, 'creating', 'meta 不该被改（可整本重传）');
+  const root1 = JSON.parse(await store.getText('meta/idx/root.json'));
+  assert.ok(!(halfId in root1.map), '半成品书不得被 upsert 进索引');
+
+  // ② 在架 creating 书被软删 → rollback 不得把它 upsert 回书架（在架+回收站双态 = 幽灵书）
+  const { id } = await makeReadyBook(store, cookie, '软删中断书', 2);
+  const up = await call(store, req(`/api/books/${id}/chapters`, {
+    method: 'POST', cookie,
+    body: { op: 'append', chapters: ['新章'], wordCount: 10, batch: 'aabbccdd11223345' },
+  }));
+  assert.equal(up.status, 200, JSON.stringify(up.data));
+  const del = await call(store, req('/api/books/batch', {
+    method: 'POST', cookie, body: { ids: [id], action: 'delete' },
+  }));
+  assert.equal(del.status, 200, JSON.stringify(del.data));
+  const r2 = await call(store, req(`/api/books/${id}/rollback`, {
+    method: 'POST', cookie, body: { op: 'append', count: 1, wordCount: 10, batch: 'aabbccdd11223345' },
+  }));
+  assert.equal(r2.status, 404, '回收站里的书必须 404：' + JSON.stringify(r2.data));
+  const root2 = JSON.parse(await store.getText('meta/idx/root.json'));
+  assert.ok(!(id in root2.map), '索引条目不得复活');
+  const tr = JSON.parse(await store.getText(KEY.TRASH));
+  assert.ok(tr.books.some((b) => b.id === id), '回收站条目必须还在');
+});
+
+test('R150 复审补丁：CAS 与 upsert 之间被并发软删 → 复检拦截，不留双态', async () => {
+  const store = memStore();
+  const cookie = await login(store);
+  const { id } = await makeReadyBook(store, cookie, '竞态软删书', 2);
+  const up = await call(store, req(`/api/books/${id}/chapters`, {
+    method: 'POST', cookie,
+    body: { op: 'append', chapters: ['新章'], wordCount: 10, batch: 'aabbccdd11223346' },
+  }));
+  assert.equal(up.status, 200, JSON.stringify(up.data));
+  // 在 rollback 流程第一次读 trash 的那一刻「并发软删」才落盘（写 trash + 摘索引两处，
+  // 与 apiSoftDelete 同形）—— 模拟软删落在入口 indexHas 之后、mutateMeta CAS 之后的窗口。
+  const origGet = store.getText.bind(store);
+  let armed = true;
+  store.getText = async (k) => {
+    if (armed && k === KEY.TRASH) {
+      armed = false;
+      const t = JSON.parse(await origGet(KEY.TRASH)) || { books: [] };
+      t.books.push({ id, title: '竞态软删书', deletedAt: Date.now() });
+      await store.putText(KEY.TRASH, JSON.stringify(t));
+      const root = JSON.parse(await origGet('meta/idx/root.json'));
+      delete root.map[id];
+      await store.putText('meta/idx/root.json', JSON.stringify(root));
+      const shard = JSON.parse(await origGet('meta/idx/s0.json'));
+      shard.books = (shard.books || []).filter((b) => b.id !== id);
+      await store.putText('meta/idx/s0.json', JSON.stringify(shard));
+    }
+    return origGet(k);
+  };
+  const r = await call(store, req(`/api/books/${id}/rollback`, {
+    method: 'POST', cookie, body: { op: 'append', count: 1, wordCount: 10, batch: 'aabbccdd11223346' },
+  }));
+  assert.equal(r.status, 409, 'upsert 前复检必须拦下：' + JSON.stringify(r.data));
+  const root = JSON.parse(await store.getText('meta/idx/root.json'));
+  assert.ok(!(id in root.map), '复检命中后不得 upsert（在架+回收站双态）');
+  assert.equal((await mj(store, id)).status, 'ready', 'meta 已 CAS 成 ready（安全侧：回收站可恢复）');
+  assert.ok(JSON.parse(await store.getText(KEY.TRASH)).books.some((b) => b.id === id), '回收站条目在');
+});
+
 test('P1-3 append 中断：回滚后可读，章表与字数退回原样（真回滚）', async () => {
   const store = memStore();
   const cookie = await login(store);

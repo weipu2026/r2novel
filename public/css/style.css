@@ -9,15 +9,29 @@ html { color-scheme: only light; } /* only light：比 light 更强的声明，�
   --panel: #ffffff;
   --line: #e3e2dc;
   --fg: #2a2a28;
-  --muted: #7d7d75; /* 次要文字：原 #8a8a82 在户外/低亮屏偏虚，加深一档（仍明显弱于正文） */
-  --accent: #b3692e;
+  /* 次要文字 4.92（白底）/ 4.51（--bg）/ 4.63（--surface-1），过 WCAG AA 4.5。
+     改造前是 #7d7d75：白底 4.15，是全站最高频的未达标项 —— 卡片元信息、分区标题、
+     书库计数、hint 全走它。色相未动、只压亮度，观感几乎看不出差别。 */
+  --muted: #71716a;
+  /* 主色：作底 + 纯白文字 4.93、作文字压白底 4.93 / 压 --bg 4.52，双向都过线。
+     改造前 #b3692e 白字只有 4.22 —— 主按钮、选中的筛选 chip、已读完印章的 11~15px
+     白字全在 4.5 门槛下。 */
+  --accent: #a3602a;
   --accent-weak: #f3e2d3;
+  /* accent-weak 浅底上的文字色：--accent 直接压在这层浅底上只有 3.90，
+     11px 的 .diag-tag、侧栏选中项都不达标 → 单独给一档更深的同色系棕（6.56）。
+     改造前这个值以 #6d4614 散落在 chips 选中态 / 保留期徽章两处，一并收进来。 */
+  --accent-ink: #6d4614;
   /* 我的标记色：星标 ★ 与置顶金条共用（两者同属「我的组织动作」）。
-     原先 #d9a01f 在卡片标记相关规则里重复 5 次，收敛到这里。 */
-  --mark: #d9a01f;
+     改造前 #d9a01f 对白底只有 2.33 —— 连图形门槛 3.0 都没到（★ 与 3px 金条都算图形）
+     → 压到 #b5861a（白底 3.29 / --bg 3.01）。
+     --mark-ink 是同色相的深金，供「金色文字 / 金底白字」用（白底 5.37），见 .star-chip。 */
+  --mark: #b5861a;
+  --mark-ink: #8a6412;
   --chrome: #20242c;
   --chrome-fg: #e8e6e0;
   --danger: #c0392b;
+  --danger-weak: #fbeeec; /* 危险操作浅底：删除悬停 / 过期警示 / 孤儿标签 */
 
   /* ============ 设计令牌（改版式只动这里，别散落魔法数字） ============
      圆角三档：小件 8 / 卡片与输入 12 / 弹层与容器 16，行动按钮走药丸 */
@@ -51,6 +65,40 @@ html { color-scheme: only light; } /* only light：比 light 更强的声明，�
   --sh-2: 0 4px 14px rgba(20,22,26,.08);  /* 悬浮/强调块 */
   --sh-3: 0 10px 34px rgba(20,22,26,.16); /* 浮层 */
   --sh-up: 0 -6px 24px rgba(20,22,26,.14); /* 从底部浮起（操作单/设置面板） */
+  /* 浅底色系：改造前 6 种近似值散落 19 处（#f2f1ec / #faf8f2 / #fbfaf6 / #f0efe9 /
+     #fbf7f0 / #fbeeec）。收成 3 个 surface + 1 条浅分隔线 + 1 个危险浅底：
+     合并的相邻值相差 ≤2 灰阶（肉眼不可辨），以后调密度/换主题只动这里。
+     刻意不把全站 249 条 padding 都换成 --sp-*：单条写 12px 比 var(--sp-3) 好读，
+     间距令牌留给「整档调密度」时批量替换用（见上面 --sp-* 段的说明）。 */
+  --surface-1: #faf8f2;    /* 行 hover / 展开态 / 菜单项 hover */
+  --surface-2: #fbfaf6;    /* 内嵌输入框 / 章节标题框 */
+  --surface-3: #f1efe9;    /* 按下态（比 hover 再深一档） */
+  --line-soft: #f2f1ec;    /* 列表行分隔线（比 --line 更浅，不抢视觉） */
+  /* 层级：按语义分档，值全部沿用改造前的集合（层叠关系零变化）。
+     卡内浮层(3) < 吸顶(10) < 侧栏(16) < 浮动面板(20) < 抽屉(30)
+     < 操作单(50) < 提示(60) < 模态(70)。
+     新增浮层按语义挑档，不再随手写一个数（原来 10 个散值看不出谁该压谁）。 */
+  --z-card: 3;
+  --z-sticky: 10;
+  --z-side: 16;
+  --z-float: 20;
+  --z-drawer: 30;
+  --z-sheet: 50;
+  --z-toast: 60;
+  --z-modal: 70;
+  /* 动效节奏两档：交互反馈（hover / 按下 / 进度）与进出场（浮层 / 淡入）。
+     原来 .1/.12/.15/.16/.18 五种时长混用，差 20~30ms 肉眼辨不出，只会让"越想越细"，
+     统一后新增动效只有两个选择。 */
+  --t-fast: .12s;
+  --t-base: .18s;
+  /* 键盘焦点环：用 outline 而不是 box-shadow ——
+     卡片是 div[role=button] 且自带 .pinned / .picked 的 box-shadow 语义（置顶金条 /
+     勾选光环），焦点环若走 box-shadow 会把它整体覆盖掉（与 .grid .card:hover
+     那处踩过的坑同源，见下方注释）。outline 不参与布局、不与阴影打架。
+     offset 2px 在环与控件之间留一圈底色，浅底（书架）与深底（阅读区夜间 chrome）
+     都看得清：--accent 对白底 4.93 / 对 --bg 4.52 / 对 --chrome 3.16，图形门槛 3.0。 */
+  --focus-ring: 2px solid var(--accent);
+  --focus-offset: 2px;
 
   --fs: 18px; /* 阅读区字号（reader.js 覆盖） */
   --lh: 1.95;
@@ -103,7 +151,7 @@ button { font-family: inherit; }
 .top {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: calc(12px + env(safe-area-inset-top)) 16px 10px; background: var(--panel);
-  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: var(--z-sticky);
 }
 /* 左上角品牌：点击回到书架（所有主视图共用） */
 .brand {
@@ -124,10 +172,20 @@ button { font-family: inherit; }
 .count { margin-left: 8px; }
 /* 继续阅读：最近在读的前 3 本（纵排列表态，与全部书籍卡片同形态；桌面自适应列且限宽，不拉满整行） */
 #continueCard { display: grid; gap: 8px; }
-@media (min-width: 900px) {
+/* 平板档（481~899）：基础规则是单列 → 3 张卡竖叠约 360px，768 下首屏工具区占 64%。
+   手机走横滑（≤480）、桌面走 4 列栅格（≥900），只有这一段被漏掉，在此补上。 */
+@media (min-width: 481px) and (max-width: 899px) {
   #continueCard {
-    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    max-width: 840px;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 12px;
+  }
+}
+@media (min-width: 900px) {
+  /* 与 .grid 同栅格（190 / 18）：改造前它是 250/840 左对齐的一块、下面书架却铺满 1376，
+     同屏两种版心，像两个页面拼起来。现在最多 3 本占前 3 格，节奏与下方书墙一致。 */
+  #continueCard {
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 18px;
   }
 }
 .top-actions {
@@ -225,9 +283,9 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 .chips label {
   display: inline-flex; align-items: center; gap: 8px; color: #555;
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px;
-  background: #fbfaf6; cursor: pointer; user-select: none; transition: border-color .12s, background .12s;
+  background: var(--surface-2); cursor: pointer; user-select: none; transition: border-color var(--t-fast), background var(--t-fast);
 }
-.chips label:has(input:checked) { border-color: var(--accent); background: var(--accent-weak); color: #6d4614; }
+.chips label:has(input:checked) { border-color: var(--accent); background: var(--accent-weak); color: var(--accent-ink); }
 .chips label:hover { border-color: #cbb59c; }
 .chips.off { opacity: .45; pointer-events: none; }
 .chips input, .switch input { accent-color: var(--accent); }
@@ -255,14 +313,14 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
   list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--r-md);
   max-height: 280px; overflow-y: auto; background: var(--panel);
 }
-.chapter-preview li { display: flex; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #f0efe9; font-size: var(--fz-base); }
+.chapter-preview li { display: flex; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line-soft); font-size: var(--fz-base); }
 .chapter-preview li:last-child { border-bottom: 0; }
 .ch-no { color: var(--accent); font-variant-numeric: tabular-nums; }
 .ch-t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ch-w { color: var(--muted); font-size: var(--fz-xs); font-variant-numeric: tabular-nums; }
 .prog { margin-top: 12px; }
 .prog-bar { height: 6px; background: var(--line); border-radius: var(--r-pill); overflow: hidden; }
-.prog-fill { height: 100%; background: var(--accent); width: 0; transition: width .15s; }
+.prog-fill { height: 100%; background: var(--accent); width: 0; transition: width var(--t-fast); }
 #upProgText { display: block; margin-top: 6px; }
 
 /* ============ v1.1：章节编辑（上传预览行 + 书架「编辑章节」弹层共用） ============ */
@@ -282,13 +340,13 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 /* 上传分章预览：每行改为可编辑（序号 + 标题输入 + 字数 + 操作钮 / 可展开正文） */
 .chapter-preview li.pv-row { flex-direction: column; align-items: stretch; gap: 6px; padding: 8px 10px; }
 /* 行 hover 落点 + 展开正文时轻微强调（:has 不支持时仅无此反馈，无害） */
-.chapter-preview li.pv-row:hover { background: #faf8f2; }
-.chapter-preview li.pv-row:has(.pv-body:not(.hidden)) { background: #fbf7f0; box-shadow: inset 2px 0 0 var(--accent); }
+.chapter-preview li.pv-row:hover { background: var(--surface-1); }
+.chapter-preview li.pv-row:has(.pv-body:not(.hidden)) { background: var(--surface-1); box-shadow: inset 2px 0 0 var(--accent); }
 .pv-line { display: flex; align-items: center; gap: 8px; min-width: 0; width: 100%; }
 .pv-line .ch-t,
 .ce-line .ce-title {
   flex: 1; min-width: 0; font: inherit; font-size: var(--fz-base); color: var(--fg);
-  border: 1px solid var(--line); border-radius: var(--r-sm); background: #fbfaf6;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2);
   padding: 4px 8px; outline: none;
 }
 .pv-line .ch-t:focus,
@@ -296,7 +354,7 @@ button.ghost:disabled, button.primary:disabled { opacity: .5; cursor: not-allowe
 .pv-body { width: 100%; }
 .pv-body textarea, .ce-body textarea {
   width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--r-sm);
-  background: #fbfaf6; color: var(--fg);
+  background: var(--surface-2); color: var(--fg);
   font: 12.5px/1.6 ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei", monospace;
   padding: 8px 10px; outline: none; resize: vertical;
 }
@@ -310,9 +368,9 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .modal-box.ce h3 { margin-bottom: 2px; }
 .ce-stat { margin: 0 0 4px; }
 .ce-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 52vh; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel); }
-.ce-row { border-bottom: 1px solid #f0efe9; }
-.ce-row:hover { background: #faf8f2; }
-.ce-row:has(.ce-body:not(.hidden)) { background: #fbf7f0; }
+.ce-row { border-bottom: 1px solid var(--line-soft); }
+.ce-row:hover { background: var(--surface-1); }
+.ce-row:has(.ce-body:not(.hidden)) { background: var(--surface-1); }
 .ce-row:last-child { border-bottom: 0; }
 .ce-line { display: flex; align-items: center; gap: 8px; padding: 8px 12px; }
 .ce-body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
@@ -350,7 +408,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   box-shadow: inset 0 1px 0 rgba(127,127,127,.14), inset 0 -1px 0 rgba(127,127,127,.14);
 }
 .read-top {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+  position: fixed; top: 0; left: 0; right: 0; z-index: var(--z-sticky);
   /* 安全区必须「加」到高度上，不能从 44px 里扣：border-box 下若写 height:44px
      又给 padding-top:env(safe-area-inset-top)，刘海机（inset 可达 47px）的内容盒
      会被 padding 压成 0，按钮溢出到正文上；#readScroll 的 top 必须用同一表达式，
@@ -381,7 +439,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   opacity: .34; cursor: default;
 }
 .read-bar {
-  position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: var(--z-sticky);
   /* 同理：46px 是内容高度，安全区另加。否则底栏实际只占 46px，而 #readScroll 的
      bottom 按 46px+安全区 上收，两者之间会空出一条页面底色横带
      ——正是「隐藏后上下两条空白」在刘海机上的残留来源。 */
@@ -401,7 +459,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 .read-prog-fill {
   position: absolute; left: 0; bottom: 0; height: 2px; width: 0;
-  background: var(--accent); transition: width .12s linear;
+  background: var(--accent); transition: width var(--t-fast) linear;
   pointer-events: none;
 }
 @media (prefers-reduced-motion: reduce) { .read-prog-fill { transition: none; } }
@@ -420,7 +478,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 /* ============ 章节头（章名 + 位置，随正文滚动） ============ */
 .ch-head { text-align: center; margin: 2px 0 20px; padding-bottom: 16px; border-bottom: 1px solid rgba(120,110,90,.18); }
 /* 翻章淡入：消除内容瞬间替换的生硬感（reader.js 每章重触发；系统减动效时关闭） */
-#readArt.fade-in { animation: artFade .18s ease-out; }
+#readArt.fade-in { animation: artFade var(--t-base) ease-out; }
 @keyframes artFade { from { opacity: 0; transform: translateY(6px); } }
 @media (prefers-reduced-motion: reduce) {
   #readArt.fade-in { animation: none; }
@@ -447,10 +505,10 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 
 /* 目录抽屉 */
 .drawer {
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 30;
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: var(--z-drawer);
   background: var(--chrome); color: var(--chrome-fg);
   display: flex; flex-direction: column;
-  animation: slideup .18s ease-out;
+  animation: slideup var(--t-base) ease-out;
 }
 @keyframes slideup { from { transform: translateY(24px); opacity: .4; } to { transform: none; opacity: 1; } }
 .drawer-head {
@@ -470,10 +528,10 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 
 /* toast & tip */
 .toast, .tip {
-  position: fixed; left: 50%; transform: translateX(-50%); z-index: 60;
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: var(--z-toast);
   background: rgba(20,22,26,.92); color: #eee; border-radius: var(--r-pill);
   padding: 8px 16px; font-size: var(--fz-sm); opacity: 0; pointer-events: none;
-  transition: opacity .18s; white-space: nowrap; max-width: 88vw; overflow: hidden; text-overflow: ellipsis;
+  transition: opacity var(--t-base); white-space: nowrap; max-width: 88vw; overflow: hidden; text-overflow: ellipsis;
 }
 .toast { bottom: calc(70px + env(safe-area-inset-bottom)); }
 .tip { bottom: calc(110px + env(safe-area-inset-bottom)); }
@@ -484,7 +542,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .pref-panel {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(52px + env(safe-area-inset-bottom));
-  z-index: 20;
+  z-index: var(--z-float);
   width: min(94vw, 460px);
   background: var(--read-chrome, var(--chrome));
   -webkit-backdrop-filter: blur(14px) saturate(1.15);
@@ -492,7 +550,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   color: var(--read-fg);
   border-radius: var(--r-lg); padding: 10px 14px 14px;
   box-shadow: var(--sh-up), inset 0 0 0 1px rgba(127,127,127,.16);
-  animation: slideup .16s ease-out;
+  animation: slideup var(--t-base) ease-out;
 }
 .pp-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -514,7 +572,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
   width: 40px; height: 30px; border-radius: var(--r-sm); cursor: pointer;
   border: 1px solid rgba(127,127,127,.3); position: relative; padding: 0;
 }
-.pp-theme.on { box-shadow: 0 0 0 2px #d29922; }
+.pp-theme.on { box-shadow: 0 0 0 2px var(--mark); }
 .pp-theme:not(.on):hover { opacity: .85; }
 /* 阅读区顶部：让 Aa 可触区域更大 */
 .read-bar button[data-act="pref"] { font-weight: 700; letter-spacing: .5px; }
@@ -547,8 +605,11 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
    注意：星标 chip 已从 #readFilter 挪到 #tagCloud（2026-09-13）——选择器必须挂在 .tagcloud 下，
    否则会被 .tagcloud button / .tagcloud button.on 覆盖成普通「灰字 / 主色调底」，
    金色语义整体丢失、且与「完结」选中态同色不可区分（曾踩此坑，有探针 audit-star-chip.mjs 守着）。 */
-.tagcloud button.star-chip { color: #a97c1a; }
-.tagcloud button.star-chip.on { background: #e0b23c; border-color: #e0b23c; color: #fff; }
+/* 金色 chip 的文字与选中底都走 --mark-ink：#a97c1a 白底只有 3.76（11px 文字要 4.5），
+   选中态 #e0b23c 配白字更是只有 1.9 —— 收进令牌的同时把两态一起压过线（5.37）。
+   --mark 留给图形（★ / 金条），两者同色相、不同明度，语义不混。 */
+.tagcloud button.star-chip { color: var(--mark-ink); }
+.tagcloud button.star-chip.on { background: var(--mark-ink); border-color: var(--mark-ink); color: #fff; }
 .tagcloud { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 2px; }
 .tagcloud button {
   border: 1px solid var(--line); background: var(--panel); color: var(--muted);
@@ -556,6 +617,10 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 }
 .tagcloud button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .tagcloud-sep { color: var(--muted); font-size: var(--fz-xs); align-self: center; }
+/* 「更多 N ▾」/「收起 ▴」：虚线边框 + 主色字，与实心 chip 区分开 ——
+   它不是筛选条件，是展开器（aria-expanded 由 renderTagCloud 维护）。 */
+.tagcloud button.tag-more { border-style: dashed; color: var(--accent); }
+.tagcloud button.tag-more:hover { border-color: var(--accent); }
 .tag-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .tag-chips button {
   border: 1px solid var(--line); background: transparent; color: var(--muted);
@@ -565,7 +630,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
 .tag-chips button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 /* 卡面标记分三类语义、各一种形制（不再混用）：
    · 我的阅读状态（在读 / 已读完）→ 右上角 .prog-badge 角标，未读不画
-   · 我的组织动作（星标 / 置顶）→ 统一金色 #d9a01f：★ 浮层 + 整卡左边缘金条
+   · 我的组织动作（星标 / 置顶）→ 统一金色（--mark）：★ 浮层 + 整卡左边缘金条
    · 书本身的属性（完结）→ 不在卡面显示，靠筛选行按需查看
    「完结」胶囊已移除：它固定占 34px + 4px 间距 = 元信息行宽的 27%，一出现就把末尾的
    「3.2 万」挤掉（实测桌面行宽 143px，`完结 · 仙侠 · 12 章 · 3.2 万字` 需 148px）。
@@ -574,7 +639,7 @@ li.pv-add .pv-btn { width: 100%; text-align: center; color: var(--accent); borde
    与置顶金条同色——两者同属「我的组织动作」，同色是对的，形制不同是因为落点不同。
    白描边保证压在深色书脊上时仍看得清。 */
 .card .card-star {
-  position: absolute; z-index: 2; pointer-events: none;
+  position: absolute; z-index: var(--z-card); pointer-events: none;
   font-size: var(--fz-sm); line-height: 1; color: var(--mark);
   text-shadow: 0 0 1.5px #fff, 0 0 1.5px #fff, 0 1px 2px rgba(0,0,0,.22);
 }
@@ -612,7 +677,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .card .prog-badge {
   position: absolute; top: 8px; right: 8px; background: rgba(20,22,26,.78); color: #f4e9dc;
   border-radius: var(--r-pill); font-size: var(--fz-2xs); padding: 2px 8px; font-variant-numeric: tabular-nums;
-  pointer-events: none; z-index: 2;
+  pointer-events: none; z-index: var(--z-card);
 }
 .card .prog-badge.done { background: var(--accent); color: #fff; font-weight: 600; }
 /* 角标长/短两套文案（见 app.js progBadgeText 的 compact 参数）：
@@ -626,7 +691,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
    只弱化「色点」与书名色，让读完的卡片在列表里一眼退到背景层。 */
 .card.read-done .card-block { filter: grayscale(.85); opacity: .5; }
 .card.read-done .card-info em { color: var(--muted); }
-/* 置顶＝我的组织动作，与星标同色 #d9a01f。必须挂在 .card 自己身上而不是 .card-block：
+/* 置顶＝我的组织动作，与星标同色（--mark）。必须挂在 .card 自己身上而不是 .card-block：
    色块带 `.read-done` 的 `filter: grayscale(.85); opacity: .5`，实测会把色块上的金环
    #E0B23C 洗成 #FFFFFF —— 与卡片底色完全相同，「置顶 + 已读完」的书上金环会彻底消失。
    改走整卡左边缘 3px 金条（手机端本来就是这个形制），两端一致，语义也贴切（置顶改的是位置）。 */
@@ -636,7 +701,18 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .card.picked.pinned { box-shadow: inset 3px 0 0 var(--mark), 0 0 0 2px var(--accent-weak); }
 .card .card-more {
   position: absolute; right: 4px; bottom: 4px; background: none; border: 0; color: var(--muted);
-  font-size: var(--fz-md); padding: 4px 8px; cursor: pointer; z-index: 3; line-height: 1;
+  font-size: var(--fz-md); padding: 4px 8px; cursor: pointer; z-index: var(--z-card); line-height: 1;
+}
+/* 触控热区：⋯ 的视觉尺寸刻意保持 34x24（再大就压书名，这个取舍是对的），但手指要 44。
+   伪元素把可点区域扩到 44x44（34+6+4 / 24+10+10），绝对定位不进文档流 ——
+   卡高、书名折行、右上角 ★ 落点全都不动。
+   向右只扩 4px：按钮本身 right:4，再扩就溢出卡片右缘 → 可能带出横向滚动条，
+   所以左边补 6px 凑满 44。向下扩 10px 落在 gap(8)+下一张卡 padding(10) 里，不覆盖内容。
+   ⚠️ 只在 pointer: coarse（触屏）下生效：鼠标精度不需要 44px，而无条件扩大的代价是
+   卡片右下角 44×44 变成「点哪儿都弹操作单」——桌面元信息行（N 章 · X 万）的右端正好
+   落在这块区域里，点章节数就进不了阅读了。触屏没有指针精度问题，才值得用热区换。 */
+@media (pointer: coarse) {
+  .card .card-more::after { content: ''; position: absolute; inset: -10px -4px -10px -6px; }
 }
 
 /* ============ M2：回收站 ============ */
@@ -652,20 +728,20 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 /* 保留期徽章：剩 N 天（≤3 天红色警示） */
 .ttl-badge {
   font-size: var(--fz-2xs); border-radius: var(--r-pill); padding: 2px 8px; white-space: nowrap;
-  background: var(--accent-weak); color: #6d4614; font-variant-numeric: tabular-nums;
+  background: var(--accent-weak); color: var(--accent-ink); font-variant-numeric: tabular-nums;
 }
-.ttl-badge.warn { background: #fbeeec; color: var(--danger); }
+.ttl-badge.warn { background: var(--danger-weak); color: var(--danger); }
 
 /* ============ M2：底部操作单 & 模态 & 忙碌层 ============ */
 .sheet {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: var(--z-sheet);
   background: var(--panel); border-radius: var(--r-lg) var(--r-lg) 0 0; padding: 8px 10px calc(12px + env(safe-area-inset-bottom));
-  box-shadow: var(--sh-up); animation: slideup .18s ease-out;
+  box-shadow: var(--sh-up); animation: slideup var(--t-base) ease-out;
 }
 .sheet button {
   display: block; width: 100%; text-align: left; background: none; border: 0;
   padding: 12px 14px; font-size: var(--fz-md); color: var(--fg); cursor: pointer;
-  border-bottom: 1px solid #f2f1ec;
+  border-bottom: 1px solid var(--line-soft);
 }
 .sheet button:last-child { border-bottom: 0; }
 .sheet button.danger { color: var(--danger); }
@@ -673,15 +749,15 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .sheet .sheet-title { font-size: var(--fz-sm); color: var(--muted); padding: 8px 14px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .modal-mask {
-  position: fixed; inset: 0; z-index: 70; background: rgba(20,22,26,.45);
+  position: fixed; inset: 0; z-index: var(--z-modal); background: rgba(20,22,26,.45);
   display: flex; align-items: center; justify-content: center; padding: 22px;
-  animation: maskFade .15s ease-out; /* 遮罩淡入（display 切换时自动重播） */
+  animation: maskFade var(--t-base) ease-out; /* 遮罩淡入（display 切换时自动重播） */
 }
 @keyframes maskFade { from { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .modal-mask { animation: none; } }
 .modal-box {
   background: var(--panel); border-radius: var(--r-lg); padding: 18px; width: 100%; max-width: 400px;
-  max-height: 84vh; overflow-y: auto; animation: slideup .16s ease-out;
+  max-height: 84vh; overflow-y: auto; animation: slideup var(--t-base) ease-out;
 }
 .modal-box h3 { margin: 0 0 6px; font-size: var(--fz-lg); }
 .modal-box .modal-sub { font-size: var(--fz-xs); color: var(--muted); margin: 0 0 12px; }
@@ -695,7 +771,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 }
 .modal-box .m-acts { display: flex; gap: 10px; margin-top: 14px; justify-content: flex-end; }
 .modal-box .m-acts button { flex: none; }
-.modal-box .m-row { display: flex; gap: 8px; align-items: center; padding: 10px 0; border-bottom: 1px solid #f2f1ec; }
+.modal-box .m-row { display: flex; gap: 8px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
 .modal-box .m-row:last-of-type { border-bottom: 0; }
 .modal-box .m-row button { flex: none; }
 .modal-box .m-row .grow { flex: 1; min-width: 0; }
@@ -730,8 +806,18 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
   }
   button.ghost.slim { padding: 6px 12px; font-size: var(--fz-base); }
 
-  /* 书架：放大卡片、左右留白 */
-  .shelf-body { padding: 22px 32px calc(32px + env(safe-area-inset-bottom)); }
+  /* 书架：放大卡片、左右留白 + 版心 1180 */
+  /* 版心：改造前书架是唯一「撑满屏幕」的主视图（1440 六列 214px / 1920 九列 190px，
+     卡片内文被压到 162px），而上传统 880 / 阅读区 756 / 登录 380 都有约束。
+     用 padding 而不是 max-width + margin auto：滚动容器保持全宽，滚动条仍贴视口右缘；
+     max-width 方案会把滚动条拖到内容右边界上（1180 处的竖线，很怪）。
+     max() 兜住 900~1244px 的窄桌面，避免 calc 算出负留白。 */
+  .shelf-body {
+    padding-top: 22px;
+    padding-bottom: calc(32px + env(safe-area-inset-bottom));
+    padding-left: max(32px, calc((100% - 1180px) / 2));
+    padding-right: max(32px, calc((100% - 1180px) / 2));
+  }
   .section-label { font-size: var(--fz-base); }
   .grid {
     grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -785,10 +871,10 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 
   /* 目录侧栏 */
   .read-side {
-    position: fixed; top: 0; bottom: 0; left: 0; z-index: 16;
+    position: fixed; top: 0; bottom: 0; left: 0; z-index: var(--z-side);
     width: 264px; background: var(--panel); border-right: 1px solid var(--line);
     display: flex; flex-direction: column;
-    transition: width .18s ease;
+    transition: width var(--t-base) ease;
   }
   .side-head {
     flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -807,12 +893,12 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
   .side-toc .toc-item {
     display: block; width: 100%; text-align: left; border: 0; background: none;
     color: var(--fg); font-size: var(--fz-base); line-height: 1.45;
-    padding: 8px 18px; cursor: pointer; border-bottom: 1px solid #f2f1ec;
+    padding: 8px 18px; cursor: pointer; border-bottom: 1px solid var(--line-soft);
   }
-  .side-toc .toc-item:hover { background: #f7f5ef; }
+  .side-toc .toc-item:hover { background: var(--surface-1); }
   .side-toc .toc-item.read { color: var(--muted); }
   .side-toc .toc-item.cur {
-    color: var(--accent); background: var(--accent-weak); font-weight: 600;
+    color: var(--accent-ink); background: var(--accent-weak); font-weight: 600; /* 浅底 6.56；--accent 只有 3.90 */
     box-shadow: inset 2px 0 0 var(--accent);
   }
   #sideTocMore { display: block; margin: 6px auto 12px; }
@@ -858,18 +944,18 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
     width: min(340px, calc(100vw - 24px)); border-radius: var(--r-lg);
     box-shadow: var(--sh-3);
   }
-  .sheet.anchored { animation: sheetdrop .14s ease-out; }
+  .sheet.anchored { animation: sheetdrop var(--t-base) ease-out; }
   @keyframes sheetdrop { from { opacity: 0; transform: translateY(-6px); } }
-  .sheet button:hover { background: #faf8f2; }
-  .sheet button.danger:hover { background: #fdf0ee; }
+  .sheet button:hover { background: var(--surface-1); }
+  .sheet button.danger:hover { background: var(--danger-weak); }
   .grid .card:not(.big):hover {
     box-shadow: var(--sh-2);
     transform: translateY(-2px);
   }
-  .grid .card { transition: box-shadow .16s ease, transform .16s ease; }
+  .grid .card { transition: box-shadow var(--t-base) ease, transform var(--t-base) ease; }
   /* ⚠️ 上面那条 hover 规则特异性 0,4,0（.grid + .card + :not(.big) + :hover），
      会把挂在 .card 上的标记阴影整体覆盖掉（.card.pinned 0,2,0 / .card.picked.pinned 0,3,0
-     全都输给它）→ 桌面鼠标悬停置顶卡时金条直接消失，又因 .grid .card 带 .16s 过渡，
+     全都输给它）→ 桌面鼠标悬停置顶卡时金条直接消失，又因 .grid .card 带 transition，
      表现为金条淡出再淡入。置顶原先挂子元素 .card-block（与作用于 .card 的 hover 不相干），
      搬到 .card 上才暴露，所以这里按「标记 × hover」逐个把阴影合并回来。
      特异性 0,5,0 稳压上面那条；位置也放在其后，双保险。
@@ -898,14 +984,14 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .diag-count { color: var(--muted); font-size: var(--fz-xs); font-weight: 400; }
 .diag-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .diag-dot-red { background: #d64541; }
-.diag-dot-amber { background: #d29922; }
+.diag-dot-amber { background: var(--mark); }
 .diag-dot-gray { background: #b3b3ab; }
 .diag-clean { color: var(--muted); font-size: var(--fz-base); padding: 4px 0 2px; }
 .diag-none { color: var(--muted); font-size: var(--fz-xs); margin: 0 0 2px 12px; }
 .diag-rows { max-height: 34vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-md); }
 .diag-row {
   display: flex; align-items: center; gap: 10px; padding: 8px 10px;
-  border-bottom: 1px solid #f2f1ec;
+  border-bottom: 1px solid var(--line-soft);
 }
 .diag-row:last-child { border-bottom: 0; }
 .diag-row-main { flex: 1; min-width: 0; }
@@ -917,11 +1003,11 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .diag-row-sub { font-size: var(--fz-xs); color: var(--muted); margin-top: 1px; line-height: 1.5; }
 .diag-row .ghost { flex: none; }
 .diag-tag {
-  display: inline-block; font-size: var(--fz-2xs); color: var(--accent);
+  display: inline-block; font-size: var(--fz-2xs); color: var(--accent-ink); /* 浅底上要 4.5，--accent 只有 3.90 */
   border: 1px solid #e2c4a6; background: var(--accent-weak);
   border-radius: var(--r-pill); padding: 0 6px; margin-left: 4px;
 }
-.diag-tag-orphan { color: var(--danger); border-color: #ecc9c4; background: #fbeeec; }
+.diag-tag-orphan { color: var(--danger); border-color: #ecc9c4; background: var(--danger-weak); }
 .diag-group-acts { margin: 8px 0 0; text-align: right; }
 .diag-group-acts .ghost { font-size: var(--fz-xs); }
 .diag-badge {
@@ -936,7 +1022,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 
 /* ============ 书架批量操作（多选治理） ============ */
 .batch-bar {
-  position: sticky; top: 8px; z-index: 5;
+  position: sticky; top: 8px; z-index: var(--z-sticky);
   display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--accent); border-radius: var(--r-md);
   padding: 8px 10px; margin: 10px 0 2px;
@@ -959,9 +1045,9 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .modal-box .tm-list { max-height: 46vh; overflow-y: auto; margin-top: 4px; }
 .tm-row {
   display: flex; gap: 6px; align-items: center;
-  padding: 8px 6px; border-radius: var(--r-sm); border-bottom: 1px solid #f2f1ec;
+  padding: 8px 6px; border-radius: var(--r-sm); border-bottom: 1px solid var(--line-soft);
 }
-.tm-row:hover { background: #faf8f2; }
+.tm-row:hover { background: var(--surface-1); }
 .tm-row:last-of-type { border-bottom: 0; }
 .tm-name {
   flex: 0 0 auto; max-width: 32%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -973,7 +1059,7 @@ button.loadmore { display: block; margin: 14px auto 4px; padding: 8px 26px; font
 .tm-row .tm-go .ic, .tm-row .tm-del .ic { width: 15px; height: 15px; display: block; }
 .tm-row .tm-go:has(.ic), .tm-row .tm-del:has(.ic) { display: grid; place-items: center; min-width: 38px; min-height: 34px; padding: 0 8px; }
 button.danger { color: var(--danger); border-color: #ecc9c4; }
-button.danger:hover { background: #fbeeec; }
+button.danger:hover { background: var(--danger-weak); }
 @media (max-width: 480px) {
   .batch-bar { top: 4px; padding: 8px; }
   .batch-bar button { padding: 4px 8px; font-size: var(--fz-xs); }
@@ -995,6 +1081,19 @@ button.danger:hover { background: #fbeeec; }
   /* minmax(0, 1fr) 而不是 1fr：1fr 的最小值是 auto = 卡片 min-content，
      一旦卡片里有「不可断行的长串」（纯英文书名的整串、超长元信息）就会把整列撑宽、
      顶破视口。minmax(0,1fr) 把列宽钉死在容器上，溢出改由书名/元信息自己省略号消化。 */
+  /* 继续阅读改横向滑动条：3 张竖排卡要占掉约 190px 首屏（实测工具区已吃掉 62%），
+     而它只是「接着读」的快捷入口。横滑只占 1 张卡的高度，首屏多露出约 2 本书；
+     86% 的列宽让下一张露出 47px 作为「还能往左滑」的提示，scroll-snap 让松手停在卡片左缘。
+     不取更窄的 78%：卡片内文宽会掉到 234px，元信息行（需 254px）末尾的「452 万」
+     会被省略号吃掉 —— 那正是上一轮费力保住的东西。 */
+  #continueCard {
+    grid-auto-flow: column;
+    grid-auto-columns: 86%;
+    overflow-x: auto; overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    padding-bottom: 4px;
+  }
+  #continueCard .card { scroll-snap-align: start; }
   .grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .card { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 12px; }
   .card-block { width: 10px; height: 10px; border-radius: 50%; font-size: 0; padding: 0; }
@@ -1049,7 +1148,7 @@ button.danger:hover { background: #fbeeec; }
    那条属性上挂着「置顶金条 × 勾选光环」的合并逻辑（见 .card.pinned / .card.picked 段），
    多写一条 :active 阴影就会把它整体覆盖掉。 */
 @media (hover: none) {
-  .card { transition: transform .1s ease; }
+  .card { transition: transform var(--t-fast) ease; }
   .card:active { transform: scale(.985); } /* 内缩 1.5%：够察觉，又不晃眼 */
   /* 触屏但宽 ≥900px（iPad 横屏）会同时命中桌面档的 `.grid .card:not(.big):hover`
      （特异性 0,4,0，压过上面那条 0,2,0，按下时反被 hover 的 -2px 抬升吃掉）。
@@ -1059,7 +1158,7 @@ button.danger:hover { background: #fbeeec; }
      底部操作单（.sheet）与弹层按钮没有 .ghost 类，要单独点名，否则最常用的
      「长按卡片 → 操作单」全程毫无反馈。 */
   button.ghost:active, .sheet button:active, .drawer button:active,
-  .modal-box button:not(.primary):active, .trash-item .t-acts button:active { background: #f1efe9; }
+  .modal-box button:not(.primary):active, .trash-item .t-acts button:active { background: var(--surface-3); }
   /* 带强调色的控件：整体压暗一档。若也刷浅灰底，选中态的标签/筛选项会瞬间「掉色」。 */
   button.primary:active, .tagcloud button.on:active,
   .readfilter button.on:active, .tag-chips button.on:active { filter: brightness(.94); }
@@ -1068,4 +1167,19 @@ button.danger:hover { background: #fbeeec; }
 @media (hover: none) and (prefers-reduced-motion: reduce) {
   .card { transition: none; }
   .card:active { transform: none; }
+}
+
+/* ============ 键盘可达性：全局焦点环 ============
+   改造前全站 0 条 :focus-visible，8 处组件级 `outline: none`（登录口令、搜索框、
+   排序下拉、字段输入、模态输入、章节标题框、正文 textarea、编码 select）没有任何
+   替代指示 → Tab 到 #searchInput / #sortSel 时画面零变化（实测 outline 计算值
+   3px none，截图取证于 audit-focus.mjs）。
+   这里必须 !important：那 8 条规则的特异性是 0,1,0~0,2,0，普通的 :focus-visible
+   （0,1,0）会被压过，焦点环根本不出现 —— 这正是改造前的成因。逐条补 :focus 会散落
+   8 处、漏一处就静默退化，故由一条全局规则统一接管。
+   不排除 input/button：输入类控件在鼠标点击时也命中 :focus-visible（浏览器规范），
+   视觉上会多一圈环，但"键盘和鼠标看到同一个焦点指示"比"只有键盘看得见"更容易验证。 */
+:focus-visible {
+  outline: var(--focus-ring) !important;
+  outline-offset: var(--focus-offset);
 }

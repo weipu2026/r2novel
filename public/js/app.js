@@ -23,7 +23,7 @@ let books = []; // 全量在架书（服务端已含 pinned/prog 镜像）
 // #144 P2-7：回收站保留期以服务端生效值为准（apiBooks/apiTrashList 随响应带 trashDays，
 // env.TRASH_DAYS 可覆盖默认值）——徽章「剩 N 天」与删除确认文案不再硬编码默认 15。
 let trashDays = TRASH_DAYS;
-let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
+let ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1, tagsMore: false };
 
 export function init() {
   ['login', 'shelf', 'upload', 'trash'].forEach((v) => {
@@ -357,7 +357,7 @@ async function finishLogout() {
   tagCache = null;
   // 筛选/搜索态一并重置：只清持久层的话，重登后书架仍按上一会话的筛选渲染 ——
   // 星标筛选残留会让新书架显示「没有匹配的书」，用户误以为书丢了（2026-10-01 审计实锤）
-  ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1 };
+  ui = { sort: 'recent', q: '', tag: '', finished: '', readState: '', star: false, page: 1, tagsMore: false };
   els.searchInput.value = '';
   // 排序下拉框是**静态 DOM**，不在任何会被重建的容器里 —— 不同步复位的话，ui.sort 已回
   // 'recent' 而下拉框仍显示「字数」，此后任何筛选操作都按 recent 排、与显示永久矛盾
@@ -407,7 +407,10 @@ function handleAuth(e) {
 }
 
 /* ---------- 书架 ---------- */
-const PALETTE = ['#d97757', '#c2518c', '#7d66c9', '#4e8fd8', '#2f9e8f', '#4f9d4f', '#d0a43a', '#8a7a5c'];
+// 8 色伪封面：白字压色块，20px 粗体（大字门槛 3.0）。
+// 第 7 色原为 #d0a43a（白字仅 2.32）→ #b68f33（3.01），色相不变、只压一档亮度；
+// 其余 7 色实测 3.12~4.55，均过线（.ui-tests/contrast-calc.mjs 可复算）。
+const PALETTE = ['#d97757', '#c2518c', '#7d66c9', '#4e8fd8', '#2f9e8f', '#4f9d4f', '#b68f33', '#8a7a5c'];
 const colorCache = new Map(); // 按书名缓存封面色，避免上千本书重复哈希
 function colorOf(title) {
   const hit = colorCache.get(title);
@@ -568,6 +571,13 @@ function renderGrid(list) {
   }
 }
 
+/* 标签云默认显示条数：12 个标签在手机上要 4 行 124px（比「全部书籍」标题 + 首排卡片
+   还高），而它是最低频的筛选器（搜过的词有搜索框、读没读有状态行）。
+   折叠到 6 个 + 「更多 N ▾」：桌面收成 1 行、手机从 4 行降到 2 行，首屏省约 60px。
+   不给每个断点单独定条数——固定 6 个已能让两端都落到「比原来少一半行数」，
+   而按视口切换条数要在 resize 时重渲染（多一条需要维护的状态）。 */
+const TAG_CLOUD_MAX = 6;
+
 let tagCache = null; // 标签计数缓存：books 变化（loadShelf）时才重算，筛选/翻页不重复 O(n) 扫描
 function tagCounts() {
   if (tagCache) return tagCache;
@@ -613,6 +623,7 @@ function renderReadFilter() {
       ui.finished = '';
       ui.star = false;
       ui.q = '';
+      ui.tagsMore = false; // 标签云一并收起（「全部」= 回到最初的浏览状态）
       els.searchInput.value = ''; // 搜索框一并清空（「全部」= 五维总重置）
       ui.page = 1;
       renderShelf();
@@ -670,7 +681,15 @@ function renderTagCloud() {
   const tags = tagCounts();
   if (tags.length) {
     cloud.appendChild(docEle('span', 'tagcloud-sep', '·'));
-    tags.forEach(([t, n]) => {
+    // 折叠：默认只画前 TAG_CLOUD_MAX 个，其余收进「更多 N ▾」。
+    // 当前选中的标签即使排在窗口之外也强制画在最前——否则筛选生效了、界面上却
+    // 找不到是哪个标签在起作用，用户只会看到「书少了」而找不到原因。
+    let shown = ui.tagsMore ? tags : tags.slice(0, TAG_CLOUD_MAX);
+    if (!ui.tagsMore && ui.tag && !shown.some(([t]) => t === ui.tag)) {
+      const picked = tags.find(([t]) => t === ui.tag);
+      if (picked) shown = [picked, ...shown];
+    }
+    for (const [t, n] of shown) {
       const b = mk(`${t} ${n}`, ui.tag === t);
       b.addEventListener('click', () => {
         ui.tag = ui.tag === t ? '' : t;
@@ -678,7 +697,20 @@ function renderTagCloud() {
         renderShelf();
       });
       cloud.appendChild(b);
-    });
+    }
+    // 展开器本身不是筛选条件（不参与 .on），用虚线边框与实心 chip 区分（见 style.css）。
+    // 只重画标签云、不重跑 renderShelf：展开/收起不该带走已加载的网格。
+    const rest = tags.length - shown.length;
+    if (rest > 0 || ui.tagsMore) {
+      const more = mk(ui.tagsMore ? '收起 ▴' : `更多 ${rest} ▾`, false);
+      more.classList.add('tag-more');
+      more.setAttribute('aria-expanded', ui.tagsMore ? 'true' : 'false');
+      more.addEventListener('click', () => {
+        ui.tagsMore = !ui.tagsMore;
+        renderTagCloud();
+      });
+      cloud.appendChild(more);
+    }
   }
 }
 

@@ -443,7 +443,10 @@ function staticReach() {
     const abs = path.join(PUBLIC, url.slice(1));
     if (!fs.existsSync(abs)) continue;
     const code = stripCommentsOnly(fs.readFileSync(abs, 'utf8'));
-    const re = /(?:^|\n)[ \t]*(?:import\s*(?:[^;\n]*?\sfrom\s*)?|export\s*\*\s*from\s*)['"]([^'"]+)['"]/g;
+    // R150 P2-13：原分支只认 `export * from`，漏了 `export { x } from` —— dom.js 的 normTitle
+    // 正是这么从 shared-text 转出的。漏掉它不只是"少一条断言"：shared-text 被挪进 LAZY 时
+    // 下面那条 reach ∩ LAZY 门禁**不会响**，首屏离线缺文件，而门禁全绿。
+    const re = /(?:^|\n)[ \t]*(?:import\s*(?:[^;\n]*?\sfrom\s*)?|export\s*(?:\*\s*|\{[^}]*\}\s*)from\s*)['"]([^'"]+)['"]/g;
     for (const m of code.matchAll(re)) {
       const spec = m[1];
       if (!spec.startsWith('.')) continue; // 本项目没有裸包名依赖
@@ -510,6 +513,11 @@ function staticReach() {
     const reach = staticReach();
     for (const s of lazySet) {
       if (reach.has(s)) say('SW LAZY', `${s} 出现在静态 import 图里（它其实是首屏依赖，不该标成懒加载）`);
+    }
+    // 同一条不变式的另一侧（R150 P2-13）：静态可达 ⇔ 必须预缓存。LAZY 只在「用过一次」之后
+    // 才有缓存，把首屏依赖错标成懒加载 = 首访断网少一块。原先只有方向一，反向全靠人工把关。
+    for (const s of reach) {
+      if (!shellSet.has(s)) say('SW SHELL', `首屏静态可达的 ${s} 不在 SHELL（离线首访缺文件）`);
     }
   }
 }

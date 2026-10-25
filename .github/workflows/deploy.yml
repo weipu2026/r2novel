@@ -237,8 +237,10 @@ jobs:
           else
             VERIFY_BASE=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1 || true)
             if [ -z "$VERIFY_BASE" ]; then
-              echo "· 未能解析访问地址，跳过版本核验"
-              exit 0
+              # R150 P3-22：与上方「生产冒烟」处同一口径 —— 解析不出访问地址就是验证链断开，
+              # 必须 fail loud。旧实现 exit 0 让这一整步静默蒸发，而 CI 照样全绿。
+              echo "::error::未能从部署输出解析 workers.dev 地址——拒绝跳过版本核验，请检查 deploy.log"
+              exit 1
             fi
           fi
           echo "::add-mask::$VERIFY_BASE"

@@ -189,6 +189,25 @@ export function init() {
   els.modalMask.addEventListener('click', (e) => {
     if (e.target === els.modalMask) modalDismiss();
   });
+  // 焦点圈在弹层里（P3-19）：不拦 Tab 的话，焦点会走到遮罩背后的书架上 —— 用户看不见焦点、
+  // 读屏却在念背景内容，是「模态」最典型的可达性缺口。只在首尾两个可聚焦元素上回绕。
+  els.modalMask.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    const items = [...els.modalBox.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )].filter((el) => el.offsetParent !== null || el === document.activeElement);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const act = document.activeElement;
+    if (e.shiftKey && (act === first || !els.modalBox.contains(act))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (act === last || !els.modalBox.contains(act))) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!els.sheet.classList.contains('hidden')) {
@@ -1023,6 +1042,10 @@ function makeCard(b) {
     more.type = 'button';
     more.className = 'card-more';
     more.textContent = '⋯';
+    // P3-19：卡内嵌真按钮是可达性问题（role=button 的子树在部分读屏里不可达），
+    // 除了下面的菜单键出口，至少要让这个按钮自己有个名字。
+    more.setAttribute('aria-label', '更多操作：' + (b.title || ''));
+    more.setAttribute('aria-haspopup', 'dialog');
     more.addEventListener('click', (e) => {
       e.stopPropagation();
       // 传触发按钮本身：桌面端操作单要贴着它展开（右上角 ⋯ 就在右上角弹，卡片 ⋯ 就在卡片旁弹）
@@ -1036,6 +1059,13 @@ function makeCard(b) {
   c.setAttribute('role', 'button');
   c.tabIndex = 0;
   c.addEventListener('keydown', (e) => {
+    // P3-19：卡片是 role=button，内部又嵌了真 <button>（⋯）—— 部分读屏在 button 模式下
+    // 进不到内层。补一个标准键盘出口：菜单键 / Shift+F10 打开操作单（桌面读屏的通用姿势）。
+    if (e.target === c && (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10'))) {
+      e.preventDefault();
+      openSheet(b, c);
+      return;
+    }
     if (e.target !== c || (e.key !== 'Enter' && e.key !== ' ')) return;
     e.preventDefault();
     if (batchMode) togglePick(b.id, c);
@@ -1297,19 +1327,53 @@ async function openEditModal(b) {
 /* ---------- 模态通用 ---------- */
 let modalSeq = 0; // 弹层世代令牌（L12）：任何一次 open/close 都推进，使在途的异步弹层内容作废——
 // 否则「标签管理」的迟到清单会把用户已经关掉或换掉的弹层重新内容化（复活）。
+let modalReturnFocus = null; // 打开弹层前的焦点宿主（P3-19：关掉后要还回去）
 let pendingConfirm = null; // 未决确认框的 resolve 句柄：被新弹层顶掉时视作「取消」，避免 Promise 永久挂起
 function openModal(html) {
   modalSeq++;
   if (pendingConfirm) pendingConfirm(false); // 上一个确认框已被替换 → 先落地为「取消」
+  // P3-19：记下触发者。弹层关掉后焦点若留在被移除的节点上，浏览器会把 activeElement 收回
+  // <body> —— 读屏用户丢掉上下文（「取消」之后不知道自己在哪张卡上）。
+  if (!els.modalMask.contains(document.activeElement)) modalReturnFocus = document.activeElement;
   els.modalBox.classList.remove('ce', 'diag'); // 清掉上个弹层可能加的加宽类
   els.modalBox.innerHTML = html;
+  // 用弹层自己的标题做无障碍名（role=dialog 没有名字时读屏只会念「对话框」）
+  const h = els.modalBox.querySelector('h3');
+  if (h) {
+    if (!h.id) h.id = 'modalTitle';
+    els.modalBox.setAttribute('aria-labelledby', h.id);
+    els.modalBox.removeAttribute('aria-label');
+  } else {
+    els.modalBox.removeAttribute('aria-labelledby');
+    els.modalBox.setAttribute('aria-label', '对话框');
+  }
   els.modalMask.classList.remove('hidden');
+  // 焦点搬进弹层：不搬的话 Tab 会继续在**遮罩下面**的页面里走，键盘/读屏用户操作的是背景内容。
+  // 有的调用方紧接着会自己 focus 某个输入框（如批量改标签），那属于精化，覆盖这里即可。
+  const first = els.modalBox.querySelector(
+    'input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  );
+  if (first) first.focus();
+  else {
+    els.modalBox.tabIndex = -1;
+    els.modalBox.focus();
+  }
 }
 function closeModal() {
   modalSeq++; // 关掉也让在途的异步弹层内容作废（否则迟到响应会把弹层"复活"）
   els.modalBox.classList.remove('ce', 'diag');
   els.modalBox.innerHTML = ''; // 清掉内容，避免下次 openModal 前残留误读/误显
   els.modalMask.classList.add('hidden');
+  // 焦点还回触发它的那个控件（P3-19）。元素可能已被重建（书架重渲）→ 判 isConnected 再还。
+  const back = modalReturnFocus;
+  modalReturnFocus = null;
+  if (back && back.isConnected && typeof back.focus === 'function') {
+    try {
+      back.focus();
+    } catch {
+      /* 元素不可聚焦（disabled / 已移除）：保持现状，不抛 */
+    }
+  }
 }
 /* 世代令牌对 upload/ 域开放的两个入口（upload/ 不 import app.js，经 initUpload 注入后
  * 写 host().modalGen()）。章节编辑器（upload/editor.js）每个动作都是「先 await 服务端、

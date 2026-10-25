@@ -28,6 +28,7 @@ const SHELL = [
   '/js/shared-const.js',
   '/js/shared-text.js', // dom.js 静态 re-export normTitle → 首屏依赖
   '/js/batch-queue.js',
+  '/icons/icon-180.png',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/maskable-512.png',
@@ -45,6 +46,10 @@ const LAZY = [
   '/js/reader.js',
   '/js/cleaner.js',
   '/js/cleaner-client.js',
+  // ⚠️ Worker 脚本的请求**不经 Service Worker**（worker 有自己的全局作用域，没有 client/controller），
+  // 所以这一项永远不会被下面的 SWR 自动入缓存（R150 P3-24）。留在清单里是必须的：check.mjs 要求
+  // SHELL ∪ LAZY 覆盖 public/ 全部静态资源，缺它门禁会报 SW MISSING。代价：离线时 new Worker
+  // 失败 → cleaner-client 回退主线程同步清洗（能出结果，只是卡几秒）。
   '/js/cleaner-worker.js',
   '/js/upload/index.js',
   '/js/upload/files.js',
@@ -75,13 +80,27 @@ self.addEventListener('install', (event) => {
     caches
       .open(CACHE)
       .then((c) =>
-        Promise.allSettled(
+        // 单个 catch 而不是 allSettled：下面要按「哪一项失败」分级，allSettled 会丢掉归属。
+        Promise.all(
           SHELL.map((u) =>
-            c.add(new Request(u, u.endsWith('.png') ? undefined : { cache: 'no-cache' }))
+            c
+              .add(new Request(u, u.endsWith('.png') ? undefined : { cache: 'no-cache' }))
+              .then(() => ({ u, ok: true }))
+              .catch(() => ({ u, ok: false }))
           )
         )
       )
-      .then(() => self.skipWaiting())
+      .then((results) => {
+        const failed = results.filter((r) => !r.ok).map((r) => r.u);
+        // R150 P2-12：**关键项**（入口 HTML / CSS / 首屏 JS / manifest）一个都不能缺。
+        // 旧实现用 allSettled 吞掉全部失败（哪怕 17 项全挂）照样 skipWaiting，而 activate 会
+        // 无条件删掉上一版缓存 → 弱网/代理下「新缓存残缺 + 旧缓存已删」= 断网打开白屏。
+        // 现在：关键项有缺就抛错让 install 失败 —— 旧 SW 继续服务旧缓存（能用），下次访问再试。
+        // 图标按「非关键」处理：缺一个图标不影响页面能不能开，为它卡住整次更新不划算。
+        const critical = failed.filter((u) => !u.endsWith('.png'));
+        if (critical.length) throw new Error('SW install 关键资源失败：' + critical.join(', '));
+        return self.skipWaiting();
+      })
   );
 });
 

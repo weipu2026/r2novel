@@ -4,11 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#20242c">
+<!-- R150 P3-25：iOS「添加到主屏」不认 manifest 的 display，要这两个 meta 才会全屏启动；
+     少 apple-mobile-web-app-capable 时加主屏仍是 Safari 套壳（顶上去多一条地址栏）。 -->
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="私人书屋">
 <meta name="color-scheme" content="only light">
 <title>私人书屋</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icons/icon-192.png" type="image/png">
-<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
 <link rel="modulepreload" href="/js/main.js">
 <link rel="modulepreload" href="/js/app.js">
 <link rel="modulepreload" href="/js/dom.js">
@@ -204,7 +210,10 @@
   <div class="read-bar">
     <!-- 进度线：贴底栏上沿的 2px 细线，看进度 + 跳章（热区向上扩，不占按钮位；
          轻点只预览、再点才跳，拖动松手即跳 —— 防阅读时拇指误触） -->
-    <div id="readProg" class="read-prog" role="slider" aria-label="阅读进度" aria-valuemin="1" aria-valuenow="1" aria-valuemax="1">
+    <!-- R150 P3-19：原来是 role="slider"，但它不可聚焦、也没有任何键盘操作 ——
+         读屏会念「滑块，用左右方向键调整」而实际毫无反应。它是**进度指示**（点击跳章只是
+         附带的鼠标增强），progressbar 才是诚实的角色。 -->
+    <div id="readProg" class="read-prog" role="progressbar" aria-label="阅读进度" aria-valuemin="1" aria-valuenow="1" aria-valuemax="1" title="点击跳到对应章节">
       <div id="readProgFill" class="read-prog-fill"></div>
     </div>
     <button data-act="prev" type="button" title="上一章" aria-label="上一章">
@@ -254,7 +263,7 @@
 <div id="sheet" class="sheet hidden"></div>
 <!-- 模态框（编辑信息 / 确认 / 选择） -->
 <div id="modalMask" class="modal-mask hidden">
-  <div id="modalBox" class="modal-box"></div>
+  <div id="modalBox" class="modal-box" role="dialog" aria-modal="true" aria-label="对话框"></div>
 </div>
 <!-- 忙碌层（导出/下载离线/清空回收站等长任务） -->
 <div id="busyMask" class="modal-mask hidden">

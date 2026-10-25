@@ -217,8 +217,14 @@ function serveStatic(req, url) {
     // 在本地永远测不出来（请求数一样，只是每个都完整重下）。补上后本地与线上同判据。
     const etag = '"' + createHash('sha1').update(body).digest('hex') + '"';
     const base = { etag, 'cache-control': 'no-cache' };
+    // R150 P3-23：If-None-Match 的三种合法形态都要认 —— `*`（任意当前表示）、弱校验
+    // `W/"…"`（弱比较只比语义不比字节）、以及逗号分隔的列表。原先只做精确字符串相等：
+    // 浏览器缓存 / SW 常发弱校验，本地就退化成「每次 200 全量」，与线上（CF 对 W/"…" 回 304）
+    // 不同构 —— 于是「SW install 的缓存选项到底省了多少字节」这类结论在本地测不出来。
     const inm = req.headers.get('if-none-match');
-    if (inm && inm.split(',').some((s) => s.trim() === etag)) {
+    const stripWeak = (s) => s.trim().replace(/^W\//i, '');
+    const inmMatch = !!inm && (inm.trim() === '*' || inm.split(',').some((s) => stripWeak(s) === stripWeak(etag)));
+    if (inmMatch) {
       return new Response(null, { status: 304, headers: base });
     }
     return new Response(body, {

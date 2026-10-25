@@ -360,44 +360,60 @@ async function runAll() {
   console.log('\nM2 链路全部通过 ✓');
 }
 
-/* 包装层：收尾清理放 finally（2026-10-01 审计）——用例中途抛错/断言失败/建书撞
- * duplicate 都照常清掉本次创建的测试书，不再留垃圾（此前失败路径直接 process.exit
- * 跳过清理，书留在库里，下次冒烟被迫撞 duplicate）。 */
+let cleaning = false;
+/** 收尾清理（可重入）。
+ *  R150 P3-26：CI 被 timeout/cancel 时先发 SIGINT 再发 SIGTERM —— 只挂 finally 的话
+ *  这两个信号一来进程就没了，《冒烟测试书》留在**生产**书架，直到下次冒烟靠 duplicate
+ *  分支兜底清理。现在信号也走这里。 */
+async function cleanup() {
+  if (cleaning || !CLEANUP || !created.length) return;
+  cleaning = true;
+  try {
+    console.log('\n[ 收尾清理 ]');
+    // 失败路径可能已登出（cookie 被清空），重新登录保证清理可用
+    cookie = '';
+    const rl = await api('/api/login', { method: 'POST', body: { password: PASS } });
+    const mc = /rn_session=([^;]+)/.exec(rl.headers.get('set-cookie') || '');
+    if (!mc) throw new Error('清理阶段登录失败（检查 SMOKE_PASSWORD / ADMIN_PASSWORD）');
+    cookie = 'rn_session=' + mc[1];
+    for (const bid of created) {
+      await purgeBook(bid);
+      console.log('  · 已彻底删除测试书 ' + bid);
+    }
+    // 兜底：历次冒烟遗留（含被改过名的）测试书一并清走
+    const lr = await api('/api/books');
+    for (const b of (lr.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''))) {
+      await purgeBook(b.id);
+      console.log('  · 已清理遗留测试书 ' + b.id + '《' + b.title + '》');
+    }
+    const lr2 = await api('/api/books');
+    const remain = (lr2.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''));
+    if (remain.length) {
+      console.error('  ✗ 清理后书架仍有测试书：' + remain.map((x) => x.id + '《' + x.title + '》').join('、'));
+      process.exitCode = 1;
+    }
+  } catch (e) {
+    console.error('收尾清理异常：', e);
+    process.exitCode = 1;
+  } finally {
+    cleaning = false;
+  }
+}
+
 async function main() {
   try {
     await runAll();
   } finally {
-    if (CLEANUP && created.length) {
-      try {
-        console.log('\n[ 收尾清理 ]');
-        // 失败路径可能已登出（cookie 被清空），重新登录保证清理可用
-        cookie = '';
-        const rl = await api('/api/login', { method: 'POST', body: { password: PASS } });
-        const mc = /rn_session=([^;]+)/.exec(rl.headers.get('set-cookie') || '');
-        if (!mc) throw new Error('清理阶段登录失败（检查 SMOKE_PASSWORD / ADMIN_PASSWORD）');
-        cookie = 'rn_session=' + mc[1];
-        for (const bid of created) {
-          await purgeBook(bid);
-          console.log('  · 已彻底删除测试书 ' + bid);
-        }
-        // 兜底：历次冒烟遗留（含被改过名的）测试书一并清走
-        const lr = await api('/api/books');
-        for (const b of (lr.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''))) {
-          await purgeBook(b.id);
-          console.log('  · 已清理遗留测试书 ' + b.id + '《' + b.title + '》');
-        }
-        const lr2 = await api('/api/books');
-        const remain = (lr2.data.books || []).filter((x) => SMOKE_TITLE_RE.test(x.title || ''));
-        if (remain.length) {
-          console.error('  ✗ 清理后书架仍有测试书：' + remain.map((x) => x.id + '《' + x.title + '》').join('、'));
-          process.exitCode = 1;
-        }
-      } catch (e) {
-        console.error('收尾清理异常：', e);
-        process.exitCode = 1;
-      }
-    }
+    await cleanup();
   }
+}
+
+// 取消/超时也要清理，否则测试书留在生产书架
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    console.log('\n收到 ' + sig + '，先清理测试数据再退出');
+    cleanup().finally(() => process.exit(1));
+  });
 }
 
 main().catch((e) => {

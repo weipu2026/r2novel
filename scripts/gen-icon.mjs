@@ -145,6 +145,9 @@ function draw(size, maskable) {
 
 /* ---------- 产出 ---------- */
 const jobs = [
+  // iOS 主屏用 180（R150 P3-25）：apple-touch-icon 指向非 180 时 iOS 会自己缩放，
+  // 圆角与安全区可能被裁；多一份 180 最省事，也让 install 的图标集合与 manifest 一致。
+  ['icon-180.png', 180, false],
   ['icon-192.png', 192, false],
   ['icon-512.png', 512, false],
   ['maskable-512.png', 512, true],

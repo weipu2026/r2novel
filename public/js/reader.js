@@ -412,6 +412,8 @@ function updateProgressLine() {
   if (els.prog) {
     els.prog.setAttribute('aria-valuemax', String(n));
     els.prog.setAttribute('aria-valuenow', String(i + 1));
+    // 纯数字在 progressbar 上只会被念成「62%」；章号才是读者关心的信息
+    els.prog.setAttribute('aria-valuetext', '第 ' + (i + 1) + ' / ' + n + ' 章');
   }
   syncStepBtns(i, state.chapters.length); // #147 B：翻页按钮的「到头」状态跟章号一起更新
 }

@@ -103,7 +103,7 @@ SMOKE_PASSWORD=<口令> SMOKE_CLEANUP=1 npm run smoke             # 冒烟 + 自
 浏览器 SPA（原生 JS，零依赖；编码/清洗/分章全在浏览器端做——免费 Worker 单请求 10ms CPU 装不下）
    │  /api/*  (fetch, 同源 HMAC Cookie 会话)
    ▼
-Cloudflare Worker（src/worker.js 薄壳；业务全在 src/router.js，本地 dev-server 共用同一套）
+Cloudflare Worker（src/worker.js 薄壳；业务在 src/{core,store,api}/，router.js 只留路由表——本地 dev-server 共用同一套）
    │  鉴权 + 存储；静态资源由 CF 边缘直出（不消耗请求数）
    ▼
 R2 桶（私有；无公开读、无直链）
@@ -217,8 +217,28 @@ Continue → Create → **复制 Token**（只显示这一次）。
 ```
 r2novel/
 ├── src/
-│   ├── router.js          共享路由核心（鉴权/建书/传章/发布/回收站/进度；本地与线上共用）
-│   └── worker.js          Cloudflare Worker 入口（R2 适配 + ASSETS 透传，薄壳）
+│   ├── router.js          路由表（handleRequest/handleApi 分发）+ 对外 re-export；本地与线上共用
+│   ├── worker.js          Cloudflare Worker 入口（R2 适配 + ASSETS 透传，薄壳）
+│   ├── core/              基础层：无业务语义，被其余层单向依赖
+│   │   ├── const.js       R2 key 布局 / 单片书数上限 / 批大小
+│   │   ├── base.js        HTTP 响应·请求体·编码·客户端 IP·etag 存储助手（mutateMeta 收口在此）
+│   │   ├── brute.js       防爆破（IP 哈希计数 + 指数退避锁）
+│   │   └── auth.js        会话鉴权（HMAC 无状态 Cookie）
+│   ├── store/             存储层：索引与回收站的真源，不碰 HTTP
+│   │   ├── shard.js       书架索引 v2：分片 / 摘要对账 / handle 保存（CAS 重放收口在 save 内）
+│   │   ├── open.js        索引打开与自愈：v1 迁移 / root 重建 / openIndex
+│   │   ├── book.js        单书 meta 与可读性副档读取
+│   │   ├── entry.js       meta → 书架索引摘要条目
+│   │   └── gc.js          彻底删除 / 孤儿章节惰性清扫
+│   └── api/               接口层：一类端点一个文件，参数校验 + 调 store
+│       ├── auth.js        登录 / 登出
+│       ├── books.js       书架列表 / 建书
+│       ├── chapters.js    章节增删改查 / 上传 / 发布
+│       ├── progress.js    阅读进度
+│       ├── batch.js       批量操作 / 标签治理
+│       ├── trash.js       回收站
+│       ├── diag.js        残留扫描 / 页分配诊断
+│       └── opds.js        OPDS 目录 / 整本流式导出
 ├── public/
 │   ├── index.html         SPA 单页（登录/书架/上传/回收站/阅读；含桌面左目录栏）
 │   ├── manifest.webmanifest / sw.js / icons/*.png

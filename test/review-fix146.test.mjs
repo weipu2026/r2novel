@@ -9,6 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { srcAll } from './_src-all.mjs';
 
 const read = (p) => readFileSync(new URL('../' + p, import.meta.url), 'utf8');
 
@@ -45,7 +46,7 @@ test('#146 P2-5 finishLogout 必须清掉继续阅读卡/书库规模/筛选条�
 /* ---------------- P3-5：诊断「未能核验」桶 ---------------- */
 
 test('#146 P3-5 服务端：清单截断时归属不明的对象进 unverified 桶，且把结果标成不完整', () => {
-  const body = bodyOf(read('src/router.js'), 'async function doDiagScan(');
+  const body = bodyOf(srcAll(), 'async function doDiagScan(');
   assert.match(
     body,
     /const pushResidue = \(o\) =>\s*\n\s*\(lMeta\.truncated \? unverified : residue\)\.push\(\{ key: o\.key, size: o\.size \}\);/,
@@ -138,7 +139,7 @@ test('#146 P3-7 dev-server：R2NOVEL_DATA 必须规整成绝对路径（否则 .
 /* ---------------- P3 批次：R15 / R16 / R17 ---------------- */
 
 test('#146 R15 索引打开：缺 root 的判据必须是 looksRoot（合法 JSON 但形状不对同样是坏 root）', () => {
-  const src = read('src/router.js');
+  const src = srcAll();
   assert.equal(
     (src.match(/if \(!looksRoot\(root\)\) \{/g) || []).length,
     2,
@@ -148,7 +149,7 @@ test('#146 R15 索引打开：缺 root 的判据必须是 looksRoot（合法 JSO
 });
 
 test('#146 R16 root 缺失时不得盲目重放迁移（v1Bak 存在 ⇒ 迁移发生过 ⇒ 由分片重建）', () => {
-  const body = bodyOf(read('src/router.js'), 'async function openIndex(');
+  const body = bodyOf(srcAll(), 'async function openIndex(');
   assert.match(
     body,
     /if \(rootRaw == null\) \{[\s\S]{0,600}?const v1bak = await getWithEtag\(store, KEY_IDX\.v1Bak\);[\s\S]{0,120}?if \(v1bak\) return rebuildIdxRoot\(store\);[\s\S]{0,80}?return migrateV1\(store\);/,
@@ -157,7 +158,7 @@ test('#146 R16 root 缺失时不得盲目重放迁移（v1Bak 存在 ⇒ 迁移�
 });
 
 test('#146 R17 章节集合路由（POST-only）必须 405 兜底并吃掉请求体', () => {
-  const src = read('src/router.js');
+  const src = srcAll();
   const i = src.indexOf('if (mChapters && req.method === \'POST\') return apiUpdateChapters(');
   assert.ok(i > 0, '找不到 mChapters 的 POST 分支');
   const tail = src.slice(i, i + 260);

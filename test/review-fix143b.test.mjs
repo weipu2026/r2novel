@@ -9,10 +9,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { memStore, call, req, login, countStore } from './_harness.mjs';
+import { srcAll } from './_src-all.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
-const routerSrc = () => read('src/router.js');
+// #149 P2 拆分后，被测实现分散在 src/{core,store,api}；srcAll() 按原声明顺序拼接
+const routerSrc = () => srcAll();
 
 /* ============ P1-4：append 的孤儿清扫上限 ============ */
 

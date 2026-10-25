@@ -5,11 +5,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { srcAll } from './_src-all.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // 仓库文件是 CRLF：断言正则里的 \n 必须在归一后匹配（否则多行正则静默失配 = 假红）
 const read = (f) => readFileSync(path.join(ROOT, f), 'utf8').replace(/\r\n/g, '\n');
-const routerSrc = () => read('src/router.js');
+// #149 P2 拆分后，被测实现分散在 src/{core,store,api}；srcAll() 按原声明顺序拼接
+const routerSrc = () => srcAll();
 
 test('P1-1 purgeOnce：keys 来自 purge 数组时必须继承续扫游标（否则 8000 章外正文永久残留）', () => {
   const src = routerSrc();

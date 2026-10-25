@@ -23,11 +23,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { memStore, req, call, login, makeReadyBook, makeDraftBook, readIdxBooks, writeIdxShards, writeIdxBooks } from './_harness.mjs';
 import { KEY } from '../src/router.js';
+import { srcAll } from './_src-all.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // 仓库文件是 CRLF：断言正则里的 \n 必须在归一后匹配（否则多行正则静默失配 = 假红）
 const read = (f) => readFileSync(path.join(ROOT, f), 'utf8').replace(/\r\n/g, '\n');
-const routerSrc = () => read('src/router.js');
+// #149 P2 拆分后，被测实现分散在 src/{core,store,api}；srcAll() 按原声明顺序拼接
+const routerSrc = () => srcAll();
 const rawMeta = async (store, id) => JSON.parse(await store.getText(KEY.book(id)));
 const restore = (store, cookie, id) => call(store, req(`/api/books/${id}/restore`, { method: 'POST', cookie }));
 const softDel = (store, cookie, id) => call(store, req(`/api/books/${id}`, { method: 'DELETE', cookie }));

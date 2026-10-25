@@ -3,7 +3,9 @@
  * 用法：node scripts/verify-deploy.mjs <base-url>   （如 https://novel.example.com）
  *
  * 做什么：遍历 public/ 下全部可服务静态资源（排除 _headers —— CF 配置非页面资源；
- * 排除 sw.js —— CI 部署时会用时间戳改写线上 CACHE 版本号，仓库副本对不上属预期），
+ * 排除 sw.js —— CI 部署时会用时间戳改写线上 CACHE 版本号，仓库副本对不上属预期；
+ * 排除 robots.txt —— Cloudflare 会在边缘响应里注入「Content Signals」托管段（账户级
+ * AI 爬虫声明，# BEGIN/END Cloudflare Managed content），源文件没变、逐字节比对必红），
  * 逐个从生产拉取（带 cache-buster 防边缘缓存），与仓库内容比对：
  *   文本文件（js/css/html/webmanifest）→ 行尾归一化（CRLF→LF）后比 sha256
  *   二进制文件（png 等）→ 原始字节比 sha256
@@ -33,7 +35,7 @@ const files = [];
     if (e.isDirectory()) walk(p);
     else {
       const rel = '/' + path.relative(PUBLIC, p).split(path.sep).join('/');
-      if (rel === '/_headers' || rel === '/sw.js') continue; // 与 check.mjs ③ 同口径排除
+      if (rel === '/_headers' || rel === '/sw.js' || rel === '/robots.txt') continue; // 与 check.mjs ③ 同口径排除
       files.push({ rel, abs: p });
     }
   }

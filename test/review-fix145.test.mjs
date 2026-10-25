@@ -583,11 +583,17 @@ test('P3-4 replace 进度迁移：每轮重读 + putIf 条件写 + updatedAt 现
   const src = routerSrc();
   const u = src.indexOf('async function apiUpdateChapters(');
   const body = src.slice(u, src.indexOf('\nasync function', u + 10));
-  assert.match(body, /const got = await getWithEtag\(store, KEY\.progress\(id\)\);/, '每轮重读现版本');
-  assert.match(body, /const res = await putIf\(store, KEY\.progress\(id\), JSON\.stringify\(next\), etag\);/, '必须 putIf 条件写');
-  assert.ok(!/store\.putText\(KEY\.progress\(id\)/.test(body), '不得无条件 putText（并发阅读写入会被覆盖）');
-  assert.ok(!/updatedAt: now/.test(body), '不得复用请求开始时的 now（时间轴倒退让进度 OCC 的 baseAt 判据失效）');
-  assert.match(body, /updatedAt: Date\.now\(\)/, '每次重试现取时间');
+  // R150 P2-1：迁移循环抽成 migrateProgress（replace / 插章 / 删章共用），不变量钉在助手本体上；
+  // 调用侧只钉「确实走的是这个助手」与「不得自己再读写进度」。
+  const m = src.indexOf('async function migrateProgress(');
+  assert.ok(m > 0, '必须存在统一的 migrateProgress 助手');
+  const mb = src.slice(m, src.indexOf('\nasync function', m + 10));
+  assert.match(mb, /const got = await getWithEtag\(store, KEY\.progress\(id\)\);/, '每轮重读现版本');
+  assert.match(mb, /const res = await putIf\(store, KEY\.progress\(id\), JSON\.stringify\(next\), etag\);/, '必须 putIf 条件写');
+  assert.ok(!/store\.putText\(KEY\.progress\(id\)/.test(mb), '不得无条件 putText（并发阅读写入会被覆盖）');
+  assert.ok(!/updatedAt: now/.test(body + mb), '不得复用请求开始时的 now（时间轴倒退让进度 OCC 的 baseAt 判据失效）');
+  assert.match(body + mb, /updatedAt: Date\.now\(\)/, '每次重试现取时间');
+  assert.match(body, /migrateProgress\(store, id,/, 'replace 迁移必须走统一助手（不得再内联一份实现）');
 });
 
 test('P3-5 插章/改章的正文落盘都在 CAS 成功之后', () => {

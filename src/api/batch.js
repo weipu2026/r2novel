@@ -74,6 +74,11 @@ async function apiBatchBooks(req, store) {
       return { root, raw, rootEtag, extra: 0, handle: null, rebuilt: false };
     }
     // 全量打开（rootRaw/rootEtag 复用上面那次读，省 1 读）：root 不可解析时顺带走 root.bak → 由分片重建。
+    // ⚠️ root.bak 必须在 openIndex **之前**读：rebuildIdxRoot 会把 root 与 root.bak 一起写成
+    // 合法内容，事后再读就永远看到「bak 是好的」→ rebuilt 恒 false，自愈轮信号彻底失效
+    // （实测：root+bak 双坏的 40 片大库本应 retry=true，改完却是 undefined）。
+    const bak = looksRoot(root) ? null : await getWithEtag(store, KEY_IDX.rootBak);
+    const bakOk = looksRoot(bak ? tryParseJson(bak.text) : null);
     const h = await openIndex(store, { rootRaw: raw, rootEtag });
     // 预扣已花的子请求：1（root 读）+ K（全量片读）+ 不可解析时 1（root.bak）+ 重建 1（list）+ 2（root/root.bak 写）
     // ⚠️ 但要**按需退差**，且只在 **root 健康**（looksRoot 为真）时退（2026-10-06 审计 P1-5）：
@@ -103,7 +108,11 @@ async function apiBatchBooks(req, store) {
       : 1 + h.shardCount + 4;
     // rebuilt 只在「root 深度坏、被 rebuildIdxRoot 确定性重建」时为真。openIndex 对健康 root
     // 也可能因目标不在 map 而全量打开（extra>0 但没重建）——那不是自愈（2026-10-06 审计 P1-5）
-    return { root: h.root, raw: null, rootEtag: null, extra, handle: h, rebuilt: !looksRoot(root) };
+    // R150 P3-5：rebuilt 只认「真自愈」—— root 深度坏**且连 root.bak 也不可用**，那才是
+    // rebuildIdxRoot 真的跑了一遍（list + 逐片读 + 2 写）。仅主 root 不可解析但 bak 好时，
+    // openIndex 只是回落 bak（多 1 次读），盘面一个字都没改；旧判据把它也算自愈轮 → 白扣预算
+    // 并把 retry:true 传给客户端，客户端再发一次拿到完全相同的盘面，无进展重试一次。
+    return { root: h.root, raw: null, rootEtag: null, extra, handle: h, rebuilt: !looksRoot(root) && !bakOk };
   })();
   const shardNoOf = (id) => (Number.isInteger(rootInfo.root.map[id]) ? rootInfo.root.map[id] : null);
   const budget = Math.max(0, 48 - rootInfo.extra); // 预扣掉的（自愈/全量读）不再给本批用

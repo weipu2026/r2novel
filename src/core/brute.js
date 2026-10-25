@@ -5,7 +5,7 @@
  * 路由/参数校验留在 src/router.js，跨模块约定见各函数注释。
  */
 
-import { clientIp, readJson, getWithEtag, tryParseJson, putIf } from './base.js';
+import { clientIp, getWithEtag, tryParseJson, putIf } from './base.js';
 import { KEY } from './const.js';
 
 /* ---------------- 防爆破（R2 持久化：跨 isolate/重启有效；指数退避防长期锁死） ----------------
@@ -48,11 +48,6 @@ function normalizeBrute(b) {
   return { ips };
 }
 
-/** 读取爆破状态（顺手清掉过期条目 + 按数量截断，文件保持极小） */
-async function readBrute(store) {
-  return normalizeBrute(await readJson(store, KEY.BRUTE, { ips: {} }));
-}
-
 /** brute.json 的「读—改—写」：CAS 乐观锁 + 冲突重放（M2）。
  * 原实现拿 bruteCheck 读到的旧快照整文件覆盖：N 个并发失败各自数到 1、互相覆盖，实际只记 1 次
  * —— 爆破预算被放大 N 倍（外部审计探针复现）。这里每轮重读最新状态，再叠自己这一次失败。
@@ -77,38 +72,41 @@ async function updateBrute(store, mutate, tries = 4) {
   return r.out;
 }
 
-/** 登录前检查：是否被锁。返回 { locked, retryAfterMs, b } */
-async function bruteCheck(req, env, store) {
-  const b = await readBrute(store);
-  const rec = b.ips[await ipHash(req)];
-  if (rec && rec.until > Date.now()) return { locked: true, retryAfterMs: rec.until - Date.now(), b };
-  return { locked: false, b };
-}
-
-/** 记一次失败：达标即锁，时长指数翻倍 */
-async function bruteFail(req, env, store) {
+/** 鉴权前的**一次性尝试预留**（R150 P2-1）：先原子占掉一次尝试额度，再比对口令。
+ * 旧实现是「bruteCheck 只读检查 → 比口令 → 失败才 bruteFail 计数」：一批并发请求会全部通过
+ * 检查再各自补记 —— 实测 BRUTE_LIMIT=5 下 12 并发 = 12 次口令猜测被执行（写侧 CAS 只保证
+ * 「计数不丢」，不保证「不多放猜测」）。预留把「检查」与「计数」并成一次 CAS，于是
+ * 「每窗口 limit 次」才真正等于「能被执行的猜测次数上限」。
+ * 语义与旧实现逐条对齐：
+ *   · 涨到 limit 的那一次**仍然放行**（旧实现也是比完这一次才锁），锁在这一次就落盘 →
+ *     下一次请求立刻 429；若这一次口令恰好正确，调用方的 bruteClear 会把记录整个删掉
+ *     （预留的那一次一并抹去，不会误锁）；
+ *   · 锁定期内一律 429 且**不写盘**（dirty:false）—— 否则每个拿错口令的请求都白写一次 brute.json；
+ *   · 滑动窗口 / 锁过期重置 / strikes 指数翻倍的判据原样保留。
+ * 代价：成功登录多 1 次写（预留）。登录是低频路径，换「并发猜测上限真的成立」值得。
+ * 返回 { locked, retryAfterMs }。 */
+async function bruteTry(req, env, store) {
   const cfg = bruteCfg(env);
   const now = Date.now();
   const h = await ipHash(req);
   return updateBrute(store, (b) => {
-    const rec = b.ips[h] || { fail: 0, until: 0, strikes: 0 };
+    const cur = b.ips[h];
+    if (cur && cur.until > now) return { dirty: false, out: { locked: true, retryAfterMs: cur.until - now } };
+    const rec = cur || { fail: 0, until: 0, strikes: 0 };
     if (rec.until > 0 && rec.until <= now) {
-      rec.fail = 0;
+      rec.fail = 0; // 上一轮锁已过期 → 重新计次
       rec.until = 0;
     }
     if (now - (rec.updatedAt || 0) > BRUTE_FAIL_WINDOW) rec.fail = 0; // 滑动窗口：隔久了重新计次
     rec.fail += 1;
     rec.updatedAt = now;
-    let locked = false;
     if (rec.fail >= cfg.limit) {
       rec.strikes = (rec.strikes || 0) + 1;
-      const lock = Math.min(cfg.lockMs * 2 ** (rec.strikes - 1), cfg.lockMaxMs);
-      rec.until = now + lock;
+      rec.until = now + Math.min(cfg.lockMs * 2 ** (rec.strikes - 1), cfg.lockMaxMs);
       rec.fail = 0;
-      locked = true;
     }
     b.ips[h] = rec;
-    return { out: { locked, retryAfterMs: rec.until > now ? rec.until - now : 0 } };
+    return { out: { locked: false } };
   });
 }
 
@@ -124,4 +122,4 @@ async function bruteClear(req, store) {
 
 
 /* 供其他模块 / router.js 使用（集中导出，避免改动声明行） */
-export { bruteCheck, bruteFail, bruteClear };
+export { bruteTry, bruteClear };

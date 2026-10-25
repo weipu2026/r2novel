@@ -145,8 +145,10 @@ test('F5：brute 耗尽路径 dirty:false 不得写盘', async () => {
       return base.getText(k);
     },
   };
-  const r = await call(store, req('/api/login', { method: 'POST', body: { password: ENV.ADMIN_PASSWORD } }));
-  assert.equal(r.status, 200, '登录应成功（并触发 bruteClear）');
+  // #150 P2-1 起登录是「预留一次尝试 → 成功再清零」两段写：预留那一段的耗尽路径**必须**落盘
+  //（限速的失效方向是宁可多记一次，不能放过），所以这条不变量只对清零段成立 —— 直接调它。
+  const { bruteClear } = await import('../src/core/brute.js');
+  await bruteClear(req('/api/login', { method: 'POST', body: { password: ENV.ADMIN_PASSWORD } }), store);
   assert.equal(casFails, 4, '前置：确实走了 4 次 CAS 冲突 + 耗尽路径');
   assert.equal(
     base._map.get(BRUTE),

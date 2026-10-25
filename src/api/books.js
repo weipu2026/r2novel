@@ -34,11 +34,12 @@ async function apiBooks(store, env) {
 async function apiCreateBook(req, env, store) {
   const bj = await readJsonBody(req, 2 * 1024 * 1024);
   if (bj.err) return json({ error: bj.err }, bj.status);
-  const body = bj.body;
-  const title = safeStr(body.title, 120);
+  // R150 P3-11：判重与落盘必须用**同一份**规范化结果。旧实现两边各做一遍 safeStr/slice ——
+  // 两份会静默漂移（判重按 A、落盘按 B 时，用户看到「说重名了，建出来的名字却不一样」）。
+  const input = normalizeBookInput(bj.body);
+  const title = input.title;
   if (!title) return json({ error: '书名不能为空' }, 400);
-  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
-  if (!chapters.length) return json({ error: '没有章节' }, 400);
+  if (!input.chapters.length) return json({ error: '没有章节' }, 400);
 
   // #144 P3（天花板标注）：判重走全量索引（openIndex = root + K 片，K≈ceil(本数/500)）。
   // 2 万本 ≈ 41 片 → 1(root)+41(片)+固定开销已贴近 50 子请求硬顶；千本级（2 片）完全无忧。
@@ -60,26 +61,41 @@ async function apiCreateBook(req, env, store) {
     });
   }
 
-  return createBookRecord(store, body);
+  return createBookRecord(store, input);
 }
 
-async function createBookRecord(store, body) {
-  const title = safeStr(body.title, 120);
-  const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
+/** 建书输入的规范化（单点）：判重与落盘共用。
+ *  wordCount 夹到 ≥0 —— Number(x) || 0 对 -5 返回 -5（publish 与 append 都夹了 ≥0，这里漏了），
+ *  负字数会直接写进 meta 与书架摘要，前端按字数排序/统计全歪。 */
+function normalizeBookInput(body) {
+  const b = body && typeof body === 'object' ? body : {};
+  return {
+    title: safeStr(b.title, 120),
+    chapters: Array.isArray(b.chapters) ? b.chapters.slice(0, CHAPTER_MAX) : [],
+    author: safeStr(b.author, 60),
+    note: safeStr(b.note, 500),
+    tags: Array.isArray(b.tags) ? b.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [],
+    wordCount: Math.max(0, Number(b.wordCount) || 0),
+    cleanVer: Number(b.cleanVer) || 1,
+    pinned: !!b.pinned,
+  };
+}
+
+async function createBookRecord(store, input) {
   const id = newId();
   const now = Date.now();
-  const chTable = chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));
+  const chTable = input.chapters.map((t, i) => ({ key: String(i + 1), title: safeStr(t, 120) || '第' + (i + 1) + '章' }));
   const meta = {
     id,
-    title,
-    author: safeStr(body.author, 60),
-    note: safeStr(body.note, 500),
-    tags: Array.isArray(body.tags) ? body.tags.map((t) => safeStr(t, 30)).filter(Boolean).slice(0, TAG_MAX) : [],
-    wordCount: Number(body.wordCount) || 0,
-    cleanVer: Number(body.cleanVer) || 1,
+    title: input.title,
+    author: input.author,
+    note: input.note,
+    tags: input.tags,
+    wordCount: input.wordCount,
+    cleanVer: input.cleanVer,
     createdAt: now,
     updatedAt: now,
-    pinned: !!body.pinned,
+    pinned: input.pinned,
     status: 'creating',
     chapters: chTable,
   };
@@ -88,10 +104,6 @@ async function createBookRecord(store, body) {
   await Promise.all([store.putText(KEY.book(id), JSON.stringify(meta)), putStatus(store, id, 'creating')]);
   return json({ ok: true, duplicate: false, id, chapterKeys: chTable.map((c) => c.key) });
 }
-
-/** 上传一章：body 为清洗后文本（utf-8）
- * 只放行「建书/更新中」（creating）的书：已发布书若走这里直写正文，
- * 会绕过就地编辑的字数修正 / cleanVer+1 / index 镜像同步，造成长期不一致。 */
 
 /* 供其他模块 / router.js 使用（集中导出，避免改动声明行） */
 export { apiBooks, apiCreateBook };

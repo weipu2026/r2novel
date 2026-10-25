@@ -7,9 +7,10 @@
 
 import { READ_DONE_RATIO } from '../../public/js/shared-const.js';
 import { json, readJsonBody, getWithEtag, tryParseJson, putIf } from '../core/base.js';
-import { KEY, IDX_SAVE_TRIES } from '../core/const.js';
+import { KEY, IDX_SAVE_TRIES, KEY_IDX } from '../core/const.js';
 import { readBook } from '../store/book.js';
 import { openIndex } from '../store/open.js';
+import { looksRoot } from '../store/shard.js';
 
 /* ---------------- 进度（DR-02：R2 小对象 + index 镜像供书架角标） ---------------- */
 
@@ -95,7 +96,17 @@ async function apiProgressPut(req, store, id) {
   // 同时收窄分片读-改-写与 publish 并发时的覆盖窗口。
   // 代价：镜像百分比停留在最近一次换章时的值（书架角标「第几章」仍准确；恢复阅读读 progress 真值，不受影响）。
   try {
-    const idx = await openIndex(store, { single: id });
+    // R150 P3-4：单书模式对「不在架」的书会**退化成全量加载**（1+K 子请求）—— 而「书刚被删 /
+    // 还没发布」恰恰是进度写入最常见的路径（阅读中删书、建书期预览），旧实现为此每次都白读
+    // 整库，异常还被下面的 catch 吞掉仍回 ok。先花 1 次读 root 判在架，不在架直接收工。
+    // root 不可解析时也直接收工：自愈该由书架 GET 触发，不该让一次进度写入去猜整库。
+    // 这次读顺便透传给 openIndex（rootRaw/rootEtag）——书**在架**时不再多花一次读，
+    // 与改造前的子请求数持平；书不在架时则省掉 1+K（旧实现每次白读整库）。
+    const got = await getWithEtag(store, KEY_IDX.root);
+    const rootRaw = got ? got.text : null;
+    const root = rootRaw != null ? tryParseJson(rootRaw) : null;
+    if (!looksRoot(root) || !Number.isInteger(root.map[id])) return json({ ok: true, updatedAt: data.updatedAt });
+    const idx = await openIndex(store, { single: id, rootRaw, rootEtag: got ? got.etag : null });
     const book = idx.get(id);
     // 书不在架（已删/未发布）：书架镜像无处可写，但进度**真值已落盘** → updatedAt 照回。
     // 不回的话客户端基线跟不上，它下一次写入会被自己刚写的版本拒掉（白跑一次对账）。

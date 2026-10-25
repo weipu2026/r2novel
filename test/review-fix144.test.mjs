@@ -110,11 +110,16 @@ test('P3 后端：进度迁移在 CAS 后 / 删章正文在 CAS 后 / tagsMerge 
   const u = src.indexOf('async function apiUpdateChapters(');
   const uBody = src.slice(u, src.indexOf('async function', u + 10)); // 整个函数体（旧 6000 窗装不下 #145 后的长度）
   const casAt = uBody.indexOf('const m = await mutateMeta(');
-  const progAt = uBody.indexOf('await putIf(store, KEY.progress(id), JSON.stringify(next), etag)');
+  const progAt = uBody.indexOf('migrateProgress(store, id');
   assert.ok(casAt > 0 && progAt > casAt, 'replace 进度迁移必须在 CAS 之后（409 时不得改写进度）');
   assert.ok(!/store\.putText\(KEY\.progress\(id\)/.test(uBody),
     '进度迁移不得用无条件 putText 的读—改—写（#145 P3-4：与并发的 apiProgressPut 撞上会整份覆盖掉那次阅读写入）');
-  assert.match(uBody, /const got = await getWithEtag\(store, KEY\.progress\(id\)\);/,
+  // R150 P2-1：三条路径（replace / 插章 / 删章）的迁移循环已抽成共用的 migrateProgress，
+  // 「每轮重读 + putIf 条件写」这条不变量挪到助手本体上钉。
+  const mpAt = src.indexOf('async function migrateProgress(');
+  assert.ok(mpAt > 0, '必须存在统一的 migrateProgress 助手');
+  const mpBody = src.slice(mpAt, src.indexOf('\nasync function', mpAt + 10));
+  assert.match(mpBody, /const got = await getWithEtag\(store, KEY\.progress\(id\)\);/,
     '迁移每轮必须重读现版本并用其 etag 条件写（updatedAt 每次重试现取，不许复用请求开始时的 now）');
   // P3-b：删章正文删除必须在 mutateMeta 之后
   const d = src.indexOf('async function apiDeleteChapter(');

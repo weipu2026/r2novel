@@ -98,7 +98,10 @@ async function readJsonBody(req, maxBytes) {
     return { err: '请求体读取失败', status: 400 };
   }
   try {
-    return { body: text ? JSON.parse(text) : {} };
+    // null / 标量也是合法 JSON：直接当 body 用会在 body.op 一类字段访问上抛 TypeError → 500
+    //（本该是 400）。统一兜成空对象，让下游的字段校验照常给出可读错误（R150 P3-10）。
+    const v = text ? JSON.parse(text) : {};
+    return { body: v && typeof v === 'object' ? v : {} };
   } catch {
     return { err: '请求体不是合法 JSON', status: 400 };
   }

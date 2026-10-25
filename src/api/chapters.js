@@ -118,6 +118,24 @@ async function apiPutChapters(req, env, store, id) {
  * 解压护栏 = MAX_UPLOAD（解压产物超限即中断流，防 gzip 炸弹），解压后按明文落盘——
  * 存储格式不变（重洗读原件零改动，旧数据天然兼容）。 */
 async function apiPutRaw(req, env, store, id) {
+  // R150 P3-6：补齐另两个正文端点（apiPutChapter / apiUpdateChapters）都有的三道守卫。旧实现
+  // 只校验 id 形状 —— 任意合法 id 都能写一份 ≤50MB 的原件：书不存在 → 白占空间，还会在
+  // 「检查残留」里留下一份无法归属的 raw 对象；书在回收站 → purge 连 raw 一起删（白传）；
+  // 书已发布 → 原件与章表从此不对版，「重新清洗」会用过期原件覆盖整本正文。
+  // 上传时序保证不误伤：两条上传链路都是先 create / updateChapters（置 creating）再传原件。
+  const meta = await readBook(store, id);
+  if (!meta) {
+    await dropBody(req);
+    return json({ error: '书不存在' }, 404);
+  }
+  if (meta.status === 'ready') {
+    await dropBody(req);
+    return json({ error: '书已发布，请先用「更新已有书」上传' }, 409);
+  }
+  if (await inTrash(store, id)) {
+    await dropBody(req);
+    return json({ error: '书已删除，无法上传原件' }, 409);
+  }
   const max = Number(env.MAX_UPLOAD) || MAX_UPLOAD_BYTES;
   // 声明值/流式超限都在 readBodyBytes 内处理（含 413 映射），此处不再自行 dropBody 排空——
   // 排空超大体等于把它读进内存，反而制造 OOM 面
@@ -157,6 +175,32 @@ const batchSig = (arr) => {
   return list.length + ':' + h.toString(16);
 };
 
+/** 进度迁移的统一写法（R150 P2-1）：读—判—**条件写**，冲突重读重判，updatedAt 每次现取。
+ * 旧的三条路径（replace 迁移 / 插章 / 删章）各自 getText → putText **无条件覆盖**：读者正读到
+ * 这一章（apiProgressPut 每次换章都写）时整份覆盖掉那次写入 —— 阅读位置莫名跳回/跳前进；
+ * updatedAt 若取请求开始时刻还会比盘上值更旧，时间轴倒退让进度 OCC 的 baseAt 判据失效。
+ * 重试用尽 → 放弃迁移（在线写优先于迁移）。map(p) 返回新进度，或 null（= 不需要改，别碰盘）。 */
+async function migrateProgress(store, id, map) {
+  for (let attempt = 0; ; attempt++) {
+    let p = null;
+    let etag;
+    try {
+      const got = await getWithEtag(store, KEY.progress(id));
+      etag = got ? got.etag : null;
+      if (got && got.text) p = JSON.parse(got.text);
+    } catch {
+      return; // 无进度 / 损坏 → 不迁移
+    }
+    if (!p || !Number.isFinite(p.ch)) return;
+    const next = map(p);
+    if (!next) return;
+    const res = await putIf(store, KEY.progress(id), JSON.stringify(next), etag);
+    if (res.ok) return;
+    if (attempt + 1 >= IDX_SAVE_TRIES) return;
+  }
+}
+
+
 /**
  * 更新已有书章节表（DR-06）。POST /api/books/:id/chapters
  * body { op:'replace'|'append', chapters:[title...], wordCount?, cleanVer?, title?, author?, tags? }
@@ -168,6 +212,12 @@ async function apiUpdateChapters(req, env, store, id) {
   const bj = await readJsonBody(req, 2 * 1024 * 1024);
   if (bj.err) return json({ error: bj.err }, bj.status);
   const body = bj.body;
+  // R150 P3-1：op 缺字段时按 replace 兜底（老客户端兼容），但**显式给了值就必须合法**。
+  // 旧实现把拼错的值（'apend'）也当 replace = 整表重建 + 进度迁移，与 /api/books/batch 对
+  // action 的严格白名单不一致，而这里的后果更重：用户本想「追加」却把全书章表重建了。
+  if (body.op !== undefined && body.op !== 'append' && body.op !== 'replace') {
+    return json({ error: 'op 只能是 append 或 replace' }, 400);
+  }
   const op = body.op === 'append' ? 'append' : 'replace';
   const chapters = Array.isArray(body.chapters) ? body.chapters.slice(0, CHAPTER_MAX) : [];
   if (!chapters.length) return json({ error: '没有章节' }, 400);
@@ -203,7 +253,11 @@ async function apiUpdateChapters(req, env, store, id) {
   const preKeys = new Set(Array.isArray(meta.orphans) ? meta.orphans : []);
   // 活键 = 清完后**仍会被章表引用**的 key：append=现有章（一本都不删）；replace=新表 key。
   // 传给 sweepOrphansBatch 让「活键防御」在这条路径也生效（F2，见该函数注释）。
-  const sweepLive = newKeySet ? Array.from(newKeySet) : oldCh.map((c) => c.key);
+  // R150 P3-3：replace 的活键必须取**新旧并集**。CAS 成功前盘上仍是旧章表；若历史脏数据存在
+  // orphans ∩ chapters 重叠，只按新表算活键会把旧表仍在引用的正文在 CAS **之前**物理删掉，
+  // 随后 409（并发冲突）也回滚不了正文 —— 书显示旧章数、点开 404。并集只让本轮少删几个
+  //（多留的对象由后续 sweep 收口），方向保守。
+  const sweepLive = newKeySet ? Array.from(newKeySet).concat(oldCh.map((c) => c.key)) : oldCh.map((c) => c.key);
   // ⚠️ 上限一律 ORPHAN_BATCH，append 也不例外（2026-10-06 审计 P1-4）。曾对 append 传
   // Infinity「一次清完」，但每章一次 store.delete 就是一个**子请求**：300 章书 replace 成
   // 3 章（orphans≈273）后点「追加章节」→ 单请求发 276 个 delete → 撞穿 50 硬顶 → 500，
@@ -250,6 +304,12 @@ async function apiUpdateChapters(req, env, store, id) {
           const n = Number(k);
           if (Number.isInteger(n) && n > maxNum) maxNum = n;
         }
+        // R150 P3-5：append 也要复核单本上限。chapters 已按 CHAPTER_MAX 截断，但**累加后**的
+        // 总章数从来没人查 —— create / replace 都截断，只有 append 能让章表无限增长。
+        // ⚠️ 判据必须在上面令牌回放分支**之后**：回放时 cur 已含上次追加的那批，会误判超限。
+        if (cur.length + chapters.length > CHAPTER_MAX) {
+          return { abort: json({ error: '章节数超过上限（' + CHAPTER_MAX + ' 章）', count: cur.length }, 409) };
+        }
         const startKey = Math.max(cur.length + 1, maxNum + 1);
         const add = chapters.map((t, i) => ({ key: String(startKey + i), title: safeStr(t, 120) || '第' + (startKey + i) + '章' }));
         mm.chapters = cur.concat(add);
@@ -293,38 +353,18 @@ async function apiUpdateChapters(req, env, store, id) {
   if (!m.ok) return metaFail(m);
   // 状态副档单独写：它只是「可读性」的廉价判定，与 meta 短暂不一致的后果与原先同类。
   // 进度迁移（replace 专用）与它并行：CAS 已成功，章表必然变 → 迁移不会白做。
-  // #145 P3-4：进度迁移改 CAS 读—判—写。原实现是无条件 putText 的读—改—写 —— 与并发的
-  // apiProgressPut（读者正在阅读）撞上时会整份覆盖掉那次写入（阅读位置莫名跳回改名前）；
-  // 另外 updatedAt 取的是请求开始时的 now（1498 行），比实际落盘旧，时间轴倒退会让进度
-  // OCC 的 baseAt 判据失效。现在每轮重读重判、putIf 条件写，updatedAt 每次重试现取；
-  // 冲突重试用尽 → 保留并发写的那份（在线写优先于迁移），不覆盖。
   const progP =
     op !== 'append'
-      ? (async () => {
-          for (let attempt = 0; ; attempt++) {
-            // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
-            // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
-            let oldProg = null;
-            let etag;
-            try {
-              const got = await getWithEtag(store, KEY.progress(id));
-              etag = got ? got.etag : null;
-              if (got && got.text) oldProg = JSON.parse(got.text);
-            } catch {
-              /* 无进度或损坏则跳过迁移 */
-            }
-            if (!oldProg || !Number.isFinite(oldProg.ch) || oldProg.ch < 1 || oldProg.ch > oldCh.length) return;
-            const newTitles = chapters.map((t, i) => safeStr(t, 120) || '第' + (i + 1) + '章');
-            const ni = newTitles.findIndex((t) => t === oldTitles[Math.floor(oldProg.ch) - 1]);
-            const next =
-              ni >= 0
-                ? { ch: ni + 1, ratio: Math.min(1, Math.max(0, Number(oldProg.ratio) || 0)), updatedAt: Date.now() }
-                : { ch: 1, ratio: 0, updatedAt: Date.now() };
-            const res = await putIf(store, KEY.progress(id), JSON.stringify(next), etag);
-            if (res.ok) return;
-            if (attempt + 1 >= IDX_SAVE_TRIES) return; // 极端：并发写非常密集，放弃迁移保留在线写
-          }
-        })()
+      ? migrateProgress(store, id, (p) => {
+          // 进度尽力保留（ch 为 1-based 章节号）：旧进度所在章的标题在新表里若同名则迁移，
+          // 找不到同名章 → 回到第 1 章；旧进度越界（脏数据）则原样保留不动。
+          if (!(p.ch >= 1) || p.ch > oldCh.length) return null;
+          const newTitles = chapters.map((t, i) => safeStr(t, 120) || '第' + (i + 1) + '章');
+          const ni = newTitles.findIndex((t) => t === oldTitles[Math.floor(p.ch) - 1]);
+          return ni >= 0
+            ? { ch: ni + 1, ratio: Math.min(1, Math.max(0, Number(p.ratio) || 0)), updatedAt: Date.now() }
+            : { ch: 1, ratio: 0, updatedAt: Date.now() };
+        })
       : Promise.resolve();
   await Promise.all([progP, putStatus(store, id, 'creating')]);
   return json({ ok: true, op, cleanVer: m.meta.cleanVer, chapterKeys: m.out });
@@ -698,37 +738,23 @@ async function syncIndexAfterEdit(store, meta) {
 }
 
 /** 插入章后迁移进度：原进度章在插入位之后 → 章号 +1（章正文未变） */
-async function shiftProgressOnInsert(store, id, at) {
-  const t = await store.getText(KEY.progress(id));
-  if (!t) return;
-  try {
-    const p = JSON.parse(t);
-    if (p && Number.isFinite(p.ch) && p.ch >= 1 && p.ch - 1 >= at) {
-      await store.putText(KEY.progress(id), JSON.stringify({ ch: p.ch + 1, ratio: p.ratio || 0, updatedAt: Date.now() }));
-    }
-  } catch {
-    /* 损坏进度忽略 */
-  }
-}
+const shiftProgressOnInsert = (store, id, at) =>
+  migrateProgress(store, id, (p) =>
+    p.ch >= 1 && p.ch - 1 >= at ? { ch: p.ch + 1, ratio: p.ratio || 0, updatedAt: Date.now() } : null
+  );
 
 /** 删除章后迁移进度：进度在被删章之后 → 章号 -1；删的恰是进度章 → 原地顶替；
  *  新章数 newLen 用于把越界进度（删末章后 ch > 章数）压回新末章——书架角标直接读
  *  progress 镜像，不 clamp 就会显示「读到 5/4 章」这类越界数字。 */
-async function shiftProgressOnDelete(store, id, di, newLen) {
-  const t = await store.getText(KEY.progress(id));
-  if (!t) return;
-  try {
-    const p = JSON.parse(t);
-    if (p && Number.isFinite(p.ch) && p.ch >= 1) {
-      let ch = p.ch;
-      if (ch - 1 > di) ch -= 1; // 被删章之后 → 前移
-      if (ch > newLen) ch = newLen; // 删的是末章/进度章且越界 → 压回新末章
-      await store.putText(KEY.progress(id), JSON.stringify({ ch, ratio: p.ratio || 0, updatedAt: Date.now() }));
-    }
-  } catch {
-    /* ignore */
-  }
-}
+const shiftProgressOnDelete = (store, id, di, newLen) =>
+  migrateProgress(store, id, (p) => {
+    if (!(p.ch >= 1)) return null;
+    let ch = p.ch;
+    if (ch - 1 > di) ch -= 1; // 被删章之后 → 前移
+    if (ch > newLen) ch = newLen; // 删的是末章/进度章且越界 → 压回新末章
+    if (ch === p.ch) return null; // 位置没变就别碰盘（旧实现每次都重写，白推进 updatedAt）
+    return { ch, ratio: p.ratio || 0, updatedAt: Date.now() };
+  });
 
 /** PATCH /api/books/:id/chapters/:key — 就地改标题 / 改正文（body: { title?, content? }） */
 async function apiPatchChapter(req, env, store, id, key) {
@@ -835,6 +861,8 @@ async function apiInsertChapter(req, env, store, id) {
       // #145 P2-10：章条目登记 words 基线（实测字数）。后续改这一章时字数差从条目上取，
       // 不再回頭读正文 —— 读盘值在「正文已写、meta CAS 失败、客户端重试」的场景里会把
       // 新正文当旧值算出 0 增量（字数永久少计）。老数据无 words 时按盘面兜底（见 apiPatchChapter）。
+      // R150 P3-5：插入同样复核单本上限（create / replace 都截断到 CHAPTER_MAX，只有 insert 从不看）
+      if (arr.length >= CHAPTER_MAX) return { abort: json({ error: '章节数超过上限（' + CHAPTER_MAX + ' 章）' }, 409) };
       arr.splice(at, 0, { key, title, words: wordsOf(content) });
       meta.chapterCount = arr.length;
       meta.wordCount = (Number(meta.wordCount) || 0) + wordsOf(content);

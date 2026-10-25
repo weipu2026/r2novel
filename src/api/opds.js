@@ -8,7 +8,7 @@
 import { EXPORT_MAX_CHAPTERS } from '../../public/js/shared-const.js';
 import { verifyCookie } from '../core/auth.js';
 import { safeEqual, json, enc, getWithEtag, tryParseJson, escXml } from '../core/base.js';
-import { bruteCheck, bruteFail, bruteClear } from '../core/brute.js';
+import { bruteTry, bruteClear } from '../core/brute.js';
 import { KEY, KEY_IDX } from '../core/const.js';
 import { readBook } from '../store/book.js';
 import { openIndex } from '../store/open.js';
@@ -18,7 +18,8 @@ async function opdsAuth(req, env, store) {
   if (await verifyCookie(req, env)) return { ok: true };
   const m = /^Basic\s+([A-Za-z0-9+/=]+)$/i.exec(req.headers.get('authorization') || '');
   if (m) {
-    const st = await bruteCheck(req, env, store);
+    const admin = env.ADMIN_PASSWORD;
+    const st = admin ? await bruteTry(req, env, store) : { locked: false };
     if (st.locked) return { ok: false, status: 429, retryAfterMs: st.retryAfterMs };
     let pair = '';
     try {
@@ -30,11 +31,7 @@ async function opdsAuth(req, env, store) {
       return { ok: false, status: 401 };
     }
     const pass = pair.slice(pair.indexOf(':') + 1); // 用户名任意（含空），只认冒号后的口令
-    const admin = env.ADMIN_PASSWORD;
-    if (!admin || !safeEqual(pass, admin)) {
-      if (admin) await bruteFail(req, env, store);
-      return { ok: false, status: 401 };
-    }
+    if (!admin || !safeEqual(pass, admin)) return { ok: false, status: 401 }; // 已在上面预留过
     await bruteClear(req, store);
     return { ok: true };
   }
@@ -46,6 +43,12 @@ const opds401 = () =>
 
 const opdsLocked = (retryAfterMs) =>
   json({ error: '尝试次数过多，请稍后再试' }, 429, { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+
+/** RFC 5987 的 ext-value 只允许 attr-char（ALPHA / DIGIT / !#$&+-.^_|~）；而 encodeURIComponent
+ *  恰好**不转义** ' ( ) * —— 书名含括号时，严格实现（部分 Java/.NET 客户端、老 curl 库）会把
+ *  filename* 判为非法并回退到 URL 末段，中文书名直接丢失。R150 P3-9：补上这四个字符。 */
+const rfc5987 = (s) =>
+  encodeURIComponent(s).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
 /** 把异步生成器产出的字节源（Uint8Array 或 ReadableStream）按序泵成一个 ReadableStream。
  *  惰性：一段读尽才拉下一段——整本导出不会一次性打开全部章节流（尊重 R2 单请求操作上限）。 */
@@ -130,7 +133,7 @@ async function opdsExport(req, env, store, id) {
     headers: {
       'content-type': 'text/plain; charset=utf-8',
       'cache-control': 'no-store',
-      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent((meta.title || 'book') + '.txt')}`,
+      'content-disposition': `attachment; filename*=UTF-8''${rfc5987((meta.title || 'book') + '.txt')}`,
     },
   });
 }

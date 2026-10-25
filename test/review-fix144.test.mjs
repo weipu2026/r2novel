@@ -16,7 +16,10 @@ const routerSrc = () => srcAll();
 test('P1-1 purgeOnce：keys 来自 purge 数组时必须继承续扫游标（否则 8000 章外正文永久残留）', () => {
   const src = routerSrc();
   const i = src.indexOf('async function purgeOnce(');
-  const body = src.slice(i, i + 4200);
+  // 窗口按「到下一个顶层 async function」截整段，不用固定字节数：固定值会在函数体变长后
+  // 静默截掉尾部的断言（#150 给 list 失败补了几行注释，4200 就把 done 判据挤出去了 → 假红）。
+  const end = src.indexOf('\nasync function', i + 10);
+  const body = src.slice(i, end > i ? end : i + 8000);
   // else 分支（keys 来自上轮 purge）：游标必须带回 nextCursor
   assert.match(body, /\} else \{\n\s*\/\/ #144 P1-1[\s\S]*?nextCursor = purgeCursor;/,
     'keys 来自 purge 时未继承 purgeCursor → 本窗删完即摘条目，list 窗外章节永久残留');

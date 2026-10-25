@@ -219,7 +219,9 @@ test('P2-3 reconcileIdx ② 不得在每片循环内全量物化 Object.keys(roo
     .join('\n');
   assert.ok(!/=\s*Object\.keys\(root\.map\)/.test(codeOnly) && !/of\s+Object\.keys\(root\.map\)/.test(codeOnly),
     '循环体内仍把 Object.keys(root.map) 当值用 → O(K×N)（40 片/2 万本实测 135ms，超 Workers Free 10ms CPU 预算）');
-  assert.match(body, /if \(id in root\.map && root\.map\[id\] === n && !owner\.has\(id\)\)/,
+  // R150：② 里加了「片号值域」守卫，判据从一行拆成「in 复查 → 取 dn → 摘除」三段。
+  // 一条正则同时钉两件事：存在性仍是循环内用 in 复查（不缓存值）、摘除仍按片号相等判。
+  assert.match(body, /if \(!\(id in root\.map\)\) continue;[\s\S]{0,1200}?if \(dn === n && !owner\.has\(id\)\)/,
     '用 `in` 复查存在性（map 在循环内被 delete，不能缓存值）');
 });
 

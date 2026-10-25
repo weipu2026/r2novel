@@ -152,8 +152,16 @@ test('#146 R16 root 缺失时不得盲目重放迁移（v1Bak 存在 ⇒ 迁移�
   const body = bodyOf(srcAll(), 'async function openIndex(');
   assert.match(
     body,
-    /if \(rootRaw == null\) \{[\s\S]{0,600}?const v1bak = await getWithEtag\(store, KEY_IDX\.v1Bak\);[\s\S]{0,120}?if \(v1bak\) return rebuildIdxRoot\(store\);[\s\S]{0,80}?return migrateV1\(store\);/,
+    /if \(rootRaw == null\) \{[\s\S]{0,600}?const v1bak = await getWithEtag\(store, KEY_IDX\.v1Bak\);[\s\S]{0,120}?if \(v1bak\) return rebuildIdxRoot\(store\);/,
     '迁移会无条件覆盖 s0..sK（数据源是冻结的 v1 快照）→ root 被误删时重放会把整库索引回滚到迁移那一刻'
+  );
+  // R150 P1-2：v1Bak 只在迁移时**读到过 v1 原文**才写 —— 从头就是 v2 的库（生产正是这种）根本
+  // 没有它。只靠 v1Bak 判会漏掉「root 与 root.bak 双失」：那时它落到 migrateV1，读不到 v1
+  // index.json → 写出空 root，把「root 不存在」这个可自愈状态永久覆盖成「合法空书架」。
+  assert.match(
+    body,
+    /const l = await store\.list\('meta\/idx\/', 2\);[\s\S]{0,240}?if \(hasShard \|\| l\.truncated\) return rebuildIdxRoot\(store\);/,
+    '盘上还有分片就必须由分片重建；只有「一个分片都没有」才允许走首次迁移'
   );
 });
 

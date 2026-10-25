@@ -39,8 +39,22 @@ const safeStr = (v, max = 200) => String(v == null ? '' : v).replace(/[\u0000-\u
  * 迁移：首次 openIndex 发现 root 不存在 → 读 v1 index 切片写 root/分片，零手工、用户无感；
  *       index.json 本体保留不动（回滚旧代码时仍有完整只读快照）。
  */
+/** root 分片数上界（R150 P2-2）。全量加载会按 root.shards 直接 Array.from 出片号列表 ——
+ *  一个被写坏的 shards: 1e9 足以在 Workers 128MB 里当场 OOM，且此后每次 /api 都崩。设计规模
+ *  40 片 = 2 万本，这里给到 1000 片（50 万本）纯属护栏，正常库永远碰不到。
+ *  map 必须是**对象**而不是数组：[] 也满足 typeof === 'object'，会让后面的 map[id] 读写
+ *  走进一个「看着合法、语义全错」的布局里。 */
+const IDX_SHARD_LIMIT = 1000;
+
 const looksRoot = (r) =>
-  !!r && r.v === 2 && Number.isInteger(r.shards) && r.shards >= 0 && r.map && typeof r.map === 'object';
+  !!r &&
+  r.v === 2 &&
+  Number.isInteger(r.shards) &&
+  r.shards >= 0 &&
+  r.shards <= IDX_SHARD_LIMIT &&
+  !!r.map &&
+  typeof r.map === 'object' &&
+  !Array.isArray(r.map);
 
 const readIndex = (store) => openIndex(store).then((h) => ({ books: h.books }));
 
@@ -167,6 +181,7 @@ function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial, pruna
   let changed = false;
   const owner = new Set();
   const mapIds = Object.keys(root.map); // 提到循环外：② 要遍历它，K 片不该物化 K 次（2026-10-06 审计 P2-3）
+  const liveNums = new Set(shardNo); // 本次真正加载到的片号（全量模式下即 0..shards-1），② 值域守卫用
   for (let si = 0; si < shardBooks.length; si++) {
     const n = shardNo[si];
     const arr = shardBooks[si];
@@ -195,7 +210,18 @@ function reconcileIdx(root, shardBooks, shardNo, shardRaw, dirty, partial, pruna
     // 「2 万本」从「能跑」变成「CPU 顶格」（2026-10-06 审计 P2-3）。改用循环外的 mapIds；
     // map 会在循环内被 delete，故用 `in` 复查存在性（不缓存值）。
     for (const id of mapIds) {
-      if (id in root.map && root.map[id] === n && !owner.has(id)) {
+      if (!(id in root.map)) continue;
+      const dn = root.map[id];
+      // 值域守卫（R150 P2-2）：指向「不存在的片号」的指针永远不会被下面那条 === n 命中，于是
+      // 永久留在 map 里 —— 每次请求都让 openIndex 的预筛误以为「map 比已加载书多」而多花一次
+      // list，upsert 侧还会把它当「在架但找不到」反复回落全量模式。全量加载下片号只可能落在
+      // 0..shards-1，指向别处的一定是坏字节，直接摘掉（partial 模式到不了这里，不会误伤）。
+      if (!Number.isInteger(dn) || dn < 0 || !liveNums.has(dn)) {
+        delete root.map[id];
+        changed = true;
+        continue;
+      }
+      if (dn === n && !owner.has(id)) {
         delete root.map[id];
         changed = true;
       }
@@ -209,10 +235,12 @@ function makeHandle(store, root, shards, opts = {}) {
   const shardRaw = shards.map((s) => s.raw); // 各片原文（写 bak 用；null=新片）
   const shardMissing = shards.map((s) => !!s.missing); // 片与片 bak 都不存在（≠损坏：没有可丢的内容）
   const shardNo = shards.map((s) => s.n);
-  // 各片主文件的版本号（CAS 用）。判据：**只有拿到了真实版本号的片才加条件**——新建片（拆片/首片）
-  // 与「片文件本来就不存在」都没有可对号的旧版本，无条件写才会收敛：否则上次失败留下的孤儿片
-  // （写成了但没进 root）会让重试永远撞「版本已变」，把一次瞬时冲突变成持续 500。
-  const shardEtag = shards.map((s) => (typeof s.mainEtag === 'string' && s.mainEtag ? s.mainEtag : undefined));
+  // 各片主文件的版本号（CAS 用）。判据：**只有拿到了真实版本号的片才加 CAS 条件**；新建片
+  // （拆片/首片）与「片文件本来就不存在」没有可对号的旧版本 → 用 null（「不存在才写」）。
+  // 旧实现这里用 undefined（无条件写），理由是不想让「上次失败留下的孤儿片」把一次瞬时冲突
+  // 变成持续 500 —— 代价是**两路并发在同一片号上新建时，后到者整片覆盖先到者**（R150 P1-1）。
+  // 现在改成条件写 + 冲突时读回合并（见 putShard）：孤儿片里的书被接回索引、并发两份都保住。
+  const shardEtag = shards.map((s) => (typeof s.mainEtag === 'string' && s.mainEtag ? s.mainEtag : null));
   const dirty = new Set();
   let rootDirty = false;
   // 改动意图日志：save() 撞上 CAS 冲突时，用它在新盘面上重放这一轮的改动（见 save / saveOnce）。
@@ -275,7 +303,7 @@ function makeHandle(store, root, shards, opts = {}) {
         shardNo.push(root.shards); // 首片
         shardBooks.push([]);
         shardRaw.push(null);
-        shardEtag.push(undefined); // 新片：盘上还没有 → 无条件写（不必 CAS，也无从 CAS）
+        shardEtag.push(null); // 新片：盘上还没有 → 「不存在才写」（见 shardEtag 注释）
         shardMissing.push(false); // 新片：文件还不存在，但里面没有可丢的内容（≠坏片的读不到）
         root.shards += 1;
       }
@@ -292,7 +320,7 @@ function makeHandle(store, root, shards, opts = {}) {
         shardNo.push(newN);
         shardBooks.push(tail);
         shardRaw.push(null);
-        shardEtag.push(undefined); // 新片（无条件写，理由同上）
+        shardEtag.push(null); // 新片（「不存在才写」，理由同上）
         for (const b of tail) root.map[b.id] = newN;
         root.shards = newN + 1;
         dirty.add(t);
@@ -410,38 +438,79 @@ function makeHandle(store, root, shards, opts = {}) {
         if (!rootDirty) return;
         const next = JSON.stringify(root);
         // root 走 CAS（P2-6 的关键一步）：两个并发发布都会改 root，谁后写谁吃掉对方 —— 版本号一变
-        // 就报冲突，由 withIdxRetry 重读重放。bak 是「写前状态」的快照（内容就是旧 root），不做 CAS。
-        const jobs = [putIf(store, KEY_IDX.root, next, rootEtag)];
-        if (bak && rootBakUsable) jobs.push(store.putText(KEY_IDX.rootBak, rootRaw));
-        const [res] = await Promise.all(jobs);
+        // 就报冲突，由 opLog 重读重放。bak 是「写前状态」的快照（内容就是旧 root），不做 CAS。
+        // ⚠️ bak 必须在 CAS **成功之后**才写（R150 P2-2）：与主片并排写时，CAS 失败的那一路也会
+        // 把 bak 覆盖成自己那份旧快照，而盘上 root 已被并发方推新 → bak 落后两代，日后 root 损坏
+        // 回落到它就等于静默回退一次布局（书从架上消失）。失败方一个字节都不该动。
+        const res = await putIf(store, KEY_IDX.root, next, rootEtag);
         if (!res.ok) throw idxConflict('root');
+        if (bak && rootBakUsable) await store.putText(KEY_IDX.rootBak, rootRaw);
         rootRaw = next;
         rootEtag = res.etag;
         rootBakUsable = root.shards > 0; // 落盘后「写前状态」即新布局
         rootDirty = false;
       };
-      const writeShards = async (list) => {
-        const jobs = [];
-        for (const si of list) {
-          const body = JSON.stringify({ books: shardBooks[si] });
-          // 分片也走 CAS：同一片被两个请求并发读—改—写时，后写者会吃掉前者的书条目。
-          const bakP = bak ? store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si] != null ? shardRaw[si] : body) : null;
-          // 防悬挂 rejection（2026-09-17 复查 F6）：主片 putIf 若以 rejection 失败，下面的 .then
-          // 不执行 → bakP 无人接管 → unhandledRejection 可打死 dev-server。先挂空 catch 占住
-          // 处理位；成功分支里仍会 await bakP 拿真实结果（bak 写失败照旧让本次 save 失败）。
-          if (bakP) bakP.catch(() => {});
-          jobs.push(
-            putIf(store, KEY_IDX.shard(shardNo[si]), body, shardEtag[si]).then(async (res) => {
-              if (!res.ok) throw idxConflict('shard ' + shardNo[si]);
-              if (bakP) await bakP;
-              shardEtag[si] = res.etag;
-              shardRaw[si] = body;
-              shardMissing[si] = false;
-              dirty.delete(si);
-            })
-          );
+      /** 写一片并回收结果。bakP 是与主片并排写的片 bak（既有片才有）；新片没有「写前内容」，
+       *  bak 由本函数在主片落盘后补写。 */
+      const putShard = async (si, body, bakP) => {
+        const key = KEY_IDX.shard(shardNo[si]);
+        let out = body;
+        let res = await putIf(store, key, out, shardEtag[si]);
+        if (!res.ok && shardEtag[si] === null) {
+          // 「不存在才写」失败 ⇒ 这个片号在盘上已经有内容了。两种来源，都**不能**覆盖：
+          //   ① 并发的另一路请求在同一号码上新建了片（R150 P1-1：无条件写时后到者整片吃掉先到者）；
+          //   ② 上一轮 save 写成了新片、root 却没写成 → 孤儿片，里面是还没进 map 的真书。
+          // 读回来按 id 合并（同 id 用本次内存态，它承载最新意图），再用盘上的版本号 CAS 重写一次。
+          // 合并而不是覆盖：孤儿片里的书由此被接回索引，而不是被静默抹掉。
+          const disk = await getWithEtag(store, key);
+          const jd = disk ? tryParseJson(disk.text) : null;
+          if (!(jd && Array.isArray(jd.books))) throw idxConflict('shard ' + shardNo[si]);
+          const mine = new Map();
+          for (const b of shardBooks[si]) if (b && b.id) mine.set(b.id, b);
+          const seen = new Set();
+          const merged = [];
+          for (const b of jd.books) {
+            if (!b || !b.id) continue;
+            merged.push(mine.has(b.id) ? mine.get(b.id) : b);
+            seen.add(b.id);
+          }
+          for (const b of shardBooks[si]) if (b && b.id && !seen.has(b.id)) merged.push(b);
+          // 孤儿片被接进来 → 这些书必须同时进 map，否则「片里有、map 没有」要等下一次 openIndex
+          // 的对账才可见（期间书架少书）。已在 map 里的条目一律不动：多片重复副本由对账 ① 收口。
+          for (const b of merged) {
+            if (b && b.id && !(b.id in root.map)) {
+              root.map[b.id] = shardNo[si];
+              rootDirty = true;
+            }
+          }
+          shardBooks[si] = merged;
+          out = JSON.stringify({ books: merged });
+          res = await putIf(store, key, out, disk ? disk.etag : undefined);
+          if (!res.ok) throw idxConflict('shard ' + shardNo[si]);
+        } else if (!res.ok) {
+          throw idxConflict('shard ' + shardNo[si]);
         }
-        await Promise.all(jobs);
+        if (bakP) await bakP;
+        else if (bak) await store.putText(KEY_IDX.shardBak(shardNo[si]), out); // 新片：首份内容即 bak 基线
+        shardEtag[si] = res.etag;
+        shardRaw[si] = out;
+        shardMissing[si] = false;
+        dirty.delete(si);
+      };
+      const writeShards = async (list) => {
+        await Promise.all(
+          list.map((si) => {
+            const body = JSON.stringify({ books: shardBooks[si] });
+            // 分片也走 CAS：同一片被两个请求并发读—改—写时，后写者会吃掉前者的书条目。
+            const isNew = shardRaw[si] == null;
+            const bakP = bak && !isNew ? store.putText(KEY_IDX.shardBak(shardNo[si]), shardRaw[si]) : null;
+            // 防悬挂 rejection（2026-09-17 复查 F6）：主片 putIf 若以 rejection 失败，bakP 无人
+            // 接管 → unhandledRejection 可打死 dev-server。先挂空 catch 占住处理位；成功分支里
+            // 仍会 await bakP 拿真实结果（bak 写失败照旧让本次 save 失败）。
+            if (bakP) bakP.catch(() => {});
+            return putShard(si, body, bakP);
+          })
+        );
       };
       if (fresh.length) {
         await writeShards(fresh); // 新片先落：失败 ⇒ root 与既有片都没动，等于本次没发生

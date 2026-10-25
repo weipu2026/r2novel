@@ -146,6 +146,16 @@ export async function openIndex(store, opts = {}) {
       // 有对称守卫：v1Bak 存在 ⇒ 迁移发生过 ⇒ 走「由分片重建」（幂等，以盘上分片为真相）。
       const v1bak = await getWithEtag(store, KEY_IDX.v1Bak);
       if (v1bak) return rebuildIdxRoot(store);
+      // ⚠️ R150 P1-2：v1Bak 只在「迁移时确实读到过 v1 原文」才写（migrateV1 里 raw != null 才留档）。
+      // 从头就是 v2 的库（生产正是这种）根本没有 v1Bak —— root 与 root.bak 双失时旧逻辑会落到
+      // migrateV1，而它读不到 v1 index.json（books 为空）→ 写出 { v:2, shards:0, map:{} }：
+      // **一个空 root 覆盖掉「root 不存在」这个本来可自愈的状态**，盘上分片全在、书架却永久 0 本，
+      // 而且此后每次 open 都认为布局合法。判据必须与 resumeMigration 同一把尺：盘上还有分片
+      // 就以盘为准重建（幂等，以分片内容为真相）。list 被截断时不敢断言「一个分片都没有」，
+      // 同样走重建（重建自己会再 list 一次）。
+      const l = await store.list('meta/idx/', 2);
+      const hasShard = l.objects.some((o) => /^meta\/idx\/s\d+\.json(?:\.bak)?$/.test(o.key));
+      if (hasShard || l.truncated) return rebuildIdxRoot(store);
       return migrateV1(store);
     }
     return rebuildIdxRoot(store);

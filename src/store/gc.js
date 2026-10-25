@@ -58,7 +58,12 @@ async function purgeOnce(store, id, maxDel = PURGE_BATCH) {
       // 而 CHAPTER_MAX 的设计上限就是 2 万）。降到 8 页（8000 章）：列到的进本批 keys，
       // 没列到的用 meta 里可能存在的 orphans 无从得知 → 靠 list 返回的 cursor 续扫窗登记。
       const prefix = `text/${id}/`;
-      const listed = await store.list(prefix, 8, purgeCursor).catch(() => ({ objects: [] }));
+      // ⚠️ 列不出来**不能**当成「没有章节」（R150 P2-3）：那会让本批 keys 为空 → left 为空 →
+      // done=true → 删掉 meta/raw/book/progress 并摘走回收站条目，而 text/<id>/ 下的正文一个都
+      // 没删，且从此再无任何线索能定位它们（条目没了，残留扫描也认不出这是谁的书）。
+      // 列失败＝存储抖动，报错让调用方稍后重试；此时占用标记还没写，盘面干净、重试无需补偿。
+      const listed = await store.list(prefix, 8, purgeCursor).catch(() => null);
+      if (!listed) throw new Error('回收站正文清单读取失败，请稍后重试');
       keys = (listed.objects || []).map((o) => o.key.slice(prefix.length).replace(/\.txt$/, ''));
       // 还有没列到的：游标随 CAS 标记写进条目，下一轮从这里续（幂等：已删的 key 删第二次无害）
       nextCursor = (listed && listed.truncated && listed.cursor) || '';
@@ -112,7 +117,10 @@ async function purgeOnce(store, id, maxDel = PURGE_BATCH) {
       return {};
     });
   }
-  return { entry, deleted, done, remaining: left.length };
+  // remaining 的语义是「还要不要续调」，不是「本窗还剩几个 key」（R150 P2-3）：只改一批就删完、
+  // 但还有没列到的章节时（left 为空、nextCursor 非空、done=false），旧实现返回 0 → 前端
+  // while (remaining > 0) 当场收手 → 8000 章以外的正文永久残留。done=false 一律至少报 1。
+  return { entry, deleted, done, remaining: done ? 0 : Math.max(1, left.length) };
 }
 
 /** 惰性清理：把超过 TRASH_DAYS 的书清掉一批（无 cron，靠业务请求时机触发）

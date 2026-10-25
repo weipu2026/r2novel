@@ -418,7 +418,7 @@ const CH_NUM = '[0-9\\uFF10-\\uFF19零〇一二三四五六七八九十百千万
  * 顺序：更具体的检测器在前（cn_hui/cn_jie/cn_juan 先于 cn）—— scanDetectors 平票保序，
  * 「第X回」的书 cn 与 cn_hui 计数相同，cn 在前会把 detected 误报成「第X章」（切分点
  * 相同、仅上报标签失真，但会误导用户以为规则选错）。 */
-export const DETECTORS = [
+const DETECTORS = [
   { id: 'cn_hui', label: '第X回', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*回)[^\\S\\n]*(.*)' },
   { id: 'cn_jie', label: '第X节', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*节)[^\\S\\n]*(.*)' },
   { id: 'cn_juan', label: '第X卷', src: '(?:^|\\n)\\s*(?:#+\\s*)?(第[^\\S\\n]*' + CH_NUM + '+[^\\S\\n]*卷)[^\\S\\n]*(.*)' },

@@ -5,7 +5,7 @@
  * 路由/参数校验留在 src/router.js，跨模块约定见各函数注释。
  */
 
-import { getWithEtag, tryParseJson, readJson, putIf, json } from '../core/base.js';
+import { getWithEtag, tryParseJson, readJson, putIf } from '../core/base.js';
 import { KEY_IDX, KEY, IDX_SHARD_MAX, IDX_SAVE_TRIES } from '../core/const.js';
 import { openIndex } from './open.js';
 

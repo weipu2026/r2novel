@@ -10,35 +10,35 @@
 （不要手动 `npm run deploy`，会让线上领先于 GitHub，下次 CI 会回滚你的改动）。
 
 ```
-src/router.js (2,242)   Workers 入口：~25 个 API 端点（apiXxx 函数 + 集中 dispatch）；
+src/router.js (331)   Workers 入口：~25 个 API 端点（apiXxx 函数 + 集中 dispatch）；
                         书架索引 v2 分片存储（openIndex/makeHandle/migrateV1/rebuildIdxRoot，见 §6）
 public/
-  index.html (278)      单页多视图：shelf / upload / read / trash / login，视图切换走 showView()
+  index.html (280)      单页多视图：shelf / upload / read / trash / login，视图切换走 showView()
   js/
     main.js             入口：import { init } from './app.js'
-    app.js (1,714)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
-    dom.js (28)         共享 DOM 薄层：els 元素表 + $ / $$ / esc / normTitle + IC（图标字面量，两端共用）
-    reader.js (774)     阅读器（交互禁区密度全站最高，改动前必读 §3）
-    store.js (255)      api（fetch 封装）+ local（localStorage）+ fmtWords
-    cleaner.js (427)    纯函数分章引擎（语义冻结：只动它必须先跑 cleaner.test）
-    offline.js (143)    离线队列（进度/操作的回网补传）
+    app.js (2,087)      宿主：登录/书架/批量/标签/诊断/回收站/阅读入口 + 8 个模块级可变状态（见 §2）
+    dom.js (30)         共享 DOM 薄层：els 元素表 + $ / $$ / esc / normTitle + IC（图标字面量，两端共用）
+    reader.js (1,123)     阅读器（交互禁区密度全站最高，改动前必读 §3）
+    store.js (368)      api（fetch 封装）+ local（localStorage）+ fmtWords
+    cleaner.js (674)    纯函数分章引擎（语义冻结：只动它必须先跑 cleaner.test）
+    offline.js (169)    离线队列（进度/操作的回网补传）
     ui.js (61) / exporter.js / shared-const.js   通用薄层（bindBusy/bindToast/busy/toast）/ 导出 / 前后端共享常量
-    sw.js (107)         PWA shell 缓存（CACHE 版本号由 CI 部署时 sed 替换成时间戳，本地字面量是占位符）
-    upload/ (1,343)     上传域（2026-09-13 拆分完成）：
+    sw.js (167)         PWA shell 缓存（CACHE 版本号由 CI 部署时 sed 替换成时间戳，本地字面量是占位符）
+    upload/ (1,570)     上传域（2026-09-13 拆分完成）：
       index.js (76)       唯一对外入口：再导出 openUpload/rewashConfirm/openChapterEditor + init(caps) 注入宿主能力
-      session.js (76)     上传会话状态唯一事实源（原 app.js 的 5 个上传裸变量，见 §2）
+      session.js (85)     上传会话状态唯一事实源（原 app.js 的 5 个上传裸变量，见 §2）
       ctx.js (21)         宿主注入点 provide(host) / host()（未注入即 fail loud）
-      files.js (211)      上传页入口 openUpload + handleFiles（选文件/拖入/粘贴）+ importBatch
-      prepare.js (37)     读字节建会话 / 编码选择
-      preview.js (232)    预览面板（runPreview / 分章表 / 清洗选项）
-      upload.js (277)     上传核心链路（onConfirm / 建书 / 逐章上传 / 原件 / 重试）
+      files.js (248)      上传页入口 openUpload + handleFiles（选文件/拖入/粘贴）+ importBatch
+      prepare.js (67)     读字节建会话 / 编码选择
+      preview.js (282)    预览面板（runPreview / 分章表 / 清洗选项）
+      upload.js (327)     上传核心链路（onConfirm / 建书 / 逐章上传 / 原件 / 重试）
       payload.js (23)     建书 payload 的单一组装点（单文件上传与批量导入共用）
-      editor.js (362)     编辑章节弹层（就地改标题/正文/插删章）
+      editor.js (413)     编辑章节弹层（就地改标题/正文/插删章）
       rewash.js (28)      重洗确认 + 转交上传链路
-  css/style.css (1,057) 设计令牌化完毕（--accent 等），断点两套：移动 / ≥900px 桌面
+  css/style.css (1,188) 设计令牌化完毕（--accent 等），断点两套：移动 / ≥900px 桌面
 scripts/dev-server.mjs  本地 :8088，自动读 .dev.vars；R2NOVEL_DATA=<不含斜杠的相对名> 换数据目录
 scripts/verify-deploy.mjs 部署后核验：拉生产静态文件与仓库哈希比对（CI 最后一步自动跑）
-test/                   314 项单测（27 文件；index-shards.test.mjs = 分片专项；_dom-stub.mjs = 前端 UI 模块的零依赖 DOM 桩）；.ui-tests/（gitignored）多套 Playwright 回归
+test/                   508 项单测（43 文件；index-shards.test.mjs = 分片专项；_dom-stub.mjs = 前端 UI 模块的零依赖 DOM 桩）；.ui-tests/（gitignored）多套 Playwright 回归
 数据布局（R2）: meta/idx/{root,s<N>}.json(+.bak) 书架索引 v2 分片 + meta/<id>.json + meta/sec/st/<id> + text/<id>/<key>.txt
                 + raw/<id>.txt + progress/<id>.json + meta/trash.json + meta/index.json(v1 冻结快照)
 ```
@@ -167,15 +167,16 @@ npm run check          # 门禁一次跑完五段，任一有问题即 CHECK_FAI
 #      必须完全相同（任一端漏实现一个原语，症状是测试静默失真、零覆盖）
 #   ⑤ SW SHELL 双向比对（SHELL_OK）：public/ 全部静态资源必须在 SHELL 预缓存清单里
 #      （SW MISSING），SHELL 条目必须真实存在（SW UNKNOWN）——手写清单漂移在此被拦
-npm test               # 314 项单测（含 index-shards 分片专项、cleaner 清洗、editor-ui 章节编辑器 DOM 桩回归）
+npm test               # 508 项单测（含 index-shards 分片专项、cleaner 清洗、editor-ui 章节编辑器 DOM 桩回归）
 # UI 回归（每套独立数据目录、串行跑）：一条命令 `.ui-tests/run-full-regression.sh`
-#   （启服 + 冒烟 + 15 套 UI 同一进程树；⚠️ 沙箱守卫会拦「一次删 >50 文件」，`data-*` 上千文件必撞
+#   （启服 + 冒烟 + 21 套 UI 同一进程树；⚠️ 沙箱守卫会拦「一次删 >50 文件」，`data-*` 上千文件必撞
 #    → 需 CODEBUDDY_SAFE_DELETE_ENABLED=0。该变量写在脚本**内部 export 无效**（守卫在工具层看
 #    命令串），必须写成 `CODEBUDDY_SAFE_DELETE_ENABLED=0 bash .ui-tests/run-full-regression.sh`）
 # verify-fix-3bugs(27) / audit-render-window(5) / verify-readstate / audit-marks(21)
 # audit-star-chip(10) / verify-iter3(33) / verify-batch(12) / verify-prelaunch(17)
 # verify-audit(14) / verify-audit4(12) / verify-review-fixes(11) / verify-0915-fixes(7)
 # verify-fix11-ui(13) / feat-ui(18)* / ui-desktop(20)*
+# verify-fix138(35) / verify-fix139(16) / verify-fix140(20) / ui-150c(21) / ui-150d(7) / ui-150e(17)
 # * 这两套要求空书架，各自单独用一个干净数据目录
 npm run smoke          # 需 TEST_PASSWORD（.dev.vars 里的口令），55 项
 # CI 部署链：单测+门禁 → 建桶 → 部署 → 同步密钥 → 生产冒烟(55) → verify-deploy.mjs 哈希核验

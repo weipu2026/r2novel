@@ -5,7 +5,7 @@
  * 路由/参数校验留在 src/router.js，跨模块约定见各函数注释。
  */
 
-import { json, putIf, getWithEtag, tryParseJson } from '../core/base.js';
+import { putIf, getWithEtag, tryParseJson } from '../core/base.js';
 import { IDX_SHARD_MAX, KEY_IDX } from '../core/const.js';
 import { readIndexRaw, makeHandle, loadIdxShard, looksRoot } from './shard.js';
 

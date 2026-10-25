@@ -14,7 +14,7 @@ export async function rewashConfirm(b) {
   if (ok) rewash(b);
 }
 
-export async function rewash(b) {
+async function rewash(b) {
   let full = b;
   try {
     const meta = await api.bookMeta(b.id);
